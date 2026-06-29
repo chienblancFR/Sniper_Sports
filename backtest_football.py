@@ -64,8 +64,9 @@ RHO_PAR_LIGUE = {
 }
 RHO_DEFAULT  = -0.12
 KELLY_FRAC   = 0.10
-EV_MIN       = 0.05
+EV_MIN       = 0.08   # relevé à 8% pour plus de sélectivité (était 5%)
 EV_MAX       = 0.20
+MIN_COTE     = 1.70   # ignorer les handicaps trop courts (< 1.70)
 N_PRIOR      = 8      # matchs-équivalents shrinkage bayésien
 
 NAME_MAPPING = {
@@ -621,10 +622,14 @@ async def simuler_paris(conn):
             rho = RHO_PAR_LIGUE.get(ligue['id'], RHO_DEFAULT)
             mat = generer_matrice(L_A, L_B, rho)
 
-            # Parcourir les marchés
+            # Parcourir les marchés — collecter tous les signaux valides pour ce fixture
             home_name_odds = NAME_MAPPING.get(h_name, h_name)
+            candidats = []  # (ev, market, outcome, h_val, cote_h24, is_home_or_over)
 
             for market, outcome, h_val, cote_h24 in odds_h24:
+                if cote_h24 < MIN_COTE:
+                    continue
+
                 is_home = (outcome == home_name_odds) or (
                     process.extractOne(outcome, [home_name_odds])[1] > 85
                 )
@@ -632,10 +637,12 @@ async def simuler_paris(conn):
                 if market == 'spreads':
                     ev = ev_ah(mat, h_val, is_home, cote_h24)
                     k  = kelly_ah(mat, h_val, is_home, cote_h24)
+                    flag = is_home
                 else:
                     is_over = "Over" in outcome
                     ev = ev_total(mat, h_val, is_over, cote_h24)
                     k  = kelly_total(mat, h_val, is_over, cote_h24)
+                    flag = is_over
 
                 if not (EV_MIN <= ev <= EV_MAX):
                     continue
@@ -644,29 +651,38 @@ async def simuler_paris(conn):
                 if mise < 0.1:
                     continue
 
-                # Cote de clôture
-                async with conn.execute(
-                    "SELECT cote FROM bt_odds_cloture WHERE fixture_id=? AND market=? AND outcome=? AND h_val=?",
-                    (fid, market, outcome, h_val)
-                ) as cur:
-                    row = await cur.fetchone()
-                cote_cloture = row[0] if row else None
+                candidats.append((ev, market, outcome, h_val, cote_h24, k, mise, flag))
 
-                # Résultat réel
-                if market == 'spreads':
-                    res = resultat_ah(gh, ga, h_val, is_home)
-                else:
-                    res = resultat_total(gh, ga, h_val, is_over)
+            if not candidats:
+                continue
 
-                clv = round((cote_h24 / cote_cloture) - 1, 4) if cote_cloture else None
+            # 🔒 FILTRE 1 PARI/MATCH : garder uniquement le signal avec le meilleur EV
+            candidats.sort(key=lambda x: x[0], reverse=True)
+            ev, market, outcome, h_val, cote_h24, k, mise, flag = candidats[0]
 
-                await conn.execute(
-                    "INSERT OR REPLACE INTO bt_signaux VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (fid, ligue['id'], saison, market, outcome, h_val,
-                     cote_h24, cote_cloture, round(ev, 4), round(k, 4),
-                     mise, gh, ga, res, clv)
-                )
-                signaux += 1
+            # Cote de clôture
+            async with conn.execute(
+                "SELECT cote FROM bt_odds_cloture WHERE fixture_id=? AND market=? AND outcome=? AND h_val=?",
+                (fid, market, outcome, h_val)
+            ) as cur:
+                row = await cur.fetchone()
+            cote_cloture = row[0] if row else None
+
+            # Résultat réel
+            if market == 'spreads':
+                res = resultat_ah(gh, ga, h_val, flag)
+            else:
+                res = resultat_total(gh, ga, h_val, flag)
+
+            clv = round((cote_h24 / cote_cloture) - 1, 4) if cote_cloture else None
+
+            await conn.execute(
+                "INSERT OR REPLACE INTO bt_signaux VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (fid, ligue['id'], saison, market, outcome, h_val,
+                 cote_h24, cote_cloture, round(ev, 4), round(k, 4),
+                 mise, gh, ga, res, clv)
+            )
+            signaux += 1
 
         await conn.commit()
         print(f"  {ligue['nom']} : {signaux} signaux générés")
