@@ -29,8 +29,6 @@ async def init_db():
     db_conn = await aiosqlite.connect("sniper_data.db")
     await db_conn.execute('''CREATE TABLE IF NOT EXISTS xg_cache
                           (cle TEXT PRIMARY KEY, xg_p REAL, xg_c REAL, timestamp DATETIME)''')
-    await db_conn.execute('''CREATE TABLE IF NOT EXISTS alertes_envoyees
-                          (cle TEXT PRIMARY KEY, derniere_ev REAL, timestamp DATETIME)''')
     await db_conn.execute('''CREATE TABLE IF NOT EXISTS paris_log
                           (id_match INTEGER, equipe TEXT, handicap REAL, cote_prise REAL,
                            mise REAL, cote_cloture REAL DEFAULT 0.0, edge_detecte REAL,
