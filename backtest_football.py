@@ -107,6 +107,20 @@ N_PRIOR_DEFAULT = 8      # fallback shrinkage bayésien (valeur par ligue dans C
 H_ODDS_BACKTEST = 24.0
 
 
+def _semaine_dc(date_utc):
+    """Bucket hebdomadaire pour cache DC (1 MLE/semaine/ligue, pas 1/match)."""
+    try:
+        dt = datetime.fromisoformat(date_utc.replace('Z', '+00:00'))
+        y, w, _ = dt.isocalendar()
+        return (y, w)
+    except Exception:
+        return date_utc[:10]
+
+
+def _jour_cache(date_utc):
+    return date_utc[:10] if date_utc else ""
+
+
 def calculer_poids_dyn(hr: float) -> float:
     """
     Poids du modèle dans le blend EV — identique au bot live (sniper_bot_foot.py).
@@ -878,7 +892,7 @@ async def estimer_parametres_dc_bt(conn, ligue_id, saison, avant_date, mu_h, mu_
         res = await asyncio.to_thread(
             minimize, neg_ll, x0,
             method='L-BFGS-B', bounds=bounds,
-            options={'maxiter': 3000, 'ftol': 1e-9},
+            options={'maxiter': 1500, 'ftol': 1e-8},
         )
     except Exception:
         return None
@@ -1047,26 +1061,45 @@ async def simuler_paris(conn):
         ) as cur:
             fixtures = await cur.fetchall()
 
-        signaux = 0
-        pending = []  # écriture batch en fin de ligue (lectures seules pendant la boucle)
-        dc_cache = {}  # (ligue_id, saison, n_prior) -> params DC (point-in-time, sans lookahead)
+        n_fixtures = len(fixtures)
+        print(f"\n  ▶ {ligue['nom']} — {n_fixtures} matchs…", flush=True)
 
-        for fid, saison, date_utc, h_id, a_id, h_name, a_name, gh, ga in fixtures:
+        # Pré-charge toutes les cotes H-24 de la ligue (évite 1 requête SQL/match)
+        odds_by_fid = defaultdict(list)
+        async with conn.execute(
+            "SELECT o.fixture_id, o.market, o.outcome, o.h_val, o.cote "
+            "FROM bt_odds_h24 o "
+            "JOIN bt_fixtures f ON f.id = o.fixture_id "
+            "WHERE f.ligue_id=?",
+            (ligue['id'],),
+        ) as cur:
+            for fid, mk, out, hv, c in await cur.fetchall():
+                odds_by_fid[fid].append((mk, out, hv, c))
+
+        signaux = 0
+        pending = []
+        dc_cache = {}
+        avg_cache = {}
+        venue_cache = {}
+
+        for idx, (fid, saison, date_utc, h_id, a_id, h_name, a_name, gh, ga) in enumerate(fixtures, 1):
+            if idx % 200 == 0 or idx == n_fixtures:
+                print(f"     … {idx}/{n_fixtures} matchs", flush=True)
+
             if gh is None or ga is None:
                 continue
 
-            # Récupérer les cotes H-24 disponibles
-            async with conn.execute(
-                "SELECT market, outcome, h_val, cote FROM bt_odds_h24 WHERE fixture_id=?",
-                (fid,)
-            ) as cur:
-                odds_h24 = await cur.fetchall()
-
+            odds_h24 = odds_by_fid.get(fid)
             if not odds_h24:
                 continue
 
-            # Moyenne de buts de la ligue calculée dynamiquement (remplace 1.3 hardcodé)
-            avg_ligue = await calculer_ligue_avg(conn, ligue['id'], saison, date_utc)
+            jour = _jour_cache(date_utc)
+            avg_key = (ligue['id'], saison, jour)
+            if avg_key not in avg_cache:
+                avg_cache[avg_key] = await calculer_ligue_avg(
+                    conn, ligue['id'], saison, date_utc
+                )
+            avg_ligue = avg_cache[avg_key]
             n_prior_l = ligue.get('n_prior', N_PRIOR_DEFAULT)
 
             # Reconstituer xG AVANT ce match — split home/away + global comme le bot principal
@@ -1100,15 +1133,15 @@ async def simuler_paris(conn):
             xg_off_e = xg_off_e_sp * we + xg_off_e_gl * (1.0 - we)
             xg_def_e = xg_def_e_sp * we + xg_def_e_gl * (1.0 - we)
 
-            # Moyennes venue ligue + estimation DC (cache invalidé quand n_prior change)
-            m_dom_l, m_ext_l = await calculer_moyennes_venue(conn, ligue['id'], saison, date_utc)
-            async with conn.execute(
-                "SELECT COUNT(*) FROM bt_fixtures WHERE ligue_id=? AND saison=? AND date_utc < ? AND gh IS NOT NULL",
-                (ligue['id'], saison, date_utc)
-            ) as cur:
-                n_prior = (await cur.fetchone())[0]
+            # Moyennes venue ligue + estimation DC (cache hebdomadaire, cron ~bot live)
+            venue_key = (ligue['id'], saison, jour)
+            if venue_key not in venue_cache:
+                venue_cache[venue_key] = await calculer_moyennes_venue(
+                    conn, ligue['id'], saison, date_utc
+                )
+            m_dom_l, m_ext_l = venue_cache[venue_key]
 
-            dc_key = (ligue['id'], saison, n_prior)
+            dc_key = (ligue['id'], saison, _semaine_dc(date_utc))
             if dc_key not in dc_cache:
                 dc_cache[dc_key] = await estimer_parametres_dc_bt(
                     conn, ligue['id'], saison, date_utc, m_dom_l, m_ext_l
