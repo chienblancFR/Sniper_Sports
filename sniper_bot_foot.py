@@ -1,7 +1,7 @@
 import requests, json, os, time, logging, csv, signal
 import numpy as np
 from scipy.stats import poisson
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize_scalar, minimize
 from thefuzz import process
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -49,10 +49,17 @@ async def init_db():
         await db_conn.execute("ALTER TABLE xg_cache ADD COLUMN is_xg INTEGER DEFAULT 0")
     except Exception:
         pass  # Colonne déjà présente
-    # Migration : IDs d'équipes dans scores_matchs pour le MLE ρ par match
+    # Table des paramètres DC complets (α, β, γ, ρ) par équipe/ligue/saison
+    await db_conn.execute('''CREATE TABLE IF NOT EXISTS dc_params
+                          (ligue_id INTEGER, saison INTEGER, team_id INTEGER,
+                           attack REAL, defense REAL, home_adv REAL, rho REAL,
+                           computed_at TEXT,
+                           PRIMARY KEY (ligue_id, saison, team_id))''')
+    # Migration : IDs d'équipes + date de match dans scores_matchs
     for migration in [
         "ALTER TABLE scores_matchs ADD COLUMN team_dom_id INTEGER DEFAULT NULL",
         "ALTER TABLE scores_matchs ADD COLUMN team_ext_id INTEGER DEFAULT NULL",
+        "ALTER TABLE scores_matchs ADD COLUMN match_date TEXT DEFAULT NULL",
     ]:
         try:
             await db_conn.execute(migration)
@@ -245,6 +252,11 @@ RHO_DEFAULT = -0.12  # Fallback pour toute ligue non listée
 # Prioritaire sur RHO_PAR_LIGUE quand on dispose d'assez de données.
 RHO_DYNAMIQUE: dict[tuple, float] = {}  # clé = (ligue_id, saison)
 
+# Paramètres Dixon-Coles complets par équipe — estimés conjointement par MLE
+# Clé = (ligue_id, saison) → {'gamma': float, 'rho': float,
+#                              'teams': {team_id: {'attack': float, 'defense': float}}}
+DC_PARAMS: dict[tuple, dict] = {}
+
 async def estimer_rho_saison(ligue_id: int, saison: int, mu_h: float, mu_a: float) -> float | None:
     """
     Estimation MLE de ρ (Dixon-Coles) à partir des scores accumulés dans scores_matchs.
@@ -319,6 +331,179 @@ async def estimer_rho_saison(ligue_id: int, saison: int, mu_h: float, mu_a: floa
                      f"n_xg={n_xg} → ρ={rho_est}")
         return rho_est
     return None
+
+
+async def estimer_parametres_dc_complet(ligue_id: int, saison: int,
+                                         mu_h: float, mu_a: float) -> dict | None:
+    """
+    Estimation MLE jointe des paramètres Dixon-Coles complets par équipe.
+
+    Modèle multiplicatif (log-espace) :
+        λ_home = exp(a_home + d_away + γ)   a = log-attaque, d = log-défense
+        λ_away = exp(a_away + d_home)
+    Contrainte d'identification (soft penalty) : Σ a_i = 0
+
+    Pondération temporelle (demi-vie 90 jours) + saison précédente à poids 0.5.
+    Actif dès 40 matchs avec IDs d'équipes ET ≥ 4 matchs par équipe.
+    Résultat stocké dans DC_PARAMS et en base dc_params.
+    """
+    async with db_lock:
+        async with db_conn.execute(
+            "SELECT id_match, buts_dom, buts_ext, team_dom_id, team_ext_id, match_date "
+            "FROM scores_matchs WHERE ligue_id=? AND saison=?",
+            (ligue_id, saison)
+        ) as cursor:
+            rows_curr = await cursor.fetchall()
+        async with db_conn.execute(
+            "SELECT id_match, buts_dom, buts_ext, team_dom_id, team_ext_id, match_date "
+            "FROM scores_matchs WHERE ligue_id=? AND saison=?",
+            (ligue_id, saison - 1)
+        ) as cursor:
+            rows_prev = await cursor.fetchall()
+
+    valid_curr = [(d, e, h, a, md) for _, d, e, h, a, md in rows_curr if h and a]
+    valid_prev = [(d, e, h, a, md) for _, d, e, h, a, md in rows_prev if h and a]
+
+    if len(valid_curr) < 40:
+        return None
+
+    # Construire l'index des équipes avec assez de données
+    team_counts: dict[int, int] = {}
+    for _, _, h, a, _ in valid_curr:
+        team_counts[h] = team_counts.get(h, 0) + 1
+        team_counts[a] = team_counts.get(a, 0) + 1
+    eligible = {t for t, c in team_counts.items() if c >= 4}
+    if len(eligible) < 8:
+        return None
+
+    teams = sorted(eligible)
+    N = len(teams)
+    idx = {t: i for i, t in enumerate(teams)}
+
+    # Pondération temporelle : demi-vie 90 jours
+    now_ts = datetime.now(timezone.utc)
+    HALF_LIFE_DAYS = 90.0
+    decay = np.log(2) / HALF_LIFE_DAYS
+
+    def weight(match_date_str: str | None, base_w: float) -> float:
+        if not match_date_str:
+            return base_w
+        try:
+            dt = datetime.fromisoformat(match_date_str.replace('Z', '+00:00'))
+            days_ago = max(0, (now_ts - dt).total_seconds() / 86400)
+            return base_w * np.exp(-decay * days_ago)
+        except Exception:
+            return base_w
+
+    all_matches = []
+    for d, e, h, a, md in valid_curr:
+        if h in idx and a in idx:
+            all_matches.append((int(d), int(e), idx[h], idx[a], weight(md, 1.0)))
+    for d, e, h, a, md in valid_prev:
+        if h in idx and a in idx:
+            all_matches.append((int(d), int(e), idx[h], idx[a], weight(md, 0.5)))
+
+    if len(all_matches) < 40:
+        return None
+
+    # Cache factorielles
+    max_g = max(max(d, e) for d, e, _, _, _ in all_matches)
+    log_fact = np.zeros(max_g + 2)
+    for k in range(1, max_g + 2):
+        log_fact[k] = log_fact[k - 1] + np.log(k)
+
+    def neg_ll(x: np.ndarray) -> float:
+        log_a = x[:N]
+        log_d = x[N:2 * N]
+        log_g = x[2 * N]        # log(home_advantage)
+        rho   = float(np.clip(x[2 * N + 1], -0.40, -0.001))
+
+        # Soft identification penalty : Σ log_a = 0
+        pen = (float(np.sum(log_a))) ** 2 * 15.0
+
+        ll = 0.0
+        for gh, ga, hi, ai, w in all_matches:
+            lh = float(np.clip(np.exp(log_a[hi] + log_d[ai] + log_g), 0.1, 12.0))
+            la = float(np.clip(np.exp(log_a[ai] + log_d[hi]),          0.1, 12.0))
+
+            ll += w * (gh * np.log(lh) - lh - float(log_fact[gh]))
+            ll += w * (ga * np.log(la) - la - float(log_fact[ga]))
+
+            if gh == 0 and ga == 0: tau = max(1e-9, 1.0 - lh * la * rho)
+            elif gh == 1 and ga == 0: tau = max(1e-9, 1.0 + la * rho)
+            elif gh == 0 and ga == 1: tau = max(1e-9, 1.0 + lh * rho)
+            elif gh == 1 and ga == 1: tau = max(1e-9, 1.0 - rho)
+            else: tau = 1.0
+            ll += w * np.log(tau)
+
+        return -(ll - pen)
+
+    x0 = np.zeros(2 * N + 2)
+    x0[2 * N]     = np.log(max(0.5, mu_h))   # home advantage ≈ mu_h
+    x0[2 * N + 1] = -0.13                     # rho initial typique
+
+    bounds = ([(-2.5, 2.5)] * N +   # log_attack
+              [(-2.5, 2.5)] * N +   # log_defense
+              [(-0.5, 0.5)]  +      # log_home_adv
+              [(-0.40, -0.001)])     # rho
+
+    try:
+        res = minimize(neg_ll, x0, method='L-BFGS-B', bounds=bounds,
+                       options={'maxiter': 3000, 'ftol': 1e-9})
+    except Exception as e:
+        logging.warning(f"[DC MLE] ligue={ligue_id} saison={saison} erreur scipy : {e}")
+        return None
+
+    x = res.x
+    log_a = x[:N]
+    log_d = x[N:2 * N]
+    gamma = float(np.exp(x[2 * N]))
+    rho   = float(np.clip(x[2 * N + 1], -0.40, -0.001))
+
+    # Normalisation : centrer log_d pour que mean(defense) = 1 (log = 0)
+    # et compenser dans gamma → préserve λ_home_avg = gamma
+    mean_log_d = float(np.mean(log_d))
+    log_d -= mean_log_d
+    gamma *= np.exp(mean_log_d)
+
+    # Calibration absolue : ajuster gamma pour que λ_home_moyen ≈ mu_h
+    # Pour une équipe moyenne : λ_home = exp(0 + 0 + log_gamma) = gamma → gamma ← mu_h
+    if gamma > 0:
+        scale = mu_h / gamma
+        log_a += np.log(max(scale, 1e-6))
+        gamma *= scale
+
+    params: dict = {
+        'gamma': gamma,
+        'rho': rho,
+        'teams': {
+            team_id: {
+                'attack':  float(np.exp(log_a[i])),
+                'defense': float(np.exp(log_d[i]))
+            }
+            for i, team_id in enumerate(teams)
+        }
+    }
+
+    # Persistance en base
+    computed_at = datetime.now().isoformat()
+    async with db_lock:
+        await db_conn.executemany(
+            "INSERT OR REPLACE INTO dc_params "
+            "(ligue_id, saison, team_id, attack, defense, home_adv, rho, computed_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [(ligue_id, saison, tid,
+              params['teams'][tid]['attack'], params['teams'][tid]['defense'],
+              gamma, rho, computed_at)
+             for tid in params['teams']]
+        )
+        await db_conn.commit()
+
+    logging.info(f"[DC MLE] ligue={ligue_id} saison={saison} N={N} "
+                 f"matchs={len([m for m in all_matches if m[4] > 0.4])} "
+                 f"γ={gamma:.3f} ρ={rho:.4f}")
+    return params
+
 
 NAME_MAPPING = {
     # ============================================================
@@ -1187,8 +1372,8 @@ async def collecter_scores_historiques(session, ligue, saison):
         async with db_lock:
             await db_conn.executemany(
                 "INSERT OR IGNORE INTO scores_matchs "
-                "(id_match, ligue_id, saison, buts_dom, buts_ext, team_dom_id, team_ext_id) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "(id_match, ligue_id, saison, buts_dom, buts_ext, team_dom_id, team_ext_id, match_date) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 [
                     (f['fixture']['id'],
                      f['league']['id'],
@@ -1196,7 +1381,8 @@ async def collecter_scores_historiques(session, ligue, saison):
                      f['goals']['home'],
                      f['goals']['away'],
                      f['teams']['home']['id'],
-                     f['teams']['away']['id'])
+                     f['teams']['away']['id'],
+                     f['fixture']['date'])
                     for f in lot
                     if f['goals']['home'] is not None and f['goals']['away'] is not None
                 ]
@@ -1271,9 +1457,10 @@ async def verifier_resultats_matchs(session):
                 async with db_lock:
                     await db_conn.execute(
                         "INSERT OR IGNORE INTO scores_matchs "
-                        "(id_match, ligue_id, saison, buts_dom, buts_ext, team_dom_id, team_ext_id) "
-                        "VALUES (?,?,?,?,?,?,?)",
-                        (id_m, ligue_id_match, saison_match, gh, ga, dom_id_match, ext_id_match)
+                        "(id_match, ligue_id, saison, buts_dom, buts_ext, team_dom_id, team_ext_id, match_date) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (id_m, ligue_id_match, saison_match, gh, ga, dom_id_match, ext_id_match,
+                         f['fixture']['date'])
                     )
                     await db_conn.commit()
 
@@ -1471,6 +1658,20 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
 
     L_A_base = (xg_d[0] * m_d / m_dom_l) * (xg_e[1] / m_dom_l) * m_dom_l
     L_B_base = (xg_e[0] * m_e / m_ext_l) * (xg_d[1] / m_ext_l) * m_ext_l
+
+    # --- 🧮 ENRICHISSEMENT DIXON-COLES COMPLET ---
+    # Si les paramètres α/β/γ/ρ par équipe sont disponibles (MLE quotidien),
+    # on blende les λ xG (forme récente) avec les λ DC (structure saison entière).
+    # Blend 50/50 : DC apporte la structure, xG apporte la forme récente.
+    dc = DC_PARAMS.get((ligue['id'], saison_correcte))
+    if dc and id_d in dc['teams'] and id_e in dc['teams']:
+        td, te = dc['teams'][id_d], dc['teams'][id_e]
+        L_A_dc = td['attack'] * te['defense'] * dc['gamma']
+        L_B_dc = te['attack'] * td['defense']
+        L_A_base = 0.50 * L_A_dc + 0.50 * L_A_base
+        L_B_base = 0.50 * L_B_dc + 0.50 * L_B_base
+        # Propager ρ DC (estimé conjointement, plus fiable)
+        RHO_DYNAMIQUE[(ligue['id'], saison_correcte)] = dc['rho']
 
     # --- ⛈️ INTÉGRATION DU WEATHER EDGE ---
     # Météo activée seulement à H < 6 (prévision fiable + marché peu anticipé)
@@ -2248,6 +2449,7 @@ async def main_loop():
     # Détection initiale de la couverture xG + collecte historique des scores
     dernier_retest_xg = None
     dernier_collecte_scores = None
+    dernier_dc = None
     async with aiohttp.ClientSession() as session:
         await detecter_ligues_sans_xg(session)
         for lg in CHAMPIONNATS:
@@ -2274,6 +2476,22 @@ async def main_loop():
                         await collecter_scores_historiques(session, lg, obtenir_saison_api(lg['nom']))
                 dernier_collecte_scores = maintenant
                 log_info("📊 Collecte quotidienne des scores FT terminée.")
+
+            # Estimation quotidienne des paramètres Dixon-Coles complets (α, β, γ, ρ par équipe)
+            if dernier_dc is None or (maintenant - dernier_dc).total_seconds() > 86400:
+                async with aiohttp.ClientSession() as session:
+                    for lg in CHAMPIONNATS:
+                        saison_lg = obtenir_saison_api(lg['nom'])
+                        stats_lg  = await actualiser_stats_ligue(session, lg, saison_lg)
+                        if stats_lg:
+                            _, _, _, _, mu_h_lg, mu_a_lg = stats_lg
+                            dc = await estimer_parametres_dc_complet(
+                                lg['id'], saison_lg, mu_h_lg, mu_a_lg)
+                            if dc:
+                                DC_PARAMS[(lg['id'], saison_lg)] = dc
+                                RHO_DYNAMIQUE[(lg['id'], saison_lg)] = dc['rho']
+                dernier_dc = maintenant
+                log_info("🧮 Paramètres DC complets recalculés pour toutes les ligues.")
 
             matchs = await lancer_scan_global_async()
             pause = calculer_pause(matchs)
