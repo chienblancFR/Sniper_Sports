@@ -89,7 +89,8 @@ cache_heures_matchs = {}
 # ==========================================
 # ⚙️ 1. SECRETS & PARAMÈTRES (LE BIG 3)
 # ==========================================
-load_dotenv()
+load_dotenv("identifiants_différent_api.env")
+load_dotenv()  # .env prioritaire si présent
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 API_ODDS_KEY = os.getenv("API_ODDS_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")

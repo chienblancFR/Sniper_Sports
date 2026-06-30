@@ -42,12 +42,32 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from collections import defaultdict
 
-load_dotenv()
+load_dotenv("identifiants_différent_api.env")
+load_dotenv()  # .env prioritaire si présent
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 API_ODDS_KEY     = os.getenv("API_ODDS_KEY")
 
 URL_FOOTBALL = "https://v3.football.api-sports.io"
-HEADERS_FB   = {"x-apisports-key": API_FOOTBALL_KEY, "v": "3"}
+
+
+def _headers_football():
+    return {"x-apisports-key": API_FOOTBALL_KEY, "v": "3"}
+
+
+def verifier_cles_api():
+    """Bloque la collecte si les clés API ne sont pas chargées."""
+    missing = [k for k, v in (
+        ("API_FOOTBALL_KEY", API_FOOTBALL_KEY),
+        ("API_ODDS_KEY", API_ODDS_KEY),
+    ) if not v]
+    if not missing:
+        return True
+    print("\n❌ Clés API manquantes : " + ", ".join(missing))
+    print("   Créez un fichier .env à la racine du projet avec :")
+    print("   API_FOOTBALL_KEY=votre_cle")
+    print("   API_ODDS_KEY=votre_cle")
+    print("\n   Ou placez vos clés dans identifiants_différent_api.env (déjà supporté).")
+    return False
 DB_PATH      = "backtest_data.db"
 
 # ─────────────────────────────────────────────────────────────
@@ -253,6 +273,68 @@ NAME_MAPPING = {
 # ─────────────────────────────────────────────────────────────
 # 🗄️  BASE DE DONNÉES
 # ─────────────────────────────────────────────────────────────
+async def configure_sqlite(conn):
+    """WAL + busy_timeout — évite 'database is locked' sur PythonAnywhere."""
+    await conn.execute("PRAGMA busy_timeout=120000")
+    try:
+        await conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+    await conn.execute("PRAGMA synchronous=NORMAL")
+
+
+async def persister_signaux(pending):
+    """
+    Écrit bt_signaux via une connexion dédiée (courte durée).
+    Retourne le nombre de lignes écrites, ou -1 en cas d'échec.
+    """
+    if not pending:
+        await _vider_signaux()
+        print("\n  💾 bt_signaux vidée (0 signaux)")
+        return 0
+
+    sql = "INSERT OR REPLACE INTO bt_signaux VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    for attempt in range(8):
+        try:
+            async with aiosqlite.connect(DB_PATH, timeout=120.0) as conn:
+                await configure_sqlite(conn)
+                await conn.execute("DELETE FROM bt_signaux")
+                await conn.executemany(sql, pending)
+                await conn.commit()
+            print(f"\n  💾 {len(pending)} signaux enregistrés en base")
+            return len(pending)
+        except Exception as e:
+            locked = "locked" in str(e).lower()
+            if locked and attempt < 7:
+                wait = min(30, 2 ** attempt)
+                print(f"  ⏳ DB verrouillée, nouvel essai dans {wait}s ({attempt + 1}/8)...")
+                await asyncio.sleep(wait)
+                continue
+            print(f"\n  ❌ Impossible d'écrire bt_signaux : {e}")
+            if locked:
+                print("  💡 Sur PythonAnywhere :")
+                print("     ps aux | grep python")
+                print("     kill <PID>  # collect ou autre simulate en cours")
+                print("     rm -f backtest_data.db-wal backtest_data.db-shm  # si aucun process actif")
+            return -1
+    return -1
+
+
+async def _vider_signaux():
+    for attempt in range(5):
+        try:
+            async with aiosqlite.connect(DB_PATH, timeout=120.0) as conn:
+                await configure_sqlite(conn)
+                await conn.execute("DELETE FROM bt_signaux")
+                await conn.commit()
+            return
+        except Exception as e:
+            if "locked" in str(e).lower() and attempt < 4:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise
+
+
 async def init_db(conn):
     await conn.executescript("""
         CREATE TABLE IF NOT EXISTS bt_fixtures (
@@ -454,7 +536,7 @@ def resultat_total(gh, ga, h, is_over):
 async def collecter_fixtures(conn, session, ligue, saison):
     """Télécharge tous les matchs terminés d'une ligue/saison."""
     url = f"{URL_FOOTBALL}/fixtures?league={ligue['id']}&season={saison}&status=FT"
-    data = await fetch(session, url, HEADERS_FB)
+    data = await fetch(session, url, _headers_football())
     if not data or not data.get('response'):
         return 0
 
@@ -486,7 +568,7 @@ async def collecter_xg(conn, session, fixture_id, home_id, away_id):
             return
 
     url = f"{URL_FOOTBALL}/fixtures/statistics?fixture={fixture_id}"
-    data = await fetch(session, url, HEADERS_FB)
+    data = await fetch(session, url, _headers_football())
 
     xg = {home_id: None, away_id: None}
     if data and data.get('response'):
@@ -586,6 +668,9 @@ async def phase_collecte(conn, session):
     print("\n" + "="*60)
     print("📥  PHASE 1 — COLLECTE DES DONNÉES HISTORIQUES")
     print("="*60)
+
+    if not verifier_cles_api():
+        return
 
     for ligue in CHAMPIONNATS:
         for saison in SAISONS_BACKTEST:
@@ -790,8 +875,11 @@ async def estimer_parametres_dc_bt(conn, ligue_id, saison, avant_date, mu_h, mu_
               [(-0.40, -0.001)])
 
     try:
-        res = minimize(neg_ll, x0, method='L-BFGS-B', bounds=bounds,
-                       options={'maxiter': 3000, 'ftol': 1e-9})
+        res = await asyncio.to_thread(
+            minimize, neg_ll, x0,
+            method='L-BFGS-B', bounds=bounds,
+            options={'maxiter': 3000, 'ftol': 1e-9},
+        )
     except Exception:
         return None
 
@@ -934,16 +1022,22 @@ async def simuler_paris(conn):
         n_odds = (await cur.fetchone())[0]
     async with conn.execute("SELECT COUNT(*) FROM bt_xg") as cur:
         n_xg = (await cur.fetchone())[0]
+    async with conn.execute("SELECT COUNT(*) FROM bt_signaux") as cur:
+        n_old = (await cur.fetchone())[0]
     print(f"  📋 Fixtures avec résultat : {n_fix}")
     print(f"  📊 Cotes H-24 en base     : {n_odds}")
     print(f"  🎯 Entrées xG en base     : {n_xg}")
+    if n_old:
+        print(f"  📦 Signaux existants      : {n_old} (seront remplacés si écriture OK)")
     print("  🧮 Modèle : blend 50/50 DC + xG, poids_dyn dynamique (formule bot live)")
 
     if n_odds == 0:
         print("\n  ⚠️  AUCUNE cote H-24 trouvée — la collecte d'odds a échoué.")
         print("  💡 Vérifiez API_ODDS_KEY et que votre plan inclut l'endpoint /v4/historical/")
         print("\n✅ Phase 2 terminée (0 signaux).")
-        return
+        return -1
+
+    all_pending = []
 
     for ligue in CHAMPIONNATS:
         async with conn.execute(
@@ -954,6 +1048,7 @@ async def simuler_paris(conn):
             fixtures = await cur.fetchall()
 
         signaux = 0
+        pending = []  # écriture batch en fin de ligue (lectures seules pendant la boucle)
         dc_cache = {}  # (ligue_id, saison, n_prior) -> params DC (point-in-time, sans lookahead)
 
         for fid, saison, date_utc, h_id, a_id, h_name, a_name, gh, ga in fixtures:
@@ -1103,18 +1198,23 @@ async def simuler_paris(conn):
 
             clv = round((cote_h24 / cote_cloture) - 1, 4) if cote_cloture else None
 
-            await conn.execute(
-                "INSERT OR REPLACE INTO bt_signaux VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (fid, ligue['id'], saison, market, outcome, h_val,
-                 cote_h24, cote_cloture, round(ev_final, 4), round(k, 4),
-                 mise, gh, ga, res, clv)
-            )
+            pending.append((
+                fid, ligue['id'], saison, market, outcome, h_val,
+                cote_h24, cote_cloture, round(ev_final, 4), round(k, 4),
+                mise, gh, ga, res, clv,
+            ))
             signaux += 1
 
-        await conn.commit()
+        all_pending.extend(pending)
         print(f"  {ligue['nom']} : {signaux} signaux générés")
 
-    print("\n✅ Phase 2 terminée.")
+    print(f"\n  📝 Total calculé : {len(all_pending)} signaux — écriture en base...")
+    n_saved = await persister_signaux(all_pending)
+    if n_saved >= 0:
+        print("\n✅ Phase 2 terminée.")
+    else:
+        print("\n❌ Phase 2 échouée (données en base inchangées — rapport = anciens signaux).")
+    return n_saved
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1302,7 +1402,8 @@ async def reset_backtest(full: bool = False):
         print("\n  >> Prochaine etape : python backtest_football.py --collect --simulate --report")
         return
 
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with aiosqlite.connect(DB_PATH, timeout=120.0) as conn:
+        await configure_sqlite(conn)
         async with conn.execute("SELECT COUNT(*) FROM bt_signaux") as cur:
             n_before = (await cur.fetchone())[0]
         await conn.execute("DELETE FROM bt_signaux")
@@ -1339,16 +1440,25 @@ async def main():
     if not run_phases and not all_phases:
         return
 
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with aiosqlite.connect(DB_PATH, timeout=120.0) as conn:
+        await configure_sqlite(conn)
         await init_db(conn)
 
         async with aiohttp.ClientSession() as session:
+            sim_ok = True
             if args.collect or all_phases:
                 await phase_collecte(conn, session)
             if args.simulate or all_phases:
-                await simuler_paris(conn)
+                async with aiosqlite.connect(
+                    f"file:{DB_PATH}?mode=ro", uri=True, timeout=120.0
+                ) as conn_ro:
+                    sim_ok = (await simuler_paris(conn_ro)) >= 0
             if args.report or all_phases:
-                await generer_rapport(conn)
+                if (args.simulate or all_phases) and not sim_ok:
+                    print("\n⚠️  Rapport ignoré — la simulation n'a pas pu écrire en base.")
+                    print("    Corrigez le verrou DB puis relancez --simulate --report")
+                else:
+                    await generer_rapport(conn)
 
 
 if __name__ == "__main__":
