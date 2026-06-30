@@ -1213,7 +1213,10 @@ async def collecter_scores_historiques(session, ligue, saison):
 # ==========================================
 async def verifier_resultats_matchs(session):
     async with db_lock:
-        async with db_conn.execute("SELECT id_match, equipe, handicap, cote_prise, mise, ligue FROM paris_log WHERE statut='PENDING'") as cursor:
+        async with db_conn.execute(
+            "SELECT id_match, equipe, handicap, cote_prise, mise, ligue, equipe_dom, equipe_ext "
+            "FROM paris_log WHERE statut='PENDING'"
+        ) as cursor:
             paris = await cursor.fetchall()
 
     if not paris: return
@@ -1239,7 +1242,7 @@ async def verifier_resultats_matchs(session):
         resultats_dict = {f['fixture']['id']: f for f in data['response']}
 
         for p in paris:
-            id_m, equipe_pari, h_val, cote, mise_initiale, ligue_tag = p
+            id_m, equipe_pari, h_val, cote, mise_initiale, ligue_tag, eq_dom_log, eq_ext_log = p
             f = resultats_dict.get(id_m)
             if not f: continue
 
@@ -1277,9 +1280,14 @@ async def verifier_resultats_matchs(session):
                 else:
                     nom_home_api = f['teams']['home']['name']
                     nom_away_api = f['teams']['away']['name']
-                    score_home = process.extractOne(equipe_pari, [nom_home_api])[1]
-                    score_away = process.extractOne(equipe_pari, [nom_away_api])[1]
-                    is_h = score_home > score_away
+                    # Priorité : équipe_dom/ext stockées en DB (noms Odds API exacts)
+                    # Fallback : fuzzy match si anciennes lignes sans ces colonnes
+                    if eq_dom_log:
+                        is_h = (equipe_pari == eq_dom_log)
+                    else:
+                        score_home = process.extractOne(equipe_pari, [nom_home_api])[1]
+                        score_away = process.extractOne(equipe_pari, [nom_away_api])[1]
+                        is_h = score_home > score_away
                     diff = (gh + h_val - ga) if is_h else (ga + h_val - gh)
 
                 if diff > 0.25 + _EPS_AH:               mult, stat = cote - 1,         "WON"
@@ -1555,6 +1563,9 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, mot_map
         for out in outcomes:
             h, cote, nom = float(out['point']), float(out['price']), out['name']
 
+            if cote < 1.70:
+                continue  # Cotes courtes : ratio edge/bruit défavorable (aligné backtest)
+
             # Pari exact déjà en log → skip (le tracker_clv_async gère la mise à jour CLV)
             async with db_lock:
                 async with db_conn.execute(
@@ -1663,7 +1674,7 @@ async def obtenir_xg_moyenne_async(session, team_id, l_id, saison_actuelle, sos_
     # 🚨 LE FACTEUR PROMU : moins de 5 matchs en D1 sur 2 saisons = promu
     if len(matchs_a_analyser) < 5:
         xg_off_promu = ligue_avg * 0.85
-        xg_def_promu = ligue_avg * 1.25
+        xg_def_promu = (ligue_avg_def or ligue_avg) * 1.25  # cible défensive, pas offensive
         return (xg_off_promu, xg_def_promu, len(matchs_a_analyser))
 
     tp, tc, tw = 0.0, 0.0, 0.0
