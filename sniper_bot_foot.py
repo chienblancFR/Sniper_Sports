@@ -1007,7 +1007,7 @@ async def envoyer_telegram_async(session, msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
     try:
-        async with session.post(url, json=payload) as response:
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status == 200: log_info("📱 Signal Telegram envoyé.")
     except Exception as e: log_info(f"⚠️ Erreur Telegram : {e}")
 
@@ -1202,7 +1202,10 @@ async def collecter_scores_historiques(session, ligue, saison):
                 ]
             )
             await db_conn.commit()
-        inserts += len(lot)
+        inserts += sum(
+            1 for f in lot
+            if f['goals']['home'] is not None and f['goals']['away'] is not None
+        )
 
     log_info(f"📊 scores_matchs : {inserts} matchs FT chargés pour {ligue['nom']} {saison}.")
     return inserts
@@ -1376,7 +1379,7 @@ async def evaluer_force_lineup(session, fixture_id, team_id, saison_correcte, de
 # ==========================================
 # 🎯 4. ANALYSEUR HYBRIDE
 # ==========================================
-async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, mot_map, luck_map, m_dom_l, m_ext_l, cotes_data):
+async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_attack_map, mot_map, luck_map, m_dom_l, m_ext_l, cotes_data):
     n_d, n_e = m['teams']['home']['name'], m['teams']['away']['name']
     id_d, id_e, id_m = m['teams']['home']['id'], m['teams']['away']['id'], m['fixture']['id']
 
@@ -1433,11 +1436,11 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, mot_map
     # ligue_avg_def : moyenne des buts encaissés par match selon le venue
     # Home team concède en moyenne m_ext_l (buts marqués par les visiteurs)
     # Away team concède en moyenne m_dom_l (buts marqués par les équipes à domicile)
-    xg_d_home = await obtenir_xg_moyenne_async(session, id_d, ligue['id'], saison_correcte, sos_map, m_dom_l, venue='home', ligue_avg_def=m_ext_l)
-    xg_e_away = await obtenir_xg_moyenne_async(session, id_e, ligue['id'], saison_correcte, sos_map, m_ext_l, venue='away', ligue_avg_def=m_dom_l)
+    xg_d_home = await obtenir_xg_moyenne_async(session, id_d, ligue['id'], saison_correcte, sos_map, m_dom_l, venue='home', ligue_avg_def=m_ext_l, sos_attack_map=sos_attack_map)
+    xg_e_away = await obtenir_xg_moyenne_async(session, id_e, ligue['id'], saison_correcte, sos_map, m_ext_l, venue='away', ligue_avg_def=m_dom_l, sos_attack_map=sos_attack_map)
     ligue_avg_all = (m_dom_l + m_ext_l) / 2
-    xg_d_all = await obtenir_xg_moyenne_async(session, id_d, ligue['id'], saison_correcte, sos_map, ligue_avg_all, venue='all', ligue_avg_def=ligue_avg_all)
-    xg_e_all = await obtenir_xg_moyenne_async(session, id_e, ligue['id'], saison_correcte, sos_map, ligue_avg_all, venue='all', ligue_avg_def=ligue_avg_all)
+    xg_d_all = await obtenir_xg_moyenne_async(session, id_d, ligue['id'], saison_correcte, sos_map, ligue_avg_all, venue='all', ligue_avg_def=ligue_avg_all, sos_attack_map=sos_attack_map)
+    xg_e_all = await obtenir_xg_moyenne_async(session, id_e, ligue['id'], saison_correcte, sos_map, ligue_avg_all, venue='all', ligue_avg_def=ligue_avg_all, sos_attack_map=sos_attack_map)
 
     # Pondération venue adaptative : la confiance dans les stats spécifiques (dom/ext)
     # croît avec la taille d'échantillon. Moins de 5 matchs → on se fie surtout au global.
@@ -1462,6 +1465,9 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, mot_map
     d_d = (mot_map.get(id_d, 1.0)-1) + (luck_map.get(id_d, 1.0)-1)
     d_e = (mot_map.get(id_e, 1.0)-1) + (luck_map.get(id_e, 1.0)-1)
     m_d, m_e = 1.0 + max(-0.25, min(0.25, d_d)), 1.0 + max(-0.25, min(0.25, d_e))
+
+    if not m_dom_l or not m_ext_l:
+        return  # Début de saison : aucun match joué, moyennes ligue à 0
 
     L_A_base = (xg_d[0] * m_d / m_dom_l) * (xg_e[1] / m_dom_l) * m_dom_l
     L_B_base = (xg_e[0] * m_e / m_ext_l) * (xg_d[1] / m_ext_l) * m_ext_l
@@ -1640,13 +1646,15 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, mot_map
 # ==========================================
 # 🚀 5. FONCTIONS MATHS & xG
 # ==========================================
-async def obtenir_xg_moyenne_async(session, team_id, l_id, saison_actuelle, sos_map, ligue_avg, venue='all', ligue_avg_def=None):
+async def obtenir_xg_moyenne_async(session, team_id, l_id, saison_actuelle, sos_map, ligue_avg, venue='all', ligue_avg_def=None, sos_attack_map=None):
     """
     Moteur Hybride : Gère le passage de témoin entre la saison passée et actuelle,
     applique un shrinkage bayésien et une décroissance temporelle basée sur les jours réels.
-    ligue_avg     : moyenne buts MARQUÉS par match (cible shrinkage offensif)
-    ligue_avg_def : moyenne buts ENCAISSÉS par match (cible shrinkage défensif)
-                    Si None → utilise ligue_avg (compatibilité ascendante).
+    ligue_avg      : moyenne buts MARQUÉS par match (cible shrinkage offensif)
+    ligue_avg_def  : moyenne buts ENCAISSÉS par match (cible shrinkage défensif)
+                     Si None → utilise ligue_avg (compatibilité ascendante).
+    sos_attack_map : buts marqués par équipe (force offensive adverse) pour normaliser xG défensif.
+                     Si None → fallback sur sos_map (compatibilité ascendante, sous-optimal).
     Retourne (xg_off, xg_def, n_matchs_utilises).
     """
     if ligue_avg_def is None:
@@ -1748,10 +1756,14 @@ async def obtenir_xg_moyenne_async(session, team_id, l_id, saison_actuelle, sos_
             weight *= ALPHA_DEGRADATION
 
         opp_id = m['teams']['away']['id'] if m['teams']['home']['id'] == team_id else m['teams']['home']['id']
-        ratio = max(0.6, min(1.6, sos_map.get(opp_id, ligue_avg) / (ligue_avg or 1)))
+        # ratio_def : force défensive de l'adversaire (buts concédés / moy.) → normalise notre attaque
+        # ratio_att : force offensive de l'adversaire (buts marqués / moy.)  → normalise notre défense
+        ratio_def = max(0.6, min(1.6, sos_map.get(opp_id, ligue_avg) / (ligue_avg or 1)))
+        _att_map  = sos_attack_map if sos_attack_map else sos_map
+        ratio_att = max(0.6, min(1.6, _att_map.get(opp_id, ligue_avg) / (ligue_avg or 1)))
 
-        tp += (p / ratio) * weight
-        tc += (c * ratio) * weight
+        tp += (p / ratio_def) * weight   # si adversaire défense faible → on a marqué facile → normalise DOWN
+        tc += (c / ratio_att) * weight   # si adversaire attaque forte  → on a encaissé normal → normalise DOWN
         tw += weight
 
     xg_off_brut = tp / tw
@@ -1814,6 +1826,7 @@ async def actualiser_stats_ligue(session, ligue_cfg, season):
         if len(standings) < 10:
             avg = ligue_cfg.get('avg_goals', 1.3)
             return ({t['team']['id']: avg for t in standings},
+                    {t['team']['id']: avg for t in standings},
                     {t['team']['id']: 1.0 for t in standings}, {}, avg, avg * 0.85)
 
         pts_c1 = standings[min(ligue_cfg['c1']-1, len(standings)-1)]['points']
@@ -1826,13 +1839,14 @@ async def actualiser_stats_ligue(session, ligue_cfg, season):
         league_avg_gf = (m_dom_l + m_ext_l) / 2
         league_avg_ga = sum(t['all']['goals']['against'] for t in standings) / (sum(t['all']['played'] for t in standings) or 1)
 
-        sos, mot, luck = {}, {}, {}
+        sos, sos_attack, mot, luck = {}, {}, {}, {}
         for team in standings:
             t_id = team['team']['id']
             j = team['all']['played'] or 1
             d = min(abs(team['points'] - pts_c1), abs(team['points'] - pts_rel))
             mot[t_id] = 1.0 + (0.10 * (1/(d+1))) if d <= 4 else (0.95 if d > 12 else 1.0)
-            sos[t_id] = team['all']['goals']['against'] / j
+            sos[t_id]        = team['all']['goals']['against'] / j  # buts concédés : force défensive adverse (normalise notre attaque)
+            sos_attack[t_id] = team['all']['goals']['for']     / j  # buts marqués  : force offensive adverse (normalise notre défense)
 
             # PDO-proxy : combine sur-performance offensive ET défensive
             # gf_ratio > 1 = équipe qui marque plus que la moyenne (peut être chanceuse)
@@ -1843,7 +1857,7 @@ async def actualiser_stats_ligue(session, ligue_cfg, season):
             pdo = (gf_ratio + (2.0 - ga_ratio)) / 2.0
             luck[t_id] = 1.0 - (pdo - 1.0) * 0.30
 
-        resultat = (sos, mot, luck, m_dom_l, m_ext_l)
+        resultat = (sos, sos_attack, mot, luck, m_dom_l, m_ext_l)
 
         # --- ρ DYNAMIQUE : estimation MLE saison courante ---
         # Lance en tâche de fond pour ne pas bloquer le scan si < 30 matchs.
@@ -2294,5 +2308,8 @@ if __name__ == "__main__":
             pass  # Windows ne supporte pas add_signal_handler — shutdown propre ignoré
     try:
         loop.run_until_complete(main_loop())
+    except KeyboardInterrupt:
+        # Sur Windows, add_signal_handler n'est pas supporté → fallback ici
+        loop.run_until_complete(_graceful_shutdown("SIGINT"))
     finally:
         loop.close()
