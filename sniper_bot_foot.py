@@ -1853,12 +1853,15 @@ def generer_matrice_dixon(l_dom, l_ext, ligue_id=None, saison=None):
     """
     Génère la matrice Dixon-Coles.
     Priorité : ρ estimé dynamiquement (MLE saison courante) > ρ statique par ligue > défaut.
+    Taille dynamique : couvre 99.8% de la masse Poisson (min 10, max 15) pour éviter
+    la troncature sur les ligues à fort volume de buts (Bundesliga, Eredivisie, λ ≥ 3.5).
     """
     rho = (RHO_DYNAMIQUE.get((ligue_id, saison))
            or RHO_PAR_LIGUE.get(ligue_id, RHO_DEFAULT) if ligue_id
            else RHO_DEFAULT)
-    p_d = [poisson.pmf(i, l_dom) for i in range(10)]
-    p_e = [poisson.pmf(i, l_ext) for i in range(10)]
+    max_goals = max(10, min(int(np.ceil(poisson.ppf(0.998, max(l_dom, l_ext)))) + 1, 15))
+    p_d = [poisson.pmf(i, l_dom) for i in range(max_goals)]
+    p_e = [poisson.pmf(i, l_ext) for i in range(max_goals)]
     m = np.outer(p_d, p_e).astype(float)
     m[0, 0] *= max(0, 1 - (l_dom * l_ext * rho))
     m[1, 0] *= max(0, 1 + (l_ext * rho))
@@ -1870,8 +1873,9 @@ _EPS_AH = 1e-6  # tolérance float pour quarts de handicap
 
 def calculer_ev_ah(matrice, h, is_h, cote):
     esperance = 0.0
-    for i in range(10):
-        for j in range(10):
+    n = matrice.shape[0]
+    for i in range(n):
+        for j in range(n):
             prob = matrice[i, j]
             if prob < 0.0001: continue
             score_diff = (i - j) if is_h else (j - i)
@@ -1888,8 +1892,9 @@ def calculer_ev_ah(matrice, h, is_h, cote):
 def calculer_ev_total_asiatique(matrice, ligne, is_over, cote):
     """Calcule l'EV pour les Totaux Asiatiques (0.0, 0.25, 0.5, 0.75)."""
     esperance = 0.0
-    for i in range(10):
-        for j in range(10):
+    n = matrice.shape[0]
+    for i in range(n):
+        for j in range(n):
             prob = matrice[i, j]
             if prob < 0.0001: continue
 
@@ -1913,8 +1918,9 @@ def calculer_kelly_ah(matrice, h, is_h, cote):
     f* = E[X] / E[X²]
     """
     e_x, e_x2 = 0.0, 0.0
-    for i in range(10):
-        for j in range(10):
+    n = matrice.shape[0]
+    for i in range(n):
+        for j in range(n):
             prob = matrice[i, j]
             if prob < 0.0001: continue
             score_diff = (i - j) if is_h else (j - i)
@@ -1934,8 +1940,9 @@ def calculer_kelly_total(matrice, ligne, is_over, cote):
     f* = E[X] / E[X²]
     """
     e_x, e_x2 = 0.0, 0.0
-    for i in range(10):
-        for j in range(10):
+    n = matrice.shape[0]
+    for i in range(n):
+        for j in range(n):
             prob = matrice[i, j]
             if prob < 0.0001: continue
             total_match = i + j
@@ -1989,11 +1996,19 @@ async def traiter_une_ligue(session, ligue) -> int:
         log_info(f"🔎 {ligue['nom']} : {n_matchs} match(s) dans les 7 prochains jours.")
 
     if isinstance(cotes, list) and matchs and 'response' in matchs:
-        tasks = [analyser_un_match(session, m, ligue, saison_correcte, *stats, cotes) for m in matchs['response']]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for res in results:
-            if isinstance(res, Exception):
-                log_info(f"⚠️ Match ignoré suite à une erreur de donnée : {res}")
+        # Traitement par lots de 5 matchs pour limiter les pics de requêtes API
+        # et préserver le quota journalier (100 req/j sur plan gratuit).
+        MATCH_BATCH = 5
+        all_matchs = matchs['response']
+        for i in range(0, len(all_matchs), MATCH_BATCH):
+            chunk = all_matchs[i:i + MATCH_BATCH]
+            chunk_tasks = [analyser_un_match(session, m, ligue, saison_correcte, *stats, cotes) for m in chunk]
+            results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    log_info(f"⚠️ Match ignoré suite à une erreur de donnée : {res}")
+            if i + MATCH_BATCH < len(all_matchs):
+                await asyncio.sleep(2)  # Respiration entre lots
 
     return n_matchs
 
