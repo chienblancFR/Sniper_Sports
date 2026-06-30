@@ -8,12 +8,14 @@ import streamlit as st
 from utils import (
     afficher_alertes_chargement,
     appliquer_theme_dark,
+    calculer_drawdown_serie,
     calculer_max_drawdown,
     convertir_dates,
     creer_graphique_bankroll,
     creer_graphique_pl_marche,
     filtre_temporel_sidebar,
     nettoyer_colonnes_numeriques,
+    preparer_df_backtest,
     verifier_authentification,
 )
 
@@ -93,6 +95,7 @@ def load_backtest_data():
     df['Type_Marche'] = df['market'].map(
         {'spreads': 'Handicap Asiatique', 'totals': 'Totaux (Buts)'}
     )
+    df = preparer_df_backtest(df)
     return df, "ok"
 
 
@@ -303,24 +306,29 @@ with tab_backtest:
         if marche_bt != "Tous":
             df_bt = df_bt[df_bt['Type_Marche'] == marche_bt]
 
-        # Séparer résultats résolus / en attente
+        # Séparer résultats résolus / en attente (tri chronologique conservé)
         df_bt_res = df_bt[df_bt['resultat'].notna()].copy()
+        if 'Date' in df_bt_res.columns:
+            df_bt_res = df_bt_res.sort_values('Date').reset_index(drop=True)
         df_bt_clv = df_bt_res[df_bt_res['clv'].notna()].copy()
+
+        if 'date_utc' not in df_bt.columns:
+            st.info(
+                "CSV sans colonne `date_utc` — regénérez avec "
+                "`python backtest_football.py --report` pour l'axe dates."
+            )
 
         # ── KPIs ─────────────────────────────────────────────────
         st.subheader("📊 Vue d'ensemble — Back-test Dixon-Coles")
 
         total_signaux = len(df_bt_res)
-        total_pnl     = df_bt_res['resultat'].sum()
+        total_pnl     = df_bt_res['Profit_Unites'].sum()
         total_mise_bt = df_bt_res['mise'].sum()
         roi_bt        = (total_pnl / total_mise_bt * 100) if total_mise_bt > 0 else 0
         clv_moy       = df_bt_clv['clv'].mean() * 100 if not df_bt_clv.empty else 0
         wins_bt       = (df_bt_res['resultat'] > 0).sum()
         wr_bt         = (wins_bt / total_signaux * 100) if total_signaux > 0 else 0
-
-        cumul = df_bt_res['resultat'].cumsum()
-        peak  = cumul.cummax()
-        dd    = ((peak - cumul) / (CAPITAL_INITIAL + peak)).max() * 100 if not cumul.empty else 0
+        dd            = calculer_drawdown_serie(df_bt_res['Profit_Unites'], CAPITAL_INITIAL)
 
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Signaux générés",  f"{total_signaux}")
@@ -336,11 +344,14 @@ with tab_backtest:
         with col_a:
             st.subheader("📈 Courbe de Capital (Back-test)")
             if not df_bt_res.empty:
-                df_curve = df_bt_res.reset_index(drop=True).copy()
-                df_curve['Bankroll'] = CAPITAL_INITIAL + df_curve['resultat'].cumsum()
+                df_curve, _ = calculer_max_drawdown(
+                    df_bt_res, 'Profit_Unites', CAPITAL_INITIAL
+                )
+                axe_x = df_curve['Date'] if 'Date' in df_curve.columns else df_curve.index
+                lbl_x = "Date du match" if 'Date' in df_curve.columns else "Paris (index)"
                 fig_bt_bank = go.Figure()
                 fig_bt_bank.add_trace(go.Scatter(
-                    x=df_curve.index, y=df_curve['Bankroll'],
+                    x=axe_x, y=df_curve['Bankroll'],
                     mode='lines', fill='tozeroy',
                     line=dict(color='#00BFFF', width=2),
                     fillcolor='rgba(0,191,255,0.1)',
@@ -349,7 +360,7 @@ with tab_backtest:
                 fig_bt_bank.add_hline(y=CAPITAL_INITIAL, line_dash="dash", line_color="#FFFFFF", opacity=0.4)
                 fig_bt_bank.update_layout(
                     yaxis_title="Capital (unités)",
-                    xaxis_title="Paris (ordre chronologique)",
+                    xaxis_title=lbl_x,
                     showlegend=False
                 )
                 appliquer_theme_dark(fig_bt_bank)
@@ -362,7 +373,7 @@ with tab_backtest:
             st.subheader("🏆 ROI & CLV par Ligue")
             if not df_bt_res.empty:
                 grp = df_bt_res.groupby('Nom_Ligue').agg(
-                    PnL=('resultat', 'sum'),
+                    PnL=('Profit_Unites', 'sum'),
                     Mise=('mise', 'sum'),
                     N=('resultat', 'count')
                 ).reset_index()
@@ -451,7 +462,7 @@ with tab_backtest:
             st.subheader("📊 P&L par Marché")
             if not df_bt_res.empty:
                 grp_m = df_bt_res.groupby('Type_Marche').agg(
-                    PnL=('resultat', 'sum'),
+                    PnL=('Profit_Unites', 'sum'),
                     Mise=('mise', 'sum'),
                     N=('resultat', 'count')
                 ).reset_index()
@@ -480,7 +491,7 @@ with tab_backtest:
         if not df_bt_res.empty:
             tbl = df_bt_res.groupby(['Nom_Ligue', 'Type_Marche']).agg(
                 N=('resultat', 'count'),
-                PnL=('resultat', 'sum'),
+                PnL=('Profit_Unites', 'sum'),
                 Mise=('mise', 'sum'),
             ).reset_index()
             tbl['ROI (%)'] = (tbl['PnL'] / tbl['Mise'] * 100).round(2)

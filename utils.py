@@ -128,6 +128,41 @@ def calculer_max_drawdown(df: pd.DataFrame, col_profit: str, capital_initial: fl
     return df, max_dd_pct
 
 
+def preparer_df_backtest(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise le CSV back-test : Profit_Unites = resultat × mise, tri chronologique.
+    Colonne date_utc optionnelle (CSV regénéré après --report).
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    cols_num = ['resultat', 'mise', 'clv', 'ev_modele', 'kelly', 'cote_h24', 'cote_cloture', 'h_val']
+    df = nettoyer_colonnes_numeriques(df, cols_num)
+    df['Profit_Unites'] = df['resultat'] * df['mise']
+    if 'date_utc' in df.columns:
+        df['Date'] = pd.to_datetime(df['date_utc'], errors='coerce', utc=True)
+        if hasattr(df['Date'].dt, 'tz') and df['Date'].dt.tz is not None:
+            df['Date'] = df['Date'].dt.tz_localize(None)
+        df = df.sort_values('Date', na_position='last').reset_index(drop=True)
+    else:
+        df = df.sort_values('fixture_id').reset_index(drop=True)
+    return df
+
+
+def calculer_drawdown_serie(profits, capital_initial: float = 100.0) -> float:
+    """Max drawdown % — même logique que generer_rapport() dans backtest_football.py."""
+    bankroll = capital_initial
+    peak = bankroll
+    max_dd = 0.0
+    for p in profits:
+        bankroll += float(p)
+        if bankroll > peak:
+            peak = bankroll
+        if peak > 0:
+            max_dd = max(max_dd, (peak - bankroll) / peak)
+    return max_dd * 100
+
+
 # ──────────────────────────────────────────────────────────────
 # 📈  GRAPHIQUES PLOTLY
 # ──────────────────────────────────────────────────────────────

@@ -1260,9 +1260,15 @@ async def generer_rapport(conn):
 
     nom_par_id = {c['id']: c['nom'] for c in CHAMPIONNATS}
 
-    async with conn.execute(
-        "SELECT * FROM bt_signaux WHERE resultat IS NOT NULL ORDER BY ligue_id, saison"
-    ) as cur:
+    async with conn.execute("""
+        SELECT s.fixture_id, s.ligue_id, s.saison, s.market, s.outcome,
+               s.h_val, s.cote_h24, s.cote_cloture, s.ev_modele, s.kelly,
+               s.mise, s.gh, s.ga, s.resultat, s.clv, f.date_utc
+        FROM bt_signaux s
+        JOIN bt_fixtures f ON f.id = s.fixture_id
+        WHERE s.resultat IS NOT NULL
+        ORDER BY f.date_utc
+    """) as cur:
         rows = await cur.fetchall()
 
     # Ajouter le nom de la ligue en fin de tuple (compatible avec toutes versions SQLite)
@@ -1386,16 +1392,22 @@ async def generer_rapport(conn):
 
     # ── Export CSV ──────────────────────────────────────────
     csv_path = "backtest_results.csv"
-    async with conn.execute(
-        "SELECT * FROM bt_signaux WHERE resultat IS NOT NULL ORDER BY ligue_id, saison"
-    ) as cur:
+    async with conn.execute("""
+        SELECT s.fixture_id, s.ligue_id, s.saison, s.market, s.outcome,
+               s.h_val, s.cote_h24, s.cote_cloture, s.ev_modele, s.kelly,
+               s.mise, s.gh, s.ga, s.resultat, s.clv, f.date_utc
+        FROM bt_signaux s
+        JOIN bt_fixtures f ON f.id = s.fixture_id
+        WHERE s.resultat IS NOT NULL
+        ORDER BY f.date_utc
+    """) as cur:
         rows_csv = await cur.fetchall()
 
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['fixture_id', 'ligue_id', 'saison', 'market', 'outcome',
                     'h_val', 'cote_h24', 'cote_cloture', 'ev_modele', 'kelly',
-                    'mise', 'gh', 'ga', 'resultat', 'clv'])
+                    'mise', 'gh', 'ga', 'resultat', 'clv', 'date_utc'])
         w.writerows(rows_csv)
 
     print(f"\n📄 Résultats détaillés exportés dans {csv_path}")
