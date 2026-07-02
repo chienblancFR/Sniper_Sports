@@ -70,6 +70,35 @@ def verifier_cles_api():
     return False
 DB_PATH      = "backtest_data.db"
 
+
+def verifier_fichier_db(path=DB_PATH):
+    """Vérifie que la base SQLite est lisible (évite 'file is not a database')."""
+    import sqlite3
+    if not os.path.exists(path):
+        print(f"\n❌ Fichier absent : {path}")
+        return False
+    size = os.path.getsize(path)
+    if size < 100_000:
+        print(f"\n❌ {path} trop petit ({size:,} octets) — collecte probablement incomplète.")
+        return False
+    try:
+        conn = sqlite3.connect(path)
+        n_fix = conn.execute("SELECT COUNT(*) FROM bt_fixtures").fetchone()[0]
+        n_odds = conn.execute("SELECT COUNT(*) FROM bt_odds_h24").fetchone()[0]
+        conn.close()
+        print(f"  ✅ Base OK — {n_fix:,} fixtures, {n_odds:,} cotes H-24")
+        return True
+    except sqlite3.Error as e:
+        print(f"\n❌ {path} illisible ou corrompu ({e})")
+        print("\n   → Sur PythonAnywhere (Bash), créez une copie propre puis retéléchargez :")
+        print("     cd ~")
+        print("     python3 -c \"import sqlite3; s=sqlite3.connect('backtest_data.db');")
+        print("     d=sqlite3.connect('backtest_export.db'); s.backup(d); d.close(); s.close();")
+        print("     print('OK', s.execute('select count(*) from bt_fixtures').fetchone()[0])\"")
+        print("\n   → Files : téléchargez backtest_export.db")
+        print("     Renommez-le backtest_data.db sur votre PC (remplace l'ancien).")
+        return False
+
 # ─────────────────────────────────────────────────────────────
 # ⚙️  CONFIGURATION
 # ─────────────────────────────────────────────────────────────
@@ -1483,6 +1512,10 @@ async def main():
     all_phases = not run_phases and not args.reset and not args.reset_full
 
     if not run_phases and not all_phases:
+        return
+
+    needs_db = args.simulate or args.report or all_phases
+    if needs_db and os.path.exists(DB_PATH) and not verifier_fichier_db():
         return
 
     async with aiosqlite.connect(DB_PATH, timeout=120.0) as conn:
