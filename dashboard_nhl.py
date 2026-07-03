@@ -1,17 +1,19 @@
-import streamlit as st
+import os
+
 import pandas as pd
-import plotly.graph_objects as go
+import streamlit as st
 
 from utils import (
-    verifier_authentification,
-    nettoyer_colonnes_numeriques,
-    convertir_dates,
     afficher_alertes_chargement,
-    filtre_temporel_sidebar,
     calculer_max_drawdown,
+    convertir_dates,
     creer_graphique_bankroll,
+    creer_graphique_clv_cumule,
     creer_graphique_pl_marche,
-    appliquer_theme_dark,
+    filtre_marche_sidebar,
+    filtre_temporel_sidebar,
+    nettoyer_colonnes_numeriques,
+    verifier_authentification,
 )
 
 # ==========================================
@@ -19,166 +21,275 @@ from utils import (
 # ==========================================
 st.set_page_config(page_title="NHL Quant Dashboard", page_icon="🏒", layout="wide")
 
-# ==========================================
-# 🛑 ÉCRAN DE SÉCURITÉ
-# ==========================================
 verifier_authentification()
 
 st.title("🏒 Centre de Commandement : Sniper NHL Oméga")
 
 URL_JOURNAL = "https://chienblanc.pythonanywhere.com/data/journal_trading_nhl_SEC2026xOmG.csv"
+FICHIER_LOCAL = "journal_trading_nhl_SEC2026xOmG.csv"
 CAPITAL_INITIAL = 1000.0
 
-# ==========================================
-# 📥 CHARGEMENT DES DONNÉES DISTANTES
-# ==========================================
+
+def _charger_csv(url: str, fichier_local: str):
+    """Tente l'URL distante, puis le fichier local."""
+    try:
+        df = pd.read_csv(url)
+        if not df.empty:
+            return df, "ok", f"PA · {fichier_local}"
+    except Exception:
+        pass
+
+    local_path = os.path.join(os.getcwd(), fichier_local)
+    if os.path.exists(local_path):
+        try:
+            df = pd.read_csv(local_path)
+            if not df.empty:
+                return df, "ok", f"local · {fichier_local}"
+            return df, "empty", f"local · {fichier_local} (vide)"
+        except Exception:
+            return pd.DataFrame(), "error", f"local · {fichier_local}"
+
+    return pd.DataFrame(), "missing", "introuvable"
+
+
+def extraire_type_pari(pari_str):
+    pari_upper = str(pari_str).upper()
+    if "OVER" in pari_upper or "UNDER" in pari_upper:
+        return "Over/Under (Totaux)"
+    if "PUCK LINE" in pari_upper or "HANDICAP" in pari_upper:
+        return "Puck Line / Handicap"
+    return "Moneyline"
+
+
+def enrichir_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    if "Pari" in df.columns:
+        df["Type_Marche"] = df["Pari"].apply(extraire_type_pari)
+    if "Cote_Prise" in df.columns and "Cote_CLV" in df.columns:
+        mask = (df["Cote_Prise"] > 1) & (df["Cote_CLV"] > 1)
+        df["CLV"] = None
+        df.loc[mask, "CLV"] = df.loc[mask, "Cote_Prise"] / df.loc[mask, "Cote_CLV"] - 1
+    return df
+
+
 @st.cache_data(ttl=60)
 def load_data():
-    try:
-        df = pd.read_csv(URL_JOURNAL)
-    except Exception:
-        return pd.DataFrame(), "error"
+    df, statut, source = _charger_csv(URL_JOURNAL, FICHIER_LOCAL)
+    if statut != "ok":
+        return df, statut, source
 
-    if df.empty:
-        return df, "empty"
-
-    colonnes_numeriques = ["Vraie_Cote_Bot", "Cote_Prise", "Cote_CLV", "Edge(%)", "Risque(%)", "Mise_€", "P&L"]
+    colonnes_numeriques = [
+        "Vraie_Cote_Bot", "Cote_Prise", "Cote_CLV",
+        "Edge(%)", "Risque(%)", "Mise_€", "P&L",
+    ]
     df = nettoyer_colonnes_numeriques(df, colonnes_numeriques)
     df = convertir_dates(df)
-    return df, "ok"
+    df = enrichir_dataframe(df)
+    return df, "ok", source
 
-df, statut_chargement = load_data()
 
 # ==========================================
-# 🛑 AFFICHAGE SI AUCUNE DONNÉE OU ERREUR
+# 🎛️ SIDEBAR — CONTRÔLES
 # ==========================================
+st.sidebar.header("⚙️ Contrôles")
+if st.sidebar.button("🔄 Rafraîchir les données", use_container_width=True):
+    load_data.clear()
+    st.rerun()
+
+df, statut_chargement, source = load_data()
+st.caption(f"📡 Live : **{source}** (cache 60 s)")
+
 afficher_alertes_chargement(
     statut_chargement, df,
-    msg_succes="🎯 Le radar Oméga est armé. En attente de la première transaction de la saison en octobre..."
+    msg_succes="🏒 Le radar NHL Oméga est armé. En attente des premières transactions..."
 )
 
-# ==========================================
-# 🔍 BARRE DE FILTRES DYNAMIQUES (SIDEBAR)
-# ==========================================
 st.sidebar.markdown("---")
-st.sidebar.header("🎯 Filtres Écran Principal")
+st.sidebar.header("🎯 Filtres Live")
 
-df = filtre_temporel_sidebar(df)
+df_live = filtre_temporel_sidebar(df, key_prefix="nhl")
+df_live = filtre_marche_sidebar(
+    df_live, key="nhl_marche", label_tous="Tous les Marchés"
+)
 
-# Filtre par Type de Pari
-if not df.empty and "Pari" in df.columns:
-    def extraire_type_pari(pari_str):
-        pari_upper = str(pari_str).upper()
-        if "OVER" in pari_upper or "UNDER" in pari_upper:
-            return "Over/Under (Totaux)"
-        if "PUCK LINE" in pari_upper or "HANDICAP" in pari_upper:
-            return "Puck Line / Handicap"
-        return "Moneyline"
+if not df_live.empty and "Visiteur" in df_live.columns and "Local" in df_live.columns:
+    equipes = sorted(set(df_live["Visiteur"].dropna()) | set(df_live["Local"].dropna()))
+    equipe_choisie = st.sidebar.selectbox(
+        "🏒 Équipe :", ["Toutes les Équipes"] + equipes, key="nhl_equipe"
+    )
+    if equipe_choisie != "Toutes les Équipes":
+        df_live = df_live[
+            (df_live["Visiteur"] == equipe_choisie) | (df_live["Local"] == equipe_choisie)
+        ]
 
-    df['Type_Pari'] = df['Pari'].apply(extraire_type_pari)
-    types_dispo = sorted(df['Type_Pari'].unique().tolist())
-    type_choisi = st.sidebar.selectbox("📊 Type de pari :", ["Tous les Types"] + types_dispo)
-    if type_choisi != "Tous les Types":
-        df = df[df['Type_Pari'] == type_choisi]
+if "Statut" not in df_live.columns and not df_live.empty:
+    st.error("Format CSV live invalide (colonne `Statut` manquante).")
+    st.stop()
+if df_live.empty:
+    if df.empty:
+        st.stop()
+    st.info("Aucune transaction ne correspond aux filtres sélectionnés.")
+    st.stop()
 
 # ==========================================
-# 📊 CALCUL DES KPI
+# 📊 KPI
 # ==========================================
-df_termines = df[df['Statut'].isin(['GAGNÉ', 'PERDU'])].copy()
-df_attente = df[df['Statut'] == 'EN ATTENTE'].copy()
+df_termines = df_live[df_live["Statut"].isin(["GAGNÉ", "PERDU"])].copy()
+df_attente = df_live[df_live["Statut"] == "EN ATTENTE"].copy()
 
-total_pl = df_termines['P&L'].sum() if not df_termines.empty else 0.0
+total_pl = df_termines["P&L"].sum() if not df_termines.empty else 0.0
 capital_actuel = CAPITAL_INITIAL + total_pl
-winrate = (len(df_termines[df_termines['Statut'] == 'GAGNÉ']) / len(df_termines) * 100) if not df_termines.empty else 0
-total_mise = df_termines['Mise_€'].sum() if not df_termines.empty else 0.0
+total_mise = df_termines["Mise_€"].sum() if not df_termines.empty else 0.0
 roi = (total_pl / total_mise * 100) if total_mise > 0 else 0
+winrate = (
+    len(df_termines[df_termines["Statut"] == "GAGNÉ"]) / len(df_termines) * 100
+    if not df_termines.empty else 0
+)
 
 max_dd_pct = 0.0
 if not df_termines.empty:
-    df_termines, max_dd_pct = calculer_max_drawdown(df_termines, 'P&L', CAPITAL_INITIAL)
+    df_termines, max_dd_pct = calculer_max_drawdown(df_termines, "P&L", CAPITAL_INITIAL)
 
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Capital Actuel", f"{capital_actuel:.2f} €", f"{total_pl:.2f} €")
-col2.metric("Retour sur Investissement (ROI)", f"{roi:.2f} %")
-col3.metric("Taux de Réussite (Winrate)", f"{winrate:.1f} %")
-col4.metric("Max Drawdown", f"{max_dd_pct:.1f} %")
-col5.metric("Paris en Attente", f"{len(df_attente)}")
+df_clv_ok = df_termines[(df_termines["CLV"].notna()) & (df_termines["CLV"] != 0)] if not df_termines.empty else pd.DataFrame()
+clv_moy = df_clv_ok["CLV"].mean() * 100 if not df_clv_ok.empty else None
+edge_col = "Edge(%)" if "Edge(%)" in df_termines.columns else None
+df_edge_ok = df_termines[df_termines[edge_col].notna()] if edge_col and not df_termines.empty else pd.DataFrame()
+edge_moy = df_edge_ok[edge_col].mean() if not df_edge_ok.empty else None
+
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+c1.metric("Capital Actuel", f"{capital_actuel:.2f} €", f"{total_pl:+.2f} €")
+c2.metric("ROI", f"{roi:.2f} %")
+c3.metric("Winrate", f"{winrate:.1f} %")
+c4.metric("Max Drawdown", f"{max_dd_pct:.1f} %")
+c5.metric("Ordres en Cours", f"{len(df_attente)}")
+c6.metric(
+    "CLV moyen",
+    f"{clv_moy:+.2f} %" if clv_moy is not None else "N/A",
+    help=f"Sur {len(df_clv_ok)} paris clôturés avec CLV",
+)
+c7.metric(
+    "Edge moyen",
+    f"{edge_moy:+.2f} %" if edge_moy is not None else "N/A",
+    help=f"Sur {len(df_edge_ok)} paris avec edge enregistré",
+)
 
 st.markdown("---")
 
 # ==========================================
-# 📈 GRAPHIQUE 1 : COURBE DE CROISSANCE
+# 📈 BANKROLL
 # ==========================================
-st.subheader("📈 Évolution de la Bankroll")
-
+st.subheader("📈 Évolution du Capital (Sniper NHL Oméga)")
 if not df_termines.empty:
     fig_bankroll = creer_graphique_bankroll(
         df_termines,
-        hover_data=['Date', 'Visiteur', 'Local', 'Pari', 'P&L'],
-        couleur='#00ff00',
-        unite='€'
+        hover_data=["Date", "Visiteur", "Local", "Pari", "P&L"],
+        couleur="#00FF00",
+        unite="€",
     )
     st.plotly_chart(fig_bankroll, use_container_width=True)
 else:
-    st.info("La courbe de croissance s'affichera dès qu'un pari sera classé comme GAGNÉ ou PERDU.")
+    st.info("La courbe de croissance s'affichera dès qu'un match sera clôturé.")
 
 col_gauche, col_droite = st.columns(2)
 
-# ==========================================
-# 🥧 GRAPHIQUE 2 : RENTABILITÉ PAR MARCHÉ
-# ==========================================
 with col_gauche:
-    st.subheader("🎯 Rentabilité par type de pari")
+    st.subheader("🎯 Rentabilité et Volume par Type de Pari")
     if not df_termines.empty:
-        df_termines['Marche'] = df_termines['Pari'].apply(
-            lambda x: x.split(' ')[0] if isinstance(x, str) else 'Inconnu'
-        )
-        pl_par_marche = df_termines.groupby('Marche').agg(
-            P_and_L=('P&L', 'sum'),
-            Volume=('P&L', 'count')
+        pl_detail = df_termines.groupby("Type_Marche").agg(
+            P_and_L=("P&L", "sum"),
+            Volume=("P&L", "count"),
         ).reset_index()
-
-        fig_marche = creer_graphique_pl_marche(
-            pl_par_marche,
-            col_x='Marche',
-            titre_x="Type de Marché",
-            titre_y="Profit / Perte (€)"
+        fig_segment = creer_graphique_pl_marche(
+            pl_detail,
+            col_x="Type_Marche",
+            titre_x="Marché",
+            titre_y="Profit / Perte (€)",
         )
-        st.plotly_chart(fig_marche, use_container_width=True)
+        st.plotly_chart(fig_segment, use_container_width=True)
     else:
-        st.write("Aucune statistique par marché disponible pour le moment.")
+        st.write("Données insuffisantes.")
 
-# ==========================================
-# 🎯 GRAPHIQUE 3 : ANALYSE CLV
-# ==========================================
 with col_droite:
-    st.subheader("⚖️ Tracking CLV (Closing Line Value)")
-    if not df_termines.empty:
-        df_clv = df_termines[(df_termines['Cote_Prise'] > 0) & (df_termines['Cote_CLV'] > 0)].copy()
-        fig_clv = go.Figure()
-        fig_clv.add_trace(go.Scatter(
-            x=df_clv.index, y=df_clv['Cote_Prise'],
-            mode='markers', name='Cote Bot',
-            marker=dict(color='blue', size=8)
-        ))
-        fig_clv.add_trace(go.Scatter(
-            x=df_clv.index, y=df_clv['Cote_CLV'],
-            mode='lines', name='Cote Pinnacle',
-            line=dict(color='red', width=2, dash='dot')
-        ))
-        appliquer_theme_dark(fig_clv)
+    st.subheader("⚖️ Validation Mathématique : CLV par Marché")
+    if not df_clv_ok.empty:
+        fig_clv = creer_graphique_clv_cumule(df_clv_ok)
         st.plotly_chart(fig_clv, use_container_width=True)
+    elif not df_termines.empty:
+        st.write("En attente de données de clôture Pinnacle.")
     else:
-        st.write("L'analyse graphique de la CLV s'affichera après les premiers matchs.")
+        st.write("Données insuffisantes.")
 
 # ==========================================
-# 📋 TABLEAU : PARIS EN ATTENTE
+# 📡 PARIS EN ATTENTE
 # ==========================================
 st.markdown("---")
-st.subheader("📡 Radar : Transactions en cours")
+st.subheader("📡 Radar NHL : Signaux Actifs / En attente de dénouement")
 
 if not df_attente.empty:
-    colonnes_a_afficher = ["Date", "Visiteur", "Local", "Pari", "Cote_Prise", "Cote_CLV", "Edge(%)", "Mise_€"]
-    st.dataframe(df_attente[colonnes_a_afficher], use_container_width=True)
+    df_att_display = df_attente.copy()
+    colonnes_attente = [
+        "Date", "Visiteur", "Local", "Pari", "Type_Marche",
+        "Cote_Prise", "Mise_€", "Edge(%)",
+    ]
+    if "CLV" in df_att_display.columns:
+        colonnes_attente.append("CLV")
+        df_att_display["CLV"] = (df_att_display["CLV"] * 100).round(2)
+        df_att_display = df_att_display.rename(columns={"CLV": "CLV (%)"})
+        colonnes_attente[-1] = "CLV (%)"
+
+    colonnes_attente = [c for c in colonnes_attente if c in df_att_display.columns]
+
+    def style_clv(val):
+        try:
+            v = float(val)
+            if v > 1:
+                return "color: #00FF00; font-weight: bold"
+            if v < -1:
+                return "color: #FF4500; font-weight: bold"
+            return "color: #FFD700"
+        except Exception:
+            return ""
+
+    df_sorted = df_att_display[colonnes_attente].sort_values("Date")
+    if "CLV (%)" in colonnes_attente:
+        st.dataframe(
+            df_sorted.style.map(style_clv, subset=["CLV (%)"]),
+            use_container_width=True,
+        )
+    else:
+        st.dataframe(df_sorted, use_container_width=True)
 else:
-    st.success("Aucun ordre en attente sur le marché. Le robot scrute les lignes...")
+    st.success("Aucun ordre en cours sur les marchés. Le Sniper est en veille.")
+
+# ==========================================
+# 📰 JOURNAL DE BORD
+# ==========================================
+st.markdown("---")
+st.subheader("📰 Journal de bord : 10 dernières rencontres clôturées")
+
+if not df_termines.empty:
+    df_derniers = df_termines.sort_values("Date", ascending=False).head(10)
+    colonnes_hist = [
+        "Date", "Visiteur", "Local", "Pari", "Type_Marche",
+        "Cote_Prise", "Mise_€", "Statut", "P&L",
+    ]
+    colonnes_hist = [c for c in colonnes_hist if c in df_derniers.columns]
+    df_derniers = df_derniers[colonnes_hist].copy()
+    if "P&L" in df_derniers.columns:
+        df_derniers["P&L"] = df_derniers["P&L"].round(2)
+
+    def style_statut(val):
+        if val == "GAGNÉ":
+            return "color: #00FF00; font-weight: bold"
+        if val == "PERDU":
+            return "color: #FF4500; font-weight: bold"
+        return ""
+
+    st.dataframe(
+        df_derniers.style.map(style_statut, subset=["Statut"]),
+        use_container_width=True,
+    )
+else:
+    st.write("Aucun pari terminé pour le moment.")
