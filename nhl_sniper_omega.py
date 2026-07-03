@@ -65,6 +65,20 @@ NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_MARCHES_ACTIFS = {m.strip().upper() for m in os.environ.get("NHL_MARCHES_ACTIFS", "ML,PL,OU").split(",") if m.strip()}
 RHO_META_FILE = "rho_calibrage_meta.json"
+# Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
+XG_FOR_COLONNES = (
+    "flurryScoreVenueAdjustedxGoalsFor",
+    "scoreVenueAdjustedxGoalsFor",
+    "flurryAdjustedxGoalsFor",
+    "xGoalsFor",
+)
+XG_AGAINST_COLONNES = (
+    "flurryScoreVenueAdjustedxGoalsAgainst",
+    "scoreVenueAdjustedxGoalsAgainst",
+    "flurryAdjustedxGoalsAgainst",
+    "xGoalsAgainst",
+)
+_xg_colonnes_actives = {"for": None, "against": None}
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -155,8 +169,32 @@ def _fetch_moneypuck_csv(kind, season):
     return None, None
 
 
+def _resoudre_colonnes_xg(fieldnames):
+    """Choisit la meilleure paire de colonnes xG disponible dans le CSV MoneyPuck."""
+    if not fieldnames:
+        return "xGoalsFor", "xGoalsAgainst"
+    cols = set(fieldnames)
+    col_for = next((c for c in XG_FOR_COLONNES if c in cols), "xGoalsFor")
+    col_against = next((c for c in XG_AGAINST_COLONNES if c in cols), "xGoalsAgainst")
+    return col_for, col_against
+
+
+def _log_colonnes_xg_si_nouveau(col_for, col_against):
+    global _xg_colonnes_actives
+    if _xg_colonnes_actives["for"] == col_for and _xg_colonnes_actives["against"] == col_against:
+        return
+    _xg_colonnes_actives["for"] = col_for
+    _xg_colonnes_actives["against"] = col_against
+    if col_for == "xGoalsFor":
+        log_nhl("ℹ️ xG 5v5 : colonnes score-adjusted absentes — repli sur xGoalsFor brut", level="warning")
+    else:
+        log_nhl(f"📐 xG 5v5 : colonnes actives → {col_for} / {col_against}")
+
+
 def _parser_team_stats_csv(texte):
     csv_reader = csv.DictReader(StringIO(texte))
+    col_for, col_against = _resoudre_colonnes_xg(csv_reader.fieldnames)
+    _log_colonnes_xg_si_nouveau(col_for, col_against)
     teams_dict = {}
     for row in csv_reader:
         team, sit = row["team"], row.get("situation")
@@ -167,13 +205,13 @@ def _parser_team_stats_csv(texte):
             }
         gp = max(float(row.get("games_played", 1)), 1)
         if sit == "5on5":
-            teams_dict[team]["xGF_per_game"] = round(float(row.get("xGoalsFor", 0)) / gp, 3)
-            teams_dict[team]["xGA_per_game"] = round(float(row.get("xGoalsAgainst", 0)) / gp, 3)
+            teams_dict[team]["xGF_per_game"] = round(float(row.get(col_for, 0) or 0) / gp, 3)
+            teams_dict[team]["xGA_per_game"] = round(float(row.get(col_against, 0) or 0) / gp, 3)
             teams_dict[team]["games_played"] = int(gp)
         elif sit == "5on4":
-            teams_dict[team]["xGF_PP"] = round(float(row.get("xGoalsFor", 0)) / gp, 3)
+            teams_dict[team]["xGF_PP"] = round(float(row.get(col_for, 0) or 0) / gp, 3)
         elif sit == "4on5":
-            teams_dict[team]["xGA_PK"] = round(float(row.get("xGoalsAgainst", 0)) / gp, 3)
+            teams_dict[team]["xGA_PK"] = round(float(row.get(col_against, 0) or 0) / gp, 3)
     return list(teams_dict.values())
 
 
@@ -197,7 +235,7 @@ def _blend_team_stats(teams_courant, teams_precedent, poids_courant):
 def get_team_stats(season=None, blend=True):
     if season is None:
         season = NHL_SEASON
-    """Aspire les xG à 5 contre 5 et les Unités Spéciales (PP/PK), blend N/N-1 en début de saison."""
+    """Aspire les xG score/venue-adjusted (5v5 + PP/PK), blend N/N-1 en début de saison."""
     try:
         texte, saison_utilisee = _fetch_moneypuck_csv("teams", season)
         if not texte:
