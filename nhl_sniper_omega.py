@@ -6,6 +6,7 @@ import time
 import os
 import logging
 import ftplib
+import json
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 import traceback
@@ -58,6 +59,12 @@ NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
 NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
 NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
 NHL_ODDS_QUOTA_ALERT = int(os.environ.get("NHL_ODDS_QUOTA_ALERT", "100"))
+NHL_BLEND_GP_PLEIN = float(os.environ.get("NHL_BLEND_GP_PLEIN", "20"))
+NHL_RHO_MIN_MATCHS = int(os.environ.get("NHL_RHO_MIN_MATCHS", "30"))
+NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
+NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
+NHL_MARCHES_ACTIFS = {m.strip().upper() for m in os.environ.get("NHL_MARCHES_ACTIFS", "ML,PL,OU").split(",") if m.strip()}
+RHO_META_FILE = "rho_calibrage_meta.json"
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -148,36 +155,79 @@ def _fetch_moneypuck_csv(kind, season):
     return None, None
 
 
-def get_team_stats(season=None):
+def _parser_team_stats_csv(texte):
+    csv_reader = csv.DictReader(StringIO(texte))
+    teams_dict = {}
+    for row in csv_reader:
+        team, sit = row["team"], row.get("situation")
+        if team not in teams_dict:
+            teams_dict[team] = {
+                "team": team, "xGF_per_game": 0.0, "xGA_per_game": 0.0,
+                "xGF_PP": 0.0, "xGA_PK": 0.0, "games_played": 0,
+            }
+        gp = max(float(row.get("games_played", 1)), 1)
+        if sit == "5on5":
+            teams_dict[team]["xGF_per_game"] = round(float(row.get("xGoalsFor", 0)) / gp, 3)
+            teams_dict[team]["xGA_per_game"] = round(float(row.get("xGoalsAgainst", 0)) / gp, 3)
+            teams_dict[team]["games_played"] = int(gp)
+        elif sit == "5on4":
+            teams_dict[team]["xGF_PP"] = round(float(row.get("xGoalsFor", 0)) / gp, 3)
+        elif sit == "4on5":
+            teams_dict[team]["xGA_PK"] = round(float(row.get("xGoalsAgainst", 0)) / gp, 3)
+    return list(teams_dict.values())
+
+
+def _blend_team_stats(teams_courant, teams_precedent, poids_courant):
+    prev_map = {t["team"]: t for t in teams_precedent}
+    blended = []
+    for team in teams_courant:
+        prev = prev_map.get(team["team"])
+        if not prev:
+            blended.append(team)
+            continue
+        merged = {"team": team["team"], "games_played": team.get("games_played", 0)}
+        for key in ("xGF_per_game", "xGA_per_game", "xGF_PP", "xGA_PK"):
+            v_n = team.get(key, 0.0)
+            v_n1 = prev.get(key, v_n)
+            merged[key] = round(poids_courant * v_n + (1 - poids_courant) * v_n1, 3)
+        blended.append(merged)
+    return blended
+
+
+def get_team_stats(season=None, blend=True):
     if season is None:
         season = NHL_SEASON
-    """Aspire les xG à 5 contre 5 et les Unités Spéciales (PP/PK)."""
+    """Aspire les xG à 5 contre 5 et les Unités Spéciales (PP/PK), blend N/N-1 en début de saison."""
     try:
         texte, saison_utilisee = _fetch_moneypuck_csv("teams", season)
         if not texte:
             return []
         if saison_utilisee != season:
-            print(f"ℹ️ MoneyPuck équipes : repli sur la saison {saison_utilisee}")
-        csv_reader = csv.DictReader(StringIO(texte))
-        teams_dict = {}
-        for row in csv_reader:
-            team, sit = row["team"], row.get("situation")
-            if team not in teams_dict:
-                teams_dict[team] = {
-                    "team": team, "xGF_per_game": 0.0, "xGA_per_game": 0.0,
-                    "xGF_PP": 0.0, "xGA_PK": 0.0,
-                }
-            gp = max(float(row.get("games_played", 1)), 1)
-            if sit == "5on5":
-                teams_dict[team]["xGF_per_game"] = round(float(row.get("xGoalsFor", 0)) / gp, 3)
-                teams_dict[team]["xGA_per_game"] = round(float(row.get("xGoalsAgainst", 0)) / gp, 3)
-            elif sit == "5on4":
-                teams_dict[team]["xGF_PP"] = round(float(row.get("xGoalsFor", 0)) / gp, 3)
-            elif sit == "4on5":
-                teams_dict[team]["xGA_PK"] = round(float(row.get("xGoalsAgainst", 0)) / gp, 3)
-        return list(teams_dict.values())
+            log_nhl(f"ℹ️ MoneyPuck équipes : repli sur la saison {saison_utilisee}")
+        teams = _parser_team_stats_csv(texte)
+        if not teams or not blend or NHL_BLEND_GP_PLEIN <= 0:
+            return teams
+
+        gp_values = [t["games_played"] for t in teams if t.get("games_played", 0) > 0]
+        gp_moyen = sum(gp_values) / len(gp_values) if gp_values else NHL_BLEND_GP_PLEIN
+        poids_n = min(1.0, gp_moyen / NHL_BLEND_GP_PLEIN)
+        if poids_n >= 1.0:
+            return teams
+
+        texte_n1, _ = _fetch_moneypuck_csv("teams", season - 1)
+        if not texte_n1:
+            return teams
+        teams_n1 = _parser_team_stats_csv(texte_n1)
+        if not teams_n1:
+            return teams
+
+        log_nhl(
+            f"🔀 Blend MoneyPuck : {round(poids_n * 100)}% saison {season} / "
+            f"{round((1 - poids_n) * 100)}% {season - 1} (GP moyen {gp_moyen:.1f})"
+        )
+        return _blend_team_stats(teams, teams_n1, poids_n)
     except Exception as e:
-        print(f"⚠️ Erreur extracteur équipes: {e}")
+        log_nhl(f"⚠️ Erreur extracteur équipes: {e}", level="warning")
         return []
 
 
@@ -570,11 +620,14 @@ def log_likelihood_rho(rho_array, historique_matchs):
     return -ll
 
 def optimiser_rho_saison(historique_matchs):
-    """Calibre le Rho par Maximum de Vraisemblance (MLE)."""
-    print(f"🔬 Début du calibrage MLE sur {len(historique_matchs)} matchs...")
-    resultat = minimize(log_likelihood_rho, [-0.12], args=(historique_matchs,), bounds=[(-0.30, 0.05)], method='L-BFGS-B')
-    meilleur_rho = round(resultat.x[0], 4)
-    print(f"✅ Calibrage terminé. Le nouveau Rho optimal est : {meilleur_rho}")
+    """Calibre le Rho par Maximum de Vraisemblance (MLE), borné [-0.30, 0.05]."""
+    log_nhl(f"🔬 Calibrage rho MLE sur {len(historique_matchs)} matchs...")
+    resultat = minimize(
+        log_likelihood_rho, [-0.12], args=(historique_matchs,),
+        bounds=[(-0.30, 0.05)], method="L-BFGS-B",
+    )
+    meilleur_rho = round(max(-0.30, min(0.05, resultat.x[0])), 4)
+    log_nhl(f"✅ Rho optimal calibré : {meilleur_rho}")
     return meilleur_rho
 
 def calculate_master_odds_v4(teams_data, home_team, away_team, home_gsax, away_gsax, mom_home=0.0, mom_away=0.0, home_is_b2b=False, away_is_b2b=False, rho=-0.12):
@@ -679,13 +732,10 @@ def calculate_master_odds_v4(teams_data, home_team, away_team, home_gsax, away_g
     if s_1x2 <= 0:
         return None
 
-    # ML Pinnacle = 2-way incluant prolongation : répartir prob_X (nul régul.) au prorata
-    denom_ml = prob_1 + prob_2
-    if denom_ml > 0:
-        prob_ml_home = prob_1 + prob_X * (prob_1 / denom_ml)
-        prob_ml_away = prob_2 + prob_X * (prob_2 / denom_ml)
-    else:
-        prob_ml_home, prob_ml_away = 0.5, 0.5
+    # ML Pinnacle = 2-way incluant prolongation/tir au but
+    ot_home = min(max(NHL_OT_HOME_ADVANTAGE, 0.45), 0.55)
+    prob_ml_home = prob_1 + prob_X * ot_home
+    prob_ml_away = prob_2 + prob_X * (1 - ot_home)
 
     prob_ml_home = min(max(prob_ml_home, 0.001), 0.999)
     prob_ml_away = min(max(prob_ml_away, 0.001), 0.999)
@@ -900,6 +950,97 @@ def get_real_live_odds_puckline(home_team_abbrev, away_team_abbrev, odds_cache=N
     if "cote_pl_away" in cotes:
         pl["cote_pl_away"] = cotes["cote_pl_away"]
     return pl if pl else None
+
+
+def _choisir_meilleur_pari(candidats):
+    """Retourne le candidat avec le plus haut edge parmi les marchés autorisés."""
+    best, max_edge = None, 0.0
+    for cand in candidats:
+        inv = cand.get("inv")
+        if inv and inv["edge"] > max_edge:
+            max_edge = inv["edge"]
+            best = cand
+    return best
+
+
+def _construire_candidats_pari(m, cotes_vraies, cotes_bookmaker, cotes_puckline, bankroll, gardiens_verrouilles):
+    """Évalue ML / PL / O-U selon NHL_MARCHES_ACTIFS."""
+    candidats = []
+
+    if "ML" in NHL_MARCHES_ACTIFS:
+        inv = calculate_kelly(
+            cotes_vraies["prob_1"], cotes_bookmaker["cote_1"],
+            bankroll, gardiens_confirmes=gardiens_verrouilles,
+        )
+        if inv:
+            candidats.append({
+                "type": f"Victoire {m['home_team']}", "inv": inv,
+                "cote_book": cotes_bookmaker["cote_1"], "cote_vraie": cotes_vraies["cote_1"],
+                "marche": "ML",
+            })
+        inv = calculate_kelly(
+            cotes_vraies["prob_2"], cotes_bookmaker["cote_2"],
+            bankroll, gardiens_confirmes=gardiens_verrouilles,
+        )
+        if inv:
+            candidats.append({
+                "type": f"Victoire {m['away_team']}", "inv": inv,
+                "cote_book": cotes_bookmaker["cote_2"], "cote_vraie": cotes_vraies["cote_2"],
+                "marche": "ML",
+            })
+
+    if "PL" in NHL_MARCHES_ACTIFS and cotes_puckline:
+        if "cote_pl_home" in cotes_puckline:
+            inv = calculate_kelly(
+                cotes_vraies["prob_pl_home"], cotes_puckline["cote_pl_home"],
+                bankroll, gardiens_confirmes=gardiens_verrouilles,
+            )
+            if inv:
+                candidats.append({
+                    "type": f"Puck Line {m['home_team']} -1.5", "inv": inv,
+                    "cote_book": cotes_puckline["cote_pl_home"], "cote_vraie": cotes_vraies["cote_pl_home"],
+                    "marche": "PL",
+                })
+        if "cote_pl_away" in cotes_puckline:
+            inv = calculate_kelly(
+                cotes_vraies["prob_pl_away"], cotes_puckline["cote_pl_away"],
+                bankroll, gardiens_confirmes=gardiens_verrouilles,
+            )
+            if inv:
+                candidats.append({
+                    "type": f"Puck Line {m['away_team']} -1.5", "inv": inv,
+                    "cote_book": cotes_puckline["cote_pl_away"], "cote_vraie": cotes_vraies["cote_pl_away"],
+                    "marche": "PL",
+                })
+
+    if "OU" in NHL_MARCHES_ACTIFS and "totals" in cotes_bookmaker:
+        for cut, prices in cotes_bookmaker["totals"].items():
+            cut_arrondi = _arrondir_cut(cut)
+            _, prob_over = _trouver_cle_float(cotes_vraies["prob_over_cuts"], cut_arrondi)
+            _, prob_under = _trouver_cle_float(cotes_vraies["prob_under_cuts"], cut_arrondi)
+            if prob_over is None:
+                continue
+            if "Over" in prices:
+                inv = calculate_kelly(prob_over, prices["Over"], bankroll, gardiens_confirmes=gardiens_verrouilles)
+                if inv:
+                    candidats.append({
+                        "type": f"OVER {cut_arrondi}", "inv": inv,
+                        "cote_book": prices["Over"],
+                        "cote_vraie": round(1 / max(prob_over, 0.001), 2),
+                        "marche": "OU",
+                    })
+            if "Under" in prices and prob_under is not None:
+                inv = calculate_kelly(prob_under, prices["Under"], bankroll, gardiens_confirmes=gardiens_verrouilles)
+                if inv:
+                    candidats.append({
+                        "type": f"UNDER {cut_arrondi}", "inv": inv,
+                        "cote_book": prices["Under"],
+                        "cote_vraie": round(1 / max(prob_under, 0.001), 2),
+                        "marche": "OU",
+                    })
+
+    return candidats
+
 
 def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True):
     if book_odds <= 1.0 or true_prob <= 0.01 or true_prob >= 0.99:
@@ -1177,6 +1318,13 @@ def run_sniper():
     cap_label = f"{NHL_MISE_MAX_PCT}% bankroll" if NHL_MISE_MAX_PCT > 0 else "Kelly pur (pas de cap %)"
     log_nhl(f"💶 Cap mise : {cap_label} | journal → {FICHIER_JOURNAL}")
     log_nhl(f"📊 Alerte quota Odds API si ≤ {NHL_ODDS_QUOTA_ALERT} requêtes restantes")
+    log_nhl(
+        f"🎯 Marchés actifs : {', '.join(sorted(NHL_MARCHES_ACTIFS)) or 'aucun'} | "
+        f"OT home adv ML : {NHL_OT_HOME_ADVANTAGE:.0%} | "
+        f"rho recalibré tous les {NHL_RHO_INTERVAL_MATCHS} matchs (min {NHL_RHO_MIN_MATCHS})"
+    )
+    if NHL_BLEND_GP_PLEIN > 0:
+        log_nhl(f"🔀 Blend MoneyPuck N/N-1 jusqu'à {NHL_BLEND_GP_PLEIN:.0f} GP moyen/ligue")
     migrer_journal_si_besoin()
 
     while True:
@@ -1288,59 +1436,18 @@ def run_sniper():
                 cotes_puckline = get_real_live_odds_puckline(m['home_team'], m['away_team'], odds_cache)
 
                 if cotes_vraies and cotes_bookmaker:
-                    pari_trouve, best_pari, max_edge = False, None, 0.0
-
-                    # --- Domicile ---
-                    inv_ml_home = calculate_kelly(cotes_vraies['prob_1'], cotes_bookmaker['cote_1'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                    if inv_ml_home and inv_ml_home['edge'] > max_edge:
-                        max_edge = inv_ml_home['edge']
-                        best_pari = {"type": f"Victoire {m['home_team']}", "inv": inv_ml_home, "cote_book": cotes_bookmaker['cote_1'], "cote_vraie": cotes_vraies['cote_1']}
-
-                    if cotes_puckline and 'cote_pl_home' in cotes_puckline:
-                        inv_pl_home = calculate_kelly(cotes_vraies['prob_pl_home'], cotes_puckline['cote_pl_home'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                        if inv_pl_home and inv_pl_home['edge'] > max_edge:
-                            max_edge = inv_pl_home['edge']
-                            best_pari = {"type": f"Puck Line {m['home_team']} -1.5", "inv": inv_pl_home, "cote_book": cotes_puckline['cote_pl_home'], "cote_vraie": cotes_vraies['cote_pl_home']}
-
-                    # --- Extérieur ---
-                    inv_ml_away = calculate_kelly(cotes_vraies['prob_2'], cotes_bookmaker['cote_2'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                    if inv_ml_away and inv_ml_away['edge'] > max_edge:
-                        max_edge = inv_ml_away['edge']
-                        best_pari = {"type": f"Victoire {m['away_team']}", "inv": inv_ml_away, "cote_book": cotes_bookmaker['cote_2'], "cote_vraie": cotes_vraies['cote_2']}
-
-                    if cotes_puckline and 'cote_pl_away' in cotes_puckline:
-                        inv_pl_away = calculate_kelly(cotes_vraies['prob_pl_away'], cotes_puckline['cote_pl_away'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                        if inv_pl_away and inv_pl_away['edge'] > max_edge:
-                            max_edge = inv_pl_away['edge']
-                            best_pari = {"type": f"Puck Line {m['away_team']} -1.5", "inv": inv_pl_away, "cote_book": cotes_puckline['cote_pl_away'], "cote_vraie": cotes_vraies['cote_pl_away']}
-
-                    # --- Cible Universelle OVER/UNDER ---
-                    if 'totals' in cotes_bookmaker:
-                        for cut, prices in cotes_bookmaker['totals'].items():
-                            cut_arrondi = _arrondir_cut(cut)
-                            _, prob_over = _trouver_cle_float(cotes_vraies['prob_over_cuts'], cut_arrondi)
-                            _, prob_under = _trouver_cle_float(cotes_vraies['prob_under_cuts'], cut_arrondi)
-                            if prob_over is None:
-                                continue
-                            if 'Over' in prices:
-                                inv_over = calculate_kelly(prob_over, prices['Over'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                                if inv_over and inv_over['edge'] > max_edge:
-                                    max_edge = inv_over['edge']
-                                    vraie_cote_over = round(1 / max(prob_over, 0.001), 2)
-                                    best_pari = {"type": f"OVER {cut_arrondi}", "inv": inv_over, "cote_book": prices['Over'], "cote_vraie": vraie_cote_over}
-
-                            if 'Under' in prices and prob_under is not None:
-                                inv_under = calculate_kelly(prob_under, prices['Under'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                                if inv_under and inv_under['edge'] > max_edge:
-                                    max_edge = inv_under['edge']
-                                    vraie_cote_under = round(1 / max(prob_under, 0.001), 2)
-                                    best_pari = {"type": f"UNDER {cut_arrondi}", "inv": inv_under, "cote_book": prices['Under'], "cote_vraie": vraie_cote_under}
+                    candidats = _construire_candidats_pari(
+                        m, cotes_vraies, cotes_bookmaker, cotes_puckline,
+                        bankroll_actuelle, gardiens_verrouilles,
+                    )
+                    best_pari = _choisir_meilleur_pari(candidats)
 
                     # --- Envoi de la transaction finale ---
                     if best_pari:
                         log_nhl(
-                            f"🎯 Edge {best_pari['inv']['edge']}% — {best_pari['type']} "
-                            f"({m['away_team']} @ {m['home_team']}) mise {best_pari['inv']['mise']} €"
+                            f"🎯 Edge {best_pari['inv']['edge']}% [{best_pari.get('marche', '?')}] — "
+                            f"{best_pari['type']} ({m['away_team']} @ {m['home_team']}) "
+                            f"mise {best_pari['inv']['mise']} €"
                         )
                         if limite_paris_jour_atteinte():
                             log_nhl(
@@ -1354,7 +1461,6 @@ def run_sniper():
                                 dry_run=True,
                             )
                             enregistrer_notification(id_match)
-                            pari_trouve = True
                         else:
                             envoyer_alerte(
                                 m['away_team'], g_ext, m['home_team'], g_dom,
@@ -1368,7 +1474,6 @@ def run_sniper():
                                 b2b_home=home_b2b, b2b_away=away_b2b, rho=rho_actuel,
                             )
                             enregistrer_notification(id_match)
-                            pari_trouve = True
                     else:
                         log_nhl(f"— Pas d'edge suffisant — {m['away_team']} @ {m['home_team']}")
             time.sleep(900)
@@ -1430,22 +1535,63 @@ def lancer_la_balayeuse():
         _ecrire_journal(rows)
         publier_journal_dashboard()
 
-def lire_rho_dynamique():
+def lire_rho_meta():
+    default = {"rho": -0.12, "nb_matchs": 0}
+    if os.path.exists(RHO_META_FILE):
+        try:
+            with open(RHO_META_FILE, "r", encoding="utf-8") as f:
+                return {**default, **json.load(f)}
+        except Exception:
+            pass
     if os.path.exists("rho_optimal.txt"):
-        with open("rho_optimal.txt", "r") as f: return float(f.read().strip())
-    return -0.12
+        try:
+            with open("rho_optimal.txt", "r", encoding="utf-8") as f:
+                return {**default, "rho": float(f.read().strip())}
+        except Exception:
+            pass
+    return default
+
+
+def lire_rho_dynamique():
+    return lire_rho_meta()["rho"]
+
 
 def entrainer_ia_dixon_coles():
-    if not os.path.exists(FICHIER_JOURNAL): return
+    if not os.path.exists(FICHIER_JOURNAL):
+        return
     historique_unique = {}
-    with open(FICHIER_JOURNAL, 'r', encoding='utf-8') as f:
+    with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            if row['Statut'] in ["GAGNÉ", "PERDU"]:
-                if row['ID_Match'] not in historique_unique:
-                    historique_unique[row['ID_Match']] = {'vrai_score_domicile': int(row['Score_Dom']), 'vrai_score_exterieur': int(row['Score_Ext']), 'lambda_domicile_calcule': float(row['Lam_Dom']), 'lambda_exterieur_calcule': float(row['Lam_Ext'])}
+            if row["Statut"] in ["GAGNÉ", "PERDU"]:
+                if row["ID_Match"] not in historique_unique:
+                    historique_unique[row["ID_Match"]] = {
+                        "vrai_score_domicile": int(row["Score_Dom"]),
+                        "vrai_score_exterieur": int(row["Score_Ext"]),
+                        "lambda_domicile_calcule": float(row["Lam_Dom"]),
+                        "lambda_exterieur_calcule": float(row["Lam_Ext"]),
+                    }
     dataset = list(historique_unique.values())
-    if len(dataset) >= 30:
-        with open("rho_optimal.txt", "w") as f: f.write(str(optimiser_rho_saison(dataset)))
+    nb = len(dataset)
+    if nb < NHL_RHO_MIN_MATCHS:
+        return
+
+    meta = lire_rho_meta()
+    nb_precedent = int(meta.get("nb_matchs", 0))
+    nouveaux = nb - nb_precedent
+    if nb_precedent > 0 and nouveaux < NHL_RHO_INTERVAL_MATCHS:
+        return
+
+    nouveau_rho = optimiser_rho_saison(dataset)
+    meta = {
+        "rho": nouveau_rho,
+        "nb_matchs": nb,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    with open(RHO_META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    with open("rho_optimal.txt", "w", encoding="utf-8") as f:
+        f.write(str(nouveau_rho))
+    log_nhl(f"💾 Rho sauvegardé ({nb} matchs calibrants, +{nouveaux} depuis dernier run)")
 
 if __name__ == "__main__":
     manquants = []
