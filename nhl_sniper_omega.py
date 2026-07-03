@@ -55,6 +55,11 @@ NHL_SEASON = int(os.environ.get("NHL_SEASON", "2026"))
 EDGE_MINIMUM = float(os.environ.get("NHL_EDGE_MIN", "0.02"))
 KELLY_FRACTION = float(os.environ.get("NHL_KELLY_FRACTION", "0.25"))
 KELLY_FRACTION_GARDIEN_INCERTAIN = float(os.environ.get("NHL_KELLY_GARDIEN", "0.125"))
+NHL_KELLY_DYNAMIQUE_ACTIF = _env_bool("NHL_KELLY_DYNAMIQUE_ACTIF", True)
+NHL_KELLY_BRIER_FENETRE = int(os.environ.get("NHL_KELLY_BRIER_FENETRE", "40"))
+NHL_KELLY_BRIER_MIN_PARIS = int(os.environ.get("NHL_KELLY_BRIER_MIN_PARIS", "20"))
+NHL_KELLY_BSS_SENSIBILITE = float(os.environ.get("NHL_KELLY_BSS_SENSIBILITE", "0.30"))
+NHL_KELLY_MULT_MIN = float(os.environ.get("NHL_KELLY_MULT_MIN", "0.4"))
 NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
 NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
 NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
@@ -1349,14 +1354,18 @@ def _choisir_meilleur_pari(candidats):
     return best
 
 
-def _construire_candidats_pari(m, cotes_vraies, cotes_bookmaker, cotes_puckline, bankroll, gardiens_verrouilles):
+def _construire_candidats_pari(
+    m, cotes_vraies, cotes_bookmaker, cotes_puckline, bankroll, gardiens_verrouilles, kelly_mult=None,
+):
     """Évalue ML / PL / O-U selon NHL_MARCHES_ACTIFS."""
     candidats = []
+    if kelly_mult is None:
+        kelly_mult = _multiplicateur_kelly_dynamique()
 
     if "ML" in NHL_MARCHES_ACTIFS:
         inv = calculate_kelly(
             cotes_vraies["prob_1"], cotes_bookmaker["cote_1"],
-            bankroll, gardiens_confirmes=gardiens_verrouilles,
+            bankroll, gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
         )
         if inv:
             candidats.append({
@@ -1366,7 +1375,7 @@ def _construire_candidats_pari(m, cotes_vraies, cotes_bookmaker, cotes_puckline,
             })
         inv = calculate_kelly(
             cotes_vraies["prob_2"], cotes_bookmaker["cote_2"],
-            bankroll, gardiens_confirmes=gardiens_verrouilles,
+            bankroll, gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
         )
         if inv:
             candidats.append({
@@ -1379,7 +1388,7 @@ def _construire_candidats_pari(m, cotes_vraies, cotes_bookmaker, cotes_puckline,
         if "cote_pl_home" in cotes_puckline:
             inv = calculate_kelly(
                 cotes_vraies["prob_pl_home"], cotes_puckline["cote_pl_home"],
-                bankroll, gardiens_confirmes=gardiens_verrouilles,
+                bankroll, gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
             )
             if inv:
                 candidats.append({
@@ -1390,7 +1399,7 @@ def _construire_candidats_pari(m, cotes_vraies, cotes_bookmaker, cotes_puckline,
         if "cote_pl_away" in cotes_puckline:
             inv = calculate_kelly(
                 cotes_vraies["prob_pl_away"], cotes_puckline["cote_pl_away"],
-                bankroll, gardiens_confirmes=gardiens_verrouilles,
+                bankroll, gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
             )
             if inv:
                 candidats.append({
@@ -1407,7 +1416,10 @@ def _construire_candidats_pari(m, cotes_vraies, cotes_bookmaker, cotes_puckline,
             if prob_over is None:
                 continue
             if "Over" in prices:
-                inv = calculate_kelly(prob_over, prices["Over"], bankroll, gardiens_confirmes=gardiens_verrouilles)
+                inv = calculate_kelly(
+                    prob_over, prices["Over"], bankroll,
+                    gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
+                )
                 if inv:
                     candidats.append({
                         "type": f"OVER {cut_arrondi}", "inv": inv,
@@ -1416,7 +1428,10 @@ def _construire_candidats_pari(m, cotes_vraies, cotes_bookmaker, cotes_puckline,
                         "marche": "OU",
                     })
             if "Under" in prices and prob_under is not None:
-                inv = calculate_kelly(prob_under, prices["Under"], bankroll, gardiens_confirmes=gardiens_verrouilles)
+                inv = calculate_kelly(
+                    prob_under, prices["Under"], bankroll,
+                    gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
+                )
                 if inv:
                     candidats.append({
                         "type": f"UNDER {cut_arrondi}", "inv": inv,
@@ -1428,7 +1443,58 @@ def _construire_candidats_pari(m, cotes_vraies, cotes_bookmaker, cotes_puckline,
     return candidats
 
 
-def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True):
+def _lire_brier_recent(fenetre=None):
+    """
+    Brier score sur les N derniers paris clôturés du journal + baseline théorique
+    p*(1-p) (variance Bernoulli irréductible aux niveaux de probabilité pariés).
+    """
+    fenetre = fenetre or NHL_KELLY_BRIER_FENETRE
+    if not os.path.exists(FICHIER_JOURNAL):
+        return None, None, 0
+    try:
+        from utils import preparer_calibration_journal, calculer_brier_score
+        import pandas as pd
+        with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return None, None, 0
+        df_cal = preparer_calibration_journal(pd.DataFrame(rows))
+        if df_cal.empty:
+            return None, None, 0
+        df_recent = df_cal.tail(fenetre)
+        brier = calculer_brier_score(df_recent)
+        brier_baseline = float((df_recent["p_model"] * (1 - df_recent["p_model"])).mean())
+        return brier, brier_baseline, len(df_recent)
+    except Exception as e:
+        log_nhl(f"⚠️ Erreur lecture Brier récent (Kelly dynamique) : {e}", level="warning")
+        return None, None, 0
+
+
+def _multiplicateur_kelly_dynamique():
+    """
+    Réduit la fraction Kelly si le Brier Skill Score récent (BSS = 1 - Brier/Brier_baseline,
+    baseline = variance Bernoulli théorique p*(1-p) aux niveaux de probabilité pariés) est
+    négatif : le modèle fait pire que ce que sa propre confiance affichée justifierait -> derisk.
+    BSS >= 0 (modèle au moins aussi bon que sa confiance théorique) -> mult=1.0 (jamais de bonus).
+    """
+    if not NHL_KELLY_DYNAMIQUE_ACTIF:
+        return 1.0
+    brier, brier_baseline, n = _lire_brier_recent()
+    if brier is None or n < NHL_KELLY_BRIER_MIN_PARIS or not brier_baseline or NHL_KELLY_BSS_SENSIBILITE <= 0:
+        return 1.0
+    bss = 1.0 - (brier / brier_baseline)
+    if bss >= 0:
+        return 1.0
+    mult = round(min(max(1.0 + bss / NHL_KELLY_BSS_SENSIBILITE, NHL_KELLY_MULT_MIN), 1.0), 3)
+    if mult < 1.0:
+        log_nhl(
+            f"⚠️ Kelly dynamique : BSS récent {bss:+.2f} sur {n} paris "
+            f"(Brier {brier:.3f} vs baseline {brier_baseline:.3f}) -> mises réduites x{mult:.2f}"
+        )
+    return mult
+
+
+def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kelly_mult=None):
     if book_odds <= 1.0 or true_prob <= 0.01 or true_prob >= 0.99:
         return None
     edge = true_prob - (1 / book_odds)
@@ -1436,6 +1502,9 @@ def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True):
         return None
     b = book_odds - 1.0
     fraction_kelly = KELLY_FRACTION if gardiens_confirmes else KELLY_FRACTION_GARDIEN_INCERTAIN
+    if kelly_mult is None:
+        kelly_mult = _multiplicateur_kelly_dynamique()
+    fraction_kelly *= kelly_mult
     if not gardiens_confirmes:
         log_nhl("🛡️ SÉCURITÉ GARDIEN : Alignement non confirmé à 100%. Mise divisée par 2.")
     safe_kelly = ((b * true_prob - (1 - true_prob)) / b) * fraction_kelly
@@ -1731,6 +1800,11 @@ def run_sniper():
             f"⚖️ Shrinkage marché actif — confiance modèle {NHL_MODEL_TRUST_MIN:.0%} à 0 GP → "
             f"{NHL_MODEL_TRUST_MAX:.0%} à {NHL_MODEL_TRUST_GP_PLEIN:.0f}+ GP (reste : no-vig Pinnacle)"
         )
+    if NHL_KELLY_DYNAMIQUE_ACTIF:
+        log_nhl(
+            f"🎚️ Kelly dynamique actif — fenêtre {NHL_KELLY_BRIER_FENETRE} paris (min {NHL_KELLY_BRIER_MIN_PARIS}), "
+            f"BSS vs baseline théorique, mult. plancher x{NHL_KELLY_MULT_MIN:.2f}"
+        )
     migrer_journal_si_besoin()
 
     while True:
@@ -1754,6 +1828,7 @@ def run_sniper():
                 f"🧠 Configuration Mathématique : Rho = {rho_actuel} | HIA = {hia_actuel:.1%} | "
                 f"Tie = {prob_tie_actuel:.1%} | EmptyNet = {prob_en_actuel:.1%}"
             )
+            kelly_mult_actuel = _multiplicateur_kelly_dynamique()
 
             log_nhl("📡 Synchronisation bases de données...")
             teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
@@ -1853,7 +1928,7 @@ def run_sniper():
                 if cotes_vraies and cotes_bookmaker:
                     candidats = _construire_candidats_pari(
                         m, cotes_vraies, cotes_bookmaker, cotes_puckline,
-                        bankroll_actuelle, gardiens_verrouilles,
+                        bankroll_actuelle, gardiens_verrouilles, kelly_mult=kelly_mult_actuel,
                     )
                     best_pari = _choisir_meilleur_pari(candidats)
 
