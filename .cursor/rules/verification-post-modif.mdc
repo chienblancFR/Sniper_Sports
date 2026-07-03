@@ -1,0 +1,31 @@
+---
+description: Vérifier bugs et incohérences après chaque modification de script
+globs: "**/*.py"
+alwaysApply: true
+---
+
+# Vérification obligatoire après modification
+
+Après **chaque ajout ou changement** sur un script Python du projet (bot, backtest, dashboard, utils), **ne pas terminer** sans contrôler que rien n'a régressé.
+
+## Checklist minimale
+
+1. **Lecture / lint** — `ReadLints` sur les fichiers modifiés ; corriger les erreurs introduites.
+2. **Cohérence cross-fichiers** — si `CHAMPIONNATS`, clés Odds API, `NAME_MAPPING`, `RHO` ou `n_prior` changent :
+   - aligner `sniper_bot_foot.py`, `backtest_football.py`, `dashboard_foot.py` (`LIGUE_NOMS`).
+   - vérifier les clés Odds API (ex. Championship = `soccer_efl_champ`, pas `soccer_england_championship`).
+3. **Smoke test** — lancer une commande courte quand c'est pertinent :
+   - backtest : `python backtest_football.py --help` ou requête SQLite de sanity (counts > 0 si attendu).
+   - bot : import ou syntaxe (`python -m py_compile fichier.py`).
+4. **Effets silencieux** — si une API peut renvoyer vide sans crash, ajouter ou vérifier un log / diagnostic (comme les counts fixtures vs odds en backtest).
+5. **Parité live ↔ backtest** — toute logique métier ajoutée au bot doit être répliquée ou documentée dans le backtest (ou l'inverse).
+
+## Signaler à l'utilisateur
+
+En fin de réponse, indiquer brièvement ce qui a été vérifié (lint, commande lancée, fichiers alignés) ou ce qui reste à tester manuellement (ex. collecte API longue, redeploy PA).
+
+## Ne pas faire
+
+- Livrer une feature sans avoir lu les lints des fichiers touchés.
+- Modifier une clé API ou une config ligue dans un seul fichier.
+- Supposer qu'un changement fonctionne sans preuve (log, count DB, ou exécution partielle).
