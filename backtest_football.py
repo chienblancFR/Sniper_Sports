@@ -42,11 +42,12 @@ from scipy.stats import poisson
 from scipy.optimize import minimize_scalar, minimize
 from thefuzz import process
 from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
 from collections import defaultdict
 
-load_dotenv("identifiants_différent_api.env")
-load_dotenv()  # .env prioritaire si présent
+from config_env import env_files_hint, load_project_env
+
+load_project_env("foot")
+from odds_devig import cote_fair_2way
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 API_ODDS_KEY     = os.getenv("API_ODDS_KEY")
 
@@ -69,7 +70,7 @@ def verifier_cles_api():
     print("   Créez un fichier .env à la racine du projet avec :")
     print("   API_FOOTBALL_KEY=votre_cle")
     print("   API_ODDS_KEY=votre_cle")
-    print("\n   Ou placez vos clés dans identifiants_différent_api.env (déjà supporté).")
+    print("\n   Configurez vos clés dans : " + env_files_hint("foot"))
     return False
 DB_PATH      = "backtest_data.db"
 
@@ -1352,12 +1353,10 @@ async def simuler_paris(conn, ligues=None):
                 ev_modele = ev_ah(mat, h_val, is_home, cote_h24)
                 k = kelly_ah(mat, h_val, is_home, cote_h24)
 
-                # Calcul EV Pinnacle no-vig (réplique du blend du bot)
-                # La cote partenaire est stockée sous la clé (-h_val)
+                # EV Pinnacle no-vig (Shin) — aligné sur sniper_bot_foot.py
                 cote_partner = partner_cote.get((market, -h_val))
                 if cote_partner and cote_partner > 1.0:
-                    ovr = (1.0 / cote_h24) + (1.0 / cote_partner)
-                    cote_novig = cote_h24 * ovr   # proportional devigging : fair_odds = market × ovr
+                    cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
                     ev_pinnacle = ev_ah(mat, h_val, is_home, cote_novig)
                 else:
                     ev_pinnacle = ev_modele  # fallback si partenaire absent

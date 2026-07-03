@@ -4,7 +4,10 @@ from scipy.stats import poisson
 from scipy.optimize import minimize_scalar, minimize
 from thefuzz import process
 from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
+from config_env import load_project_env
+
+load_project_env("foot")
+from odds_devig import cote_fair_2way
 import asyncio
 import aiohttp
 import aiosqlite
@@ -89,8 +92,6 @@ cache_heures_matchs = {}
 # ==========================================
 # ⚙️ 1. SECRETS & PARAMÈTRES (LE BIG 3)
 # ==========================================
-load_dotenv("identifiants_différent_api.env")
-load_dotenv()  # .env prioritaire si présent
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 API_ODDS_KEY = os.getenv("API_ODDS_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -1881,8 +1882,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                     None
                 )
                 if cote_partenaire and cote_partenaire > 1.0:
-                    ovr_ligne = (1.0 / cote) + (1.0 / cote_partenaire)
-                    cote_novig = cote * ovr_ligne
+                    cote_novig = cote_fair_2way(cote, cote_partenaire) or cote
                 else:
                     cote_novig = cote
                 ev_modele = calculer_ev_ah(mat_actif, h, is_h_odds, cote)
@@ -1899,8 +1899,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                     None
                 )
                 if cote_partenaire and cote_partenaire > 1.0:
-                    ovr_ligne = (1.0 / cote) + (1.0 / cote_partenaire)
-                    cote_novig = cote * ovr_ligne
+                    cote_novig = cote_fair_2way(cote, cote_partenaire) or cote
                 else:
                     cote_novig = cote
                 ev_modele = calculer_ev_total_asiatique(mat_actif, h, is_over, cote)
