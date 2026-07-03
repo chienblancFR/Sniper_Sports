@@ -61,6 +61,8 @@ NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
 NHL_ODDS_QUOTA_ALERT = int(os.environ.get("NHL_ODDS_QUOTA_ALERT", "100"))
 NHL_BLEND_GP_PLEIN = float(os.environ.get("NHL_BLEND_GP_PLEIN", "20"))
 NHL_PP_PK_SHRINK_GP = float(os.environ.get("NHL_PP_PK_SHRINK_GP", "20"))
+NHL_GSAX_EWMA_SPAN = float(os.environ.get("NHL_GSAX_EWMA_SPAN", "8"))
+NHL_GSAX_EWMA_GP_PLEIN = float(os.environ.get("NHL_GSAX_EWMA_GP_PLEIN", "8"))
 NHL_RHO_MIN_MATCHS = int(os.environ.get("NHL_RHO_MIN_MATCHS", "30"))
 NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
@@ -83,6 +85,7 @@ XG_AGAINST_COLONNES = (
 )
 _xg_colonnes_actives = {"for": None, "against": None}
 _pp_pk_shrink_logue = False
+_gsax_ewma_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -159,7 +162,7 @@ def _trouver_cle_float(dictionnaire, cible):
 
 
 def _fetch_moneypuck_csv(kind, season):
-    """Télécharge un CSV MoneyPuck (saison N, puis N-1 si échec)."""
+    """Télécharge un CSV MoneyPuck seasonSummary (saison N, puis N-1 si échec)."""
     headers = {"User-Agent": "Mozilla/5.0"}
     for s in (season, season - 1):
         url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{s}/regular/{kind}.csv"
@@ -170,6 +173,21 @@ def _fetch_moneypuck_csv(kind, season):
             print(f"⚠️ MoneyPuck {kind} saison {s} : HTTP {response.status_code}")
         except Exception as e:
             print(f"⚠️ MoneyPuck {kind} saison {s} : {e}")
+    return None, None
+
+
+def _fetch_moneypuck_game_by_game(kind, season):
+    """Télécharge un CSV MoneyPuck gameByGame (saison N, puis N-1 si échec)."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for s in (season, season - 1):
+        url = f"https://moneypuck.com/moneypuck/playerData/gameByGame/{s}/regular/{kind}.csv"
+        try:
+            response = requests.get(url, headers=headers, timeout=20)
+            if response.status_code == 200 and response.text.strip():
+                return response.text, s
+            print(f"⚠️ MoneyPuck gameByGame {kind} saison {s} : HTTP {response.status_code}")
+        except Exception as e:
+            print(f"⚠️ MoneyPuck gameByGame {kind} saison {s} : {e}")
     return None, None
 
 
@@ -309,27 +327,149 @@ def get_team_stats(season=None, blend=True):
         return []
 
 
+def _gsax_per_60_de_ligne(row):
+    """GSAx/60 sur une ligne MoneyPuck (match ou cumul saison)."""
+    icetime = float(row.get("icetime", 0) or 0)
+    if icetime < 600:
+        return None
+    heures = icetime / 3600.0
+    return (float(row.get("xGoals", 0) or 0) - float(row.get("goals", 0) or 0)) / heures
+
+
+def _ewma_series(values, span):
+    """EWMA pandas-compatible (span = fenêtre effective, ordre chronologique)."""
+    if not values:
+        return 0.0
+    alpha = 2.0 / (float(span) + 1.0)
+    result = values[0]
+    for val in values[1:]:
+        result = alpha * val + (1.0 - alpha) * result
+    return result
+
+
+def _parser_goalie_season_csv(texte):
+    goalies = []
+    csv_reader = csv.DictReader(StringIO(texte))
+    for row in csv_reader:
+        if row.get("situation") != "all":
+            continue
+        if float(row.get("games_played", 0) or 0) < 5:
+            continue
+        gsax_per_60 = _gsax_per_60_de_ligne(row)
+        if gsax_per_60 is None:
+            continue
+        goalies.append({
+            "name": row["name"],
+            "gsax_per_60": round(gsax_per_60, 3),
+            "gsax_saison": round(gsax_per_60, 3),
+        })
+    return goalies
+
+
+def _parser_goalie_games_by_game(texte):
+    """Indexe les matchs gardiens (situation=all) par nom, triés chronologiquement."""
+    by_name = {}
+    csv_reader = csv.DictReader(StringIO(texte))
+    for row in csv_reader:
+        if row.get("situation") != "all":
+            continue
+        name = row.get("name") or row.get("playerName") or ""
+        if not name:
+            continue
+        if _gsax_per_60_de_ligne(row) is None:
+            continue
+        by_name.setdefault(name, []).append(row)
+
+    def _cle_tri(match_row):
+        for col in ("gameDate", "game_date", "date"):
+            if match_row.get(col):
+                return match_row[col]
+        return match_row.get("gameId", "")
+
+    for name in by_name:
+        by_name[name].sort(key=_cle_tri)
+    return by_name
+
+
+def _calculer_ewma_gsax_per_60(game_rows, span):
+    """GSAx/60 EWMA sur les derniers matchs (plus récent = poids max)."""
+    vals = []
+    for row in game_rows:
+        gsax = _gsax_per_60_de_ligne(row)
+        if gsax is not None:
+            vals.append(round(gsax, 4))
+    if not vals:
+        return None, 0
+    fenetre = int(span) if span > 0 else len(vals)
+    recent = vals[-fenetre:]
+    return round(_ewma_series(recent, span), 3), len(recent)
+
+
+def _index_goalie_games(games_by_name):
+    idx = {}
+    for name, games in games_by_name.items():
+        idx[name] = games
+        idx[normaliser_nom_joueur(name)] = games
+    return idx
+
+
+def _appliquer_ewma_gsax_goalies(goalies, games_by_name):
+    """Blend GSAx saison + EWMA récent : w = min(1, n_matchs / GP_plein)."""
+    global _gsax_ewma_logue
+    if NHL_GSAX_EWMA_SPAN <= 0 or not goalies or not games_by_name:
+        return goalies
+
+    idx = _index_goalie_games(games_by_name)
+    nb_blend = 0
+    for gardien in goalies:
+        name = gardien["name"]
+        games = idx.get(name) or idx.get(normaliser_nom_joueur(name))
+        if not games:
+            continue
+        gsax_ewma, n_jeux = _calculer_ewma_gsax_per_60(games, NHL_GSAX_EWMA_SPAN)
+        if gsax_ewma is None or n_jeux == 0:
+            continue
+        gsax_saison = gardien.get("gsax_saison", gardien["gsax_per_60"])
+        w = min(1.0, n_jeux / NHL_GSAX_EWMA_GP_PLEIN) if NHL_GSAX_EWMA_GP_PLEIN > 0 else 1.0
+        gardien["gsax_ewma"] = gsax_ewma
+        gardien["gsax_per_60"] = round(w * gsax_ewma + (1.0 - w) * gsax_saison, 3)
+        if w < 1.0:
+            nb_blend += 1
+
+    if not _gsax_ewma_logue:
+        _gsax_ewma_logue = True
+        log_nhl(
+            f"🥅 GSAx EWMA actif — span {NHL_GSAX_EWMA_SPAN:.0f} matchs, "
+            f"confiance pleine à {NHL_GSAX_EWMA_GP_PLEIN:.0f} GP "
+            f"({nb_blend}/{len(goalies)} gardiens partiellement blendés)"
+        )
+    return goalies
+
+
 def get_goalie_stats(season=None):
     if season is None:
         season = NHL_SEASON
-    """Aspire les performances avancées des gardiens (GSAx)."""
+    """Aspire GSAx gardiens (saison + blend EWMA forme récente si activé)."""
     try:
         texte, saison_utilisee = _fetch_moneypuck_csv("goalies", season)
         if not texte:
             return []
         if saison_utilisee != season:
             print(f"ℹ️ MoneyPuck gardiens : repli sur la saison {saison_utilisee}")
-        csv_reader = csv.DictReader(StringIO(texte))
-        goalies = []
-        for row in csv_reader:
-            if row.get("situation") == "all":
-                if float(row.get("games_played", 0)) < 5:
-                    continue
-                games_eq = max(float(row.get("icetime", 1)) / 3600, 1)
-                gsax_per_60 = round(
-                    (float(row.get("xGoals", 0)) - float(row.get("goals", 0))) / games_eq, 3
-                )
-                goalies.append({"name": row["name"], "gsax_per_60": gsax_per_60})
+        goalies = _parser_goalie_season_csv(texte)
+        if not goalies:
+            return []
+
+        if NHL_GSAX_EWMA_SPAN > 0:
+            texte_gbg, saison_gbg = _fetch_moneypuck_game_by_game("goalies", season)
+            if texte_gbg:
+                if saison_gbg != season:
+                    log_nhl(f"ℹ️ MoneyPuck gardiens game-by-game : repli saison {saison_gbg}")
+                games_map = _parser_goalie_games_by_game(texte_gbg)
+                goalies = _appliquer_ewma_gsax_goalies(goalies, games_map)
+            else:
+                log_nhl("ℹ️ GSAx EWMA : game-by-game indisponible — saison seule", level="warning")
+
         return goalies
     except Exception as e:
         print(f"⚠️ Erreur extracteur gardiens: {e}")
@@ -1440,6 +1580,11 @@ def run_sniper():
         log_nhl(f"🔀 Blend MoneyPuck N/N-1 jusqu'à {NHL_BLEND_GP_PLEIN:.0f} GP moyen/ligue")
     if NHL_PP_PK_SHRINK_GP > 0:
         log_nhl(f"📉 Shrinkage PP/PK vers moyenne ligue jusqu'à {NHL_PP_PK_SHRINK_GP:.0f} GP/équipe")
+    if NHL_GSAX_EWMA_SPAN > 0:
+        log_nhl(
+            f"🥅 GSAx gardiens : blend EWMA ({NHL_GSAX_EWMA_SPAN:.0f} derniers matchs) "
+            f"+ saison (plein à {NHL_GSAX_EWMA_GP_PLEIN:.0f} GP)"
+        )
     migrer_journal_si_besoin()
 
     while True:
