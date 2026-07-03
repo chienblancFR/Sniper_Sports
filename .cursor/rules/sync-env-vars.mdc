@@ -1,5 +1,5 @@
 ---
-description: Ajouter automatiquement les nouvelles variables dans identifiants_différent_api.env
+description: Ajouter automatiquement les nouvelles variables dans les fichiers env du projet
 alwaysApply: true
 ---
 
@@ -7,35 +7,41 @@ alwaysApply: true
 
 Quand du code lit une variable via `os.environ.get(...)` (ou équivalent) et que cette clé est **nouvelle ou documentée pour l'utilisateur**, **mettre à jour le fichier env immédiatement** — ne pas se contenter de la citer en fin de réponse.
 
-## Fichier cible
+## Fichiers cibles
 
-- **Principal :** `identifiants_différent_api.env` (chargé par `nhl_sniper_omega.py`, `sniper_bot_foot.py`, `backtest_football.py`)
-- **Secondaire :** `.env` à la racine seulement si le projet l'utilise explicitement (`load_dotenv()` sans nom)
+Structure `env/` (chargée par `config_env.load_project_env(sport)`) :
+
+| Fichier | Contenu |
+|---------|---------|
+| `env/common.env` | Secrets partagés : `API_ODDS_KEY`, `TELEGRAM_*`, `DASHBOARD_PASSWORD`, `PA_FTP_*` |
+| `env/nhl.env` | Toutes les clés `NHL_*` |
+| `env/foot.env` | `API_FOOTBALL_KEY`, `OPENWEATHER_KEY`, clés `FOOT_*` |
+| `env/mlb.env` | Clés `MLB_*` |
+| `env/basket.env` / `env/tennis.env` | Quand les bots existeront |
+
+Mettre à jour aussi le `.env.example` correspondant (`env/nhl.env.example`, etc.) **sans secrets** — versionné dans git.
+
+- **Override local :** `.env` à la racine (dernier chargé)
+- **Legacy :** `identifiants_différent_api.env` — fallback uniquement, ne plus y ajouter de clés
 
 ## Protocole
 
-1. Après avoir ajouté ou modifié une lecture env dans le code, ouvrir `identifiants_différent_api.env`.
-2. Si la clé **n'existe pas déjà**, ajouter une ligne `CLE=valeur_defaut` (valeur = default du code, pas un placeholder).
-3. Placer la ligne dans le **bloc thématique** existant (ex. section `# P3 — Gestion risque & ops`, bloc NHL, clés API en tête).
-4. Commentaire court si le sens n'est pas évident (ex. `# 0 = désactivé`).
-5. **Ne jamais** modifier une valeur déjà présente (secrets, tokens, toggles user) sans demande explicite.
-6. **Ne jamais** committer ce fichier (gitignoré, secrets).
-
-## Exclusions
-
-- Variables purement internes / jamais configurables par l'utilisateur.
-- Renommage ou suppression de clés : mettre à jour le `.env` seulement si l'utilisateur le demande ou si la clé est retirée du code.
-- Ne pas dupliquer une clé déjà présente.
+1. Après avoir ajouté ou modifié une lecture env dans le code, ouvrir le bon fichier (`common` vs sport).
+2. Si la clé **n'existe pas déjà**, ajouter `CLE=valeur_defaut` (default du code, pas un placeholder).
+3. Placer la ligne dans le **bloc thématique** du fichier sport.
+4. Commentaire court si le sens n'est pas évident.
+5. **Ne jamais** modifier une valeur déjà présente (secrets, toggles user) sans demande explicite.
+6. **Ne jamais** committer `env/*.env` (gitignoré) — seulement les `*.env.example`.
 
 ## Exemple
 
-Code ajouté :
+Code NHL ajouté :
 
 ```python
 NHL_PP_PK_SHRINK_GP = float(os.environ.get("NHL_PP_PK_SHRINK_GP", "20"))
 ```
 
-Action obligatoire dans `identifiants_différent_api.env` :
+Action obligatoire dans `env/nhl.env` **et** `env/nhl.env.example` :
 
 ```env
 NHL_PP_PK_SHRINK_GP=20   # 0 = désactivé
@@ -43,4 +49,4 @@ NHL_PP_PK_SHRINK_GP=20   # 0 = désactivé
 
 ## Fin de réponse
 
-Indiquer brièvement quelles lignes ont été ajoutées ou confirmées présentes — pas « à ajouter manuellement dans le .env ».
+Indiquer brièvement quels fichiers env ont été mis à jour — pas « à ajouter manuellement ».

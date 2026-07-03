@@ -1,5 +1,7 @@
 /sniper_mlb_v11_god_mode.py
 identifiants_différent_api.env
+env/*.env
+!env/*.env.example
 __pycache__/
 *.pyc
 *.pyo

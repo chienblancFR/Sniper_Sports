@@ -11,10 +11,9 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 import traceback
 from scipy.optimize import minimize
-from dotenv import load_dotenv
+from config_env import env_files_hint, load_project_env
 
-load_dotenv("identifiants_différent_api.env")
-load_dotenv()
+load_project_env("nhl")
 
 # ==========================================
 # ⚙️ CONFIGURATION GLOBALE
@@ -53,6 +52,8 @@ FICHIER_JOURNAL = (
 BANKROLL_INITIALE = float(os.environ.get("NHL_BANKROLL", "1000.0"))
 NHL_SEASON = int(os.environ.get("NHL_SEASON", "2026"))
 EDGE_MINIMUM = float(os.environ.get("NHL_EDGE_MIN", "0.02"))
+# Edge min plus élevé tant que les gardiens ne sont pas confirmés (sinon on attend)
+NHL_EDGE_MIN_PROBABLE = float(os.environ.get("NHL_EDGE_MIN_PROBABLE", "0.04"))
 KELLY_FRACTION = float(os.environ.get("NHL_KELLY_FRACTION", "0.25"))
 KELLY_FRACTION_GARDIEN_INCERTAIN = float(os.environ.get("NHL_KELLY_GARDIEN", "0.125"))
 NHL_KELLY_DYNAMIQUE_ACTIF = _env_bool("NHL_KELLY_DYNAMIQUE_ACTIF", True)
@@ -1498,7 +1499,8 @@ def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kel
     if book_odds <= 1.0 or true_prob <= 0.01 or true_prob >= 0.99:
         return None
     edge = true_prob - (1 / book_odds)
-    if edge <= EDGE_MINIMUM:
+    edge_min = EDGE_MINIMUM if gardiens_confirmes else NHL_EDGE_MIN_PROBABLE
+    if edge <= edge_min:
         return None
     b = book_odds - 1.0
     fraction_kelly = KELLY_FRACTION if gardiens_confirmes else KELLY_FRACTION_GARDIEN_INCERTAIN
@@ -1506,7 +1508,10 @@ def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kel
         kelly_mult = _multiplicateur_kelly_dynamique()
     fraction_kelly *= kelly_mult
     if not gardiens_confirmes:
-        log_nhl("🛡️ SÉCURITÉ GARDIEN : Alignement non confirmé à 100%. Mise divisée par 2.")
+        log_nhl(
+            f"🛡️ Gardiens probables — Kelly ÷2, edge min {NHL_EDGE_MIN_PROBABLE:.0%} "
+            f"(seuil confirmés : {EDGE_MINIMUM:.0%})"
+        )
     safe_kelly = ((b * true_prob - (1 - true_prob)) / b) * fraction_kelly
     mise_brute = bankroll * safe_kelly
     if NHL_MISE_MAX_PCT > 0:
@@ -1778,6 +1783,7 @@ def run_sniper():
     log_nhl(
         f"🎯 Marchés actifs : {', '.join(sorted(NHL_MARCHES_ACTIFS)) or 'aucun'} | "
         f"OT home adv ML : {NHL_OT_HOME_ADVANTAGE:.0%} | "
+        f"edge min {EDGE_MINIMUM:.0%} (confirmés) / {NHL_EDGE_MIN_PROBABLE:.0%} (probables) | "
         f"rho+HIA recalibrés tous les {NHL_RHO_INTERVAL_MATCHS} matchs (min {NHL_RHO_MIN_MATCHS}) | "
         f"empty-net/tie recalibrés dès {NHL_EMPTY_NET_MIN_MATCHS} matchs"
     )
@@ -1965,7 +1971,13 @@ def run_sniper():
                             )
                             enregistrer_notification(id_match)
                     else:
-                        log_nhl(f"— Pas d'edge suffisant — {m['away_team']} @ {m['home_team']}")
+                        if not gardiens_verrouilles:
+                            log_nhl(
+                                f"— Pas d'edge ≥ {NHL_EDGE_MIN_PROBABLE:.0%} (gardiens probables) "
+                                f"— attente confirmation {m['away_team']} @ {m['home_team']}"
+                            )
+                        else:
+                            log_nhl(f"— Pas d'edge suffisant — {m['away_team']} @ {m['home_team']}")
             time.sleep(900)
         except Exception as e:
             log_nhl(f"⚠️ Erreur système : {e}", level="error")
@@ -2150,7 +2162,7 @@ if __name__ == "__main__":
         manquants.append("TELEGRAM_TOKEN")
     if manquants:
         log_nhl(
-            f"⚠️ Variables manquantes dans identifiants_différent_api.env : {', '.join(manquants)}",
+            f"⚠️ Variables manquantes dans {env_files_hint('nhl')} : {', '.join(manquants)}",
             level="warning",
         )
         log_nhl("   Le bot peut tourner en veille, mais ne pourra pas parier sans clé Odds API.")
