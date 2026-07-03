@@ -4,6 +4,8 @@ import csv
 import math
 import time
 import os
+import logging
+import ftplib
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 import traceback
@@ -16,16 +18,46 @@ load_dotenv()
 # ==========================================
 # ⚙️ CONFIGURATION GLOBALE
 # ==========================================
+logging.basicConfig(
+    filename="nhl_sniper.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%d/%m/%Y %H:%M:%S",
+)
+
+
+def _env_bool(key, default=False):
+    return os.environ.get(key, str(default)).lower() in ("1", "true", "yes", "on")
+
+
+def log_nhl(msg, level="info"):
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", "replace").decode("ascii"))
+    getattr(logging, level, logging.info)(msg)
+
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 FICHIER_MEMOIRE = "alertes_nhl_envoyees.txt"
-FICHIER_JOURNAL = "journal_trading_nhl_SEC2026xOmG.csv"
+JOURNAL_NOM = "journal_trading_nhl_SEC2026xOmG.csv"
+PA_DATA_DIR = "/home/chienblanc/data"
+FICHIER_JOURNAL = (
+    os.path.join(PA_DATA_DIR, JOURNAL_NOM)
+    if os.path.isdir(PA_DATA_DIR)
+    else JOURNAL_NOM
+)
 BANKROLL_INITIALE = float(os.environ.get("NHL_BANKROLL", "1000.0"))
 NHL_SEASON = int(os.environ.get("NHL_SEASON", "2026"))
 EDGE_MINIMUM = float(os.environ.get("NHL_EDGE_MIN", "0.02"))
 KELLY_FRACTION = float(os.environ.get("NHL_KELLY_FRACTION", "0.25"))
 KELLY_FRACTION_GARDIEN_INCERTAIN = float(os.environ.get("NHL_KELLY_GARDIEN", "0.125"))
+NHL_MISE_MAX_EUR = float(os.environ.get("NHL_MISE_MAX_EUR", "25"))
+NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
+NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
+NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -838,18 +870,68 @@ def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True):
     b = book_odds - 1.0
     fraction_kelly = KELLY_FRACTION if gardiens_confirmes else KELLY_FRACTION_GARDIEN_INCERTAIN
     if not gardiens_confirmes:
-        print("🛡️ SÉCURITÉ GARDIEN : Alignement non confirmé à 100%. Mise divisée par 2.")
+        log_nhl("🛡️ SÉCURITÉ GARDIEN : Alignement non confirmé à 100%. Mise divisée par 2.")
     safe_kelly = ((b * true_prob - (1 - true_prob)) / b) * fraction_kelly
+    mise_brute = bankroll * safe_kelly
+    cap_pct = bankroll * (NHL_MISE_MAX_PCT / 100.0)
+    mise = round(min(mise_brute, NHL_MISE_MAX_EUR, cap_pct), 2)
+    if mise <= 0:
+        return None
+    pct_effectif = round((mise / bankroll) * 100, 2) if bankroll > 0 else 0.0
+    if mise < mise_brute:
+        log_nhl(
+            f"📉 Cap mise appliqué : {round(mise_brute, 2)} € → {mise} € "
+            f"(max {NHL_MISE_MAX_EUR} € ou {NHL_MISE_MAX_PCT}% bankroll)"
+        )
     return {
         'edge': round(edge * 100, 2),
-        'pct_bankroll': round(safe_kelly * 100, 2),
-        'mise': round(bankroll * safe_kelly, 2),
+        'pct_bankroll': pct_effectif,
+        'mise': mise,
         'statut_gardiens': "CONFIRMÉ" if gardiens_confirmes else "PROBABLE",
     }
 
 # ==========================================
 # 6. JOURNAL DE TRADING & NOTIFICATIONS
 # ==========================================
+def compter_paris_du_jour():
+    if not os.path.exists(FICHIER_JOURNAL):
+        return 0
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+            return sum(1 for row in csv.DictReader(f) if row.get("Date", "").startswith(today))
+    except Exception:
+        return 0
+
+
+def limite_paris_jour_atteinte():
+    return NHL_PARIS_JOUR_MAX > 0 and compter_paris_du_jour() >= NHL_PARIS_JOUR_MAX
+
+
+def publier_journal_dashboard():
+    """Journal déjà sur PA, ou upload FTP optionnel depuis une machine locale."""
+    if os.path.isdir(PA_DATA_DIR) and FICHIER_JOURNAL.startswith(PA_DATA_DIR):
+        return
+    if not os.path.exists(FICHIER_JOURNAL):
+        return
+    ftp_user = os.environ.get("PA_FTP_USER", "")
+    ftp_pass = os.environ.get("PA_FTP_PASSWORD", "")
+    if not ftp_user or not ftp_pass:
+        return
+    ftp_host = os.environ.get("PA_FTP_HOST", "ftp.pythonanywhere.com")
+    remote_dir = os.environ.get("PA_FTP_REMOTE_DIR", "/home/chienblanc/data")
+    remote_name = os.path.basename(FICHIER_JOURNAL)
+    try:
+        with ftplib.FTP(ftp_host, timeout=30) as ftp:
+            ftp.login(ftp_user, ftp_pass)
+            ftp.cwd(remote_dir)
+            with open(FICHIER_JOURNAL, "rb") as f:
+                ftp.storbinary(f"STOR {remote_name}", f)
+        log_nhl(f"📤 Journal uploadé → {ftp_host}{remote_dir}/{remote_name}")
+    except Exception as e:
+        log_nhl(f"⚠️ Upload FTP journal échoué : {e}", level="warning")
+
+
 def match_deja_notifie(id_match):
     if not os.path.exists(FICHIER_MEMOIRE): return False
     with open(FICHIER_MEMOIRE, "r") as f: return id_match in f.read()
@@ -876,17 +958,21 @@ def enregistrer_transaction(id_match, ext, dom, type_pari, vraie_cote_pari, cote
             investissement['edge'], investissement['pct_bankroll'],
             investissement['mise'], "EN ATTENTE", "0.00"
         ])
+    publier_journal_dashboard()
 
-def envoyer_alerte(ext, g_ext, dom, g_dom, vraie_cote_pari, investissement, type_pari):
+def envoyer_alerte(ext, g_ext, dom, g_dom, vraie_cote_pari, investissement, type_pari, dry_run=False):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram non configuré — alerte non envoyée.")
+        log_nhl("⚠️ Telegram non configuré — alerte non envoyée.", level="warning")
         return
     statut = investissement.get('statut_gardiens', 'CONFIRMÉ')
     alerte_gardien = "✅ Gardiens Confirmés" if statut == "CONFIRMÉ" else "🛡️ GARDIENS PROBABLES (Mise / 2)"
-    msg = f"🚨 **SNIPER NHL DÉCLENCHÉ** 🚨\n\nLoc: 🏟️ **{dom}** ({g_dom})\nVis: ✈️ **{ext}** ({g_ext})\n"
+    prefix = "🧪 **[DRY RUN — SIMULATION]**\n\n" if dry_run else ""
+    msg = prefix + f"🚨 **SNIPER NHL DÉCLENCHÉ** 🚨\n\nLoc: 🏟️ **{dom}** ({g_dom})\nVis: ✈️ **{ext}** ({g_ext})\n"
     msg += f"ℹ️ Statut : {alerte_gardien}\n──────────────\n"
     msg += f"🎯 **ORDRE : PARIER {type_pari}**\n🔥 Edge : **+{investissement['edge']}%**\n⚖️ Kelly : **{investissement['pct_bankroll']}%**\n"
     msg += f"💵 **MISE : {investissement['mise']} €**\n──────────────\n📊 True Odds: {vraie_cote_pari}"
+    if dry_run:
+        msg += "\n\n_(Aucune écriture journal — mode simulation)_"
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
@@ -949,6 +1035,7 @@ def traquer_et_actualiser_clv():
     if mise_a_jour_effectuee:
         with open(FICHIER_JOURNAL, 'w', encoding='utf-8', newline='') as f:
             csv.writer(f).writerows(lignes)
+        publier_journal_dashboard()
 
 def calculer_bankroll_dynamique(capital_de_base=1000.0):
     """
@@ -982,7 +1069,16 @@ def calculer_bankroll_dynamique(capital_de_base=1000.0):
 # 7. BOUCLE DE SCANNAGE PRINCIPALE
 # ==========================================
 def run_sniper():
-    print("🤖 Lancement de l'arme absolue NHL...")
+    mode = "DRY RUN (simulation)" if NHL_DRY_RUN else "LIVE"
+    log_nhl(f"🤖 Lancement Sniper NHL — mode {mode}")
+    if NHL_DRY_RUN:
+        log_nhl("🧪 NHL_DRY_RUN actif : signaux Telegram sans écriture journal.")
+    if NHL_PARIS_JOUR_MAX > 0:
+        log_nhl(f"📊 Limite paris/jour : {NHL_PARIS_JOUR_MAX}")
+    log_nhl(
+        f"💶 Cap mise : min(Kelly, {NHL_MISE_MAX_EUR} €, {NHL_MISE_MAX_PCT}% bankroll) | "
+        f"journal → {FICHIER_JOURNAL}"
+    )
 
     while True:
         try:
@@ -990,17 +1086,17 @@ def run_sniper():
             entrainer_ia_dixon_coles()
 
             nb_attente = compter_paris_en_attente()
-            print(f"🕵️ Tracking CLV ({nb_attente} pari(s) en attente)...")
+            log_nhl(f"🕵️ Tracking CLV ({nb_attente} pari(s) en attente)...")
             traquer_et_actualiser_clv()
 
             bankroll_actuelle = calculer_bankroll_dynamique(BANKROLL_INITIALE)
-            print(f"💰 Capital Dynamique Disponible : {bankroll_actuelle} €")
+            log_nhl(f"💰 Capital Dynamique Disponible : {bankroll_actuelle} €")
             # ------------------------------------
 
             rho_actuel = lire_rho_dynamique()
-            print(f"🧠 Configuration Mathématique : Rho = {rho_actuel}")
+            log_nhl(f"🧠 Configuration Mathématique : Rho = {rho_actuel}")
 
-            print("\n📡 Synchronisation bases de données...")
+            log_nhl("📡 Synchronisation bases de données...")
             teams, goalies, stars_vip, momentum_data = (
                 get_team_stats(), get_goalie_stats(), get_stars_impact(), get_nhl_momentum()
             )
@@ -1008,15 +1104,18 @@ def run_sniper():
             odds_cache = fetch_all_pinnacle_odds()
 
             if not teams or not goalies:
-                print(f"⚠️ Données MoneyPuck indisponibles (saison {NHL_SEASON}). Nouvelle tentative dans 5 min...")
+                log_nhl(
+                    f"⚠️ Données MoneyPuck indisponibles (saison {NHL_SEASON}). Nouvelle tentative dans 5 min...",
+                    level="warning",
+                )
                 time.sleep(300)
                 continue
 
             matchs = get_nhl_games_today()
             if not matchs:
-                print("🏒 Aucun match NHL éligible dans la fenêtre de scan — veille active.")
+                log_nhl("🏒 Aucun match NHL éligible dans la fenêtre de scan — veille active.")
             else:
-                print(f"🏒 {len(matchs)} match(s) dans la fenêtre de scan.")
+                log_nhl(f"🏒 {len(matchs)} match(s) dans la fenêtre de scan.")
             for m in matchs:
                 id_match = f"{m['game_id']}_notified"
                 if match_deja_notifie(id_match):
@@ -1024,20 +1123,19 @@ def run_sniper():
 
                 g_ext, g_dom, skaters_ext, skaters_dom, source_roster = get_rosters_avec_fallback(m["game_id"])
                 if not g_ext or not g_dom:
-                    print(
-                        f"⏳ Alignement indisponible — {m['away_team']} @ {m['home_team']} "
-                        f"(id {m['game_id']}, état {m.get('game_state', '?')}) — retry prochain cycle."
+                    log_nhl(
+                        f"⏳ Skip alignement — {m['away_team']} @ {m['home_team']} "
+                        f"(id {m['game_id']}, état {m.get('game_state', '?')})"
                     )
                     continue
 
                 if source_roster == "landing_probable":
-                    print(
-                        f"ℹ️ Gardiens probables (landing) pour {m['away_team']} @ {m['home_team']} : "
-                        f"{g_ext} / {g_dom}"
+                    log_nhl(
+                        f"ℹ️ Gardiens probables (landing) {m['away_team']} @ {m['home_team']} : {g_ext} / {g_dom}"
                     )
                 elif not skaters_ext and not skaters_dom:
-                    print(
-                        f"ℹ️ Rosters patineurs non publiés pour {m['away_team']} @ {m['home_team']} "
+                    log_nhl(
+                        f"ℹ️ Rosters patineurs non publiés {m['away_team']} @ {m['home_team']} "
                         f"— analyse sans détection d'absences stars."
                     )
 
@@ -1048,9 +1146,9 @@ def run_sniper():
                 away_b2b = m['away_team'] in equipes_en_b2b_hier
 
                 if home_b2b:
-                    print(f"🔄 {m['home_team']} détecté en Back-to-Back !")
+                    log_nhl(f"🔄 {m['home_team']} détecté en Back-to-Back !")
                 if away_b2b:
-                    print(f"🔄 {m['away_team']} détecté en Back-to-Back !")
+                    log_nhl(f"🔄 {m['away_team']} détecté en Back-to-Back !")
 
                 gsax_ext, gsax_dom = trouver_gsax(g_ext, goalies), trouver_gsax(g_dom, goalies)
                 absents_ext = detecter_stars_absentes(m['away_team'], skaters_ext, stars_vip)
@@ -1060,6 +1158,7 @@ def run_sniper():
                 home_base = next((t for t in teams_match if t['team'] == m['home_team']), None)
                 away_base = next((t for t in teams_match if t['team'] == m['away_team']), None)
                 if not home_base or not away_base:
+                    log_nhl(f"⚠️ Skip stats MoneyPuck — {m['away_team']} @ {m['home_team']}", level="warning")
                     continue
 
                 adj_xgf_ext, adj_xga_ext = apply_star_absence_penalty(
@@ -1084,6 +1183,9 @@ def run_sniper():
                 cotes_bookmaker = get_real_live_odds(
                     m['home_team'], m['away_team'], odds_cache, log_si_absent=True,
                 )
+                if not cotes_bookmaker:
+                    log_nhl(f"⚠️ Skip cotes Pinnacle — {m['away_team']} @ {m['home_team']}")
+                    continue
                 cotes_puckline = get_real_live_odds_puckline(m['home_team'], m['away_team'], odds_cache)
 
                 if cotes_vraies and cotes_bookmaker:
@@ -1137,15 +1239,39 @@ def run_sniper():
 
                     # --- Envoi de la transaction finale ---
                     if best_pari:
-                        envoyer_alerte(m['away_team'], g_ext, m['home_team'], g_dom, best_pari['cote_vraie'], best_pari['inv'], best_pari['type'])
-                        enregistrer_transaction(id_match, m['away_team'], m['home_team'], best_pari['type'], best_pari['cote_vraie'], cotes_vraies, best_pari['inv'], best_pari['cote_book'])
-                        pari_trouve = True
-
-                    if pari_trouve:
-                        enregistrer_notification(id_match)
+                        log_nhl(
+                            f"🎯 Edge {best_pari['inv']['edge']}% — {best_pari['type']} "
+                            f"({m['away_team']} @ {m['home_team']}) mise {best_pari['inv']['mise']} €"
+                        )
+                        if limite_paris_jour_atteinte():
+                            log_nhl(
+                                f"🛑 Limite paris/jour atteinte ({NHL_PARIS_JOUR_MAX}) — signal ignoré.",
+                                level="warning",
+                            )
+                        elif NHL_DRY_RUN:
+                            envoyer_alerte(
+                                m['away_team'], g_ext, m['home_team'], g_dom,
+                                best_pari['cote_vraie'], best_pari['inv'], best_pari['type'],
+                                dry_run=True,
+                            )
+                            enregistrer_notification(id_match)
+                            pari_trouve = True
+                        else:
+                            envoyer_alerte(
+                                m['away_team'], g_ext, m['home_team'], g_dom,
+                                best_pari['cote_vraie'], best_pari['inv'], best_pari['type'],
+                            )
+                            enregistrer_transaction(
+                                id_match, m['away_team'], m['home_team'], best_pari['type'],
+                                best_pari['cote_vraie'], cotes_vraies, best_pari['inv'], best_pari['cote_book'],
+                            )
+                            enregistrer_notification(id_match)
+                            pari_trouve = True
+                    else:
+                        log_nhl(f"— Pas d'edge suffisant — {m['away_team']} @ {m['home_team']}")
             time.sleep(900)
         except Exception as e:
-            print(f"⚠️ Erreur système : {e}")
+            log_nhl(f"⚠️ Erreur système : {e}", level="error")
             traceback.print_exc()
             time.sleep(60)
 
@@ -1161,8 +1287,10 @@ def get_match_result(game_id):
     except: return None
 
 def lancer_la_balayeuse():
-    if not os.path.exists(FICHIER_JOURNAL): return
+    if not os.path.exists(FICHIER_JOURNAL):
+        return
     lignes = []
+    modifie = False
     with open(FICHIER_JOURNAL, 'r', encoding='utf-8') as f:
         reader = csv.reader(f)
         lignes.append(next(reader))
@@ -1170,6 +1298,7 @@ def lancer_la_balayeuse():
             if row[15] == "EN ATTENTE":
                 res = get_match_result(row[1].split('_')[0])
                 if res:
+                    modifie = True
                     score_v, score_d = res
                     row[10], row[11] = str(score_v), str(score_d)
                     ext, dom, pari = row[2], row[3], row[4]
@@ -1190,7 +1319,10 @@ def lancer_la_balayeuse():
                     row[15] = "GAGNÉ" if gagne else "PERDU"
                     row[16] = f"{round(mise * (cote_book - 1), 2) if gagne else -mise}"
             lignes.append(row)
-    with open(FICHIER_JOURNAL, 'w', encoding='utf-8', newline='') as f: csv.writer(f).writerows(lignes)
+    if modifie:
+        with open(FICHIER_JOURNAL, 'w', encoding='utf-8', newline='') as f:
+            csv.writer(f).writerows(lignes)
+        publier_journal_dashboard()
 
 def lire_rho_dynamique():
     if os.path.exists("rho_optimal.txt"):
@@ -1216,7 +1348,14 @@ if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
         manquants.append("TELEGRAM_TOKEN")
     if manquants:
-        print(f"⚠️ Variables manquantes dans identifiants_différent_api.env : {', '.join(manquants)}")
-        print("   Le bot peut tourner en mode veille, mais ne pourra pas parier sans clé Odds API.")
-    print(f"🏒 Sniper NHL Oméga — saison MoneyPuck {NHL_SEASON} | bankroll initiale {BANKROLL_INITIALE} €")
+        log_nhl(
+            f"⚠️ Variables manquantes dans identifiants_différent_api.env : {', '.join(manquants)}",
+            level="warning",
+        )
+        log_nhl("   Le bot peut tourner en veille, mais ne pourra pas parier sans clé Odds API.")
+    mode_label = "DRY RUN" if NHL_DRY_RUN else "LIVE"
+    log_nhl(
+        f"🏒 Sniper NHL Oméga — {mode_label} | saison {NHL_SEASON} | "
+        f"bankroll {BANKROLL_INITIALE} € | cap {NHL_MISE_MAX_EUR}€ / {NHL_MISE_MAX_PCT}%"
+    )
     run_sniper()
