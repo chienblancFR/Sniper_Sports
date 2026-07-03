@@ -72,6 +72,7 @@ NHL_MODEL_TRUST_MAX = float(os.environ.get("NHL_MODEL_TRUST_MAX", "0.90"))
 NHL_MODEL_TRUST_GP_PLEIN = float(os.environ.get("NHL_MODEL_TRUST_GP_PLEIN", "20"))
 NHL_RHO_MIN_MATCHS = int(os.environ.get("NHL_RHO_MIN_MATCHS", "30"))
 NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
+NHL_EMPTY_NET_MIN_MATCHS = int(os.environ.get("NHL_EMPTY_NET_MIN_MATCHS", "60"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
 HIA_REF_CALIBRATION = 0.05  # HIA utilisé lors du calcul des lambdas historiques du journal
@@ -854,14 +855,79 @@ def optimiser_rho_saison(historique_matchs):
     rho, _ = optimiser_rho_et_hia_saison(historique_matchs)
     return rho
 
+
+def _prob_score_avec_correction(lam_h, lam_a, h_obs, a_obs, rho, prob_tie, prob_en):
+    """
+    Probabilité fermée d'observer le score (h_obs, a_obs) sous Dixon-Coles +
+    correction empty-net/OT-tie (équivalent cellule-par-cellule de la matrice
+    construite dans calculate_master_odds_v4, sans reconstruire toute la matrice).
+    """
+    def p_brute(h, a):
+        if h < 0 or a < 0:
+            return 0.0
+        return poisson(lam_h, h) * poisson(lam_a, a) * tau_dixon_coles(lam_h, lam_a, h, a, rho)
+
+    margin = h_obs - a_obs
+    p = p_brute(h_obs, a_obs)
+
+    if margin == 1 or margin == -1:
+        return p * (1.0 - prob_tie - prob_en)
+    if margin == 0:
+        return p + p_brute(h_obs, a_obs - 1) * prob_tie + p_brute(h_obs - 1, a_obs) * prob_tie
+    if margin == 2:
+        return p + p_brute(h_obs - 1, a_obs) * prob_en
+    if margin == -2:
+        return p + p_brute(h_obs, a_obs - 1) * prob_en
+    return p
+
+
+def log_likelihood_empty_net(params, historique_matchs, rho, hia):
+    prob_tie, prob_en = params[0], params[1]
+    if prob_tie < 0 or prob_en < 0 or (prob_tie + prob_en) >= 1.0:
+        return 1e10
+    ll = 0.0
+    for match in historique_matchs:
+        h_obs, a_obs = match["vrai_score_domicile"], match["vrai_score_exterieur"]
+        lam_h = match["lambda_domicile_calcule"]
+        lam_a = match["lambda_exterieur_calcule"]
+        hia_ref = match.get("hia_ref", HIA_REF_CALIBRATION)
+        lam_h, lam_a = _ajuster_lambdas_pour_hia(lam_h, lam_a, hia, hia_ref)
+        p = _prob_score_avec_correction(lam_h, lam_a, h_obs, a_obs, rho, prob_tie, prob_en)
+        ll += math.log(max(p, 1e-10))
+    return -ll
+
+
+def optimiser_empty_net_ot(historique_matchs, rho, hia):
+    """Calibre prob_tie (retour à égalité) et prob_en (but cage vide) par MLE, rho/HIA fixés."""
+    meta = lire_rho_meta()
+    x0 = [float(meta.get("prob_tie", 0.12)), float(meta.get("prob_en", 0.22))]
+    log_nhl(f"🔬 Calibrage MLE empty-net/OT-tie sur {len(historique_matchs)} matchs (init {x0})...")
+    resultat = minimize(
+        log_likelihood_empty_net,
+        x0,
+        args=(historique_matchs, rho, hia),
+        bounds=[(0.02, 0.30), (0.02, 0.40)],
+        method="L-BFGS-B",
+    )
+    prob_tie_opt = round(max(0.02, min(0.30, resultat.x[0])), 4)
+    prob_en_opt = round(max(0.02, min(0.40, resultat.x[1])), 4)
+    log_nhl(f"✅ Calibrage empty-net terminé — prob_tie={prob_tie_opt:.1%}, prob_en={prob_en_opt:.1%}")
+    return prob_tie_opt, prob_en_opt
+
 def calculate_master_odds_v4(
     teams_data, home_team, away_team, home_gsax, away_gsax,
     home_is_b2b=False, away_is_b2b=False,
-    rho=-0.12, hia=None,
+    rho=-0.12, hia=None, prob_tie=None, prob_en=None,
 ):
     if hia is None:
         hia = lire_hia_dynamique()
     hia = min(max(float(hia), 0.0), 0.10)
+    if prob_tie is None:
+        prob_tie = lire_prob_tie_dynamique()
+    if prob_en is None:
+        prob_en = lire_prob_en_dynamique()
+    prob_tie = min(max(float(prob_tie), 0.0), 0.30)
+    prob_en = min(max(float(prob_en), 0.0), 0.40)
     league_avg_5v5 = sum(t['xGF_per_game'] for t in teams_data) / len(teams_data)
     league_avg_pp = sum(t['xGF_PP'] for t in teams_data) / len(teams_data)
     safe_league_pp = max(league_avg_pp, 0.01)
@@ -911,9 +977,8 @@ def calculate_master_odds_v4(
         for a in range(12):
             matrice_brute[h][a] = poisson(final_lam_home, h) * poisson(final_lam_away, a) * tau_dixon_coles(final_lam_home, final_lam_away, h, a, rho)
 
-    # Correction Surdispersion (Empty Net)
+    # Correction Surdispersion (Empty Net / retour à égalité) — prob_tie/prob_en calibrés par MLE
     matrice_finale = [[0.0]*12 for _ in range(12)]
-    prob_tie, prob_en = 0.12, 0.22
 
     for h in range(12):
         for a in range(12):
@@ -1644,7 +1709,8 @@ def run_sniper():
     log_nhl(
         f"🎯 Marchés actifs : {', '.join(sorted(NHL_MARCHES_ACTIFS)) or 'aucun'} | "
         f"OT home adv ML : {NHL_OT_HOME_ADVANTAGE:.0%} | "
-        f"rho+HIA recalibrés tous les {NHL_RHO_INTERVAL_MATCHS} matchs (min {NHL_RHO_MIN_MATCHS})"
+        f"rho+HIA recalibrés tous les {NHL_RHO_INTERVAL_MATCHS} matchs (min {NHL_RHO_MIN_MATCHS}) | "
+        f"empty-net/tie recalibrés dès {NHL_EMPTY_NET_MIN_MATCHS} matchs"
     )
     if NHL_BLEND_GP_PLEIN > 0:
         log_nhl(f"🔀 Blend MoneyPuck N/N-1 jusqu'à {NHL_BLEND_GP_PLEIN:.0f} GP moyen/ligue")
@@ -1682,7 +1748,12 @@ def run_sniper():
 
             rho_actuel = lire_rho_dynamique()
             hia_actuel = lire_hia_dynamique()
-            log_nhl(f"🧠 Configuration Mathématique : Rho = {rho_actuel} | HIA = {hia_actuel:.1%}")
+            prob_tie_actuel = lire_prob_tie_dynamique()
+            prob_en_actuel = lire_prob_en_dynamique()
+            log_nhl(
+                f"🧠 Configuration Mathématique : Rho = {rho_actuel} | HIA = {hia_actuel:.1%} | "
+                f"Tie = {prob_tie_actuel:.1%} | EmptyNet = {prob_en_actuel:.1%}"
+            )
 
             log_nhl("📡 Synchronisation bases de données...")
             teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
@@ -1762,6 +1833,7 @@ def run_sniper():
                     teams_match, m['home_team'], m['away_team'], gsax_dom, gsax_ext,
                     home_is_b2b=home_b2b, away_is_b2b=away_b2b,
                     rho=rho_actuel, hia=hia_actuel,
+                    prob_tie=prob_tie_actuel, prob_en=prob_en_actuel,
                 )
                 cotes_bookmaker = get_real_live_odds(
                     m['home_team'], m['away_team'], odds_cache, log_si_absent=True,
@@ -1879,7 +1951,11 @@ def lancer_la_balayeuse():
         publier_journal_dashboard()
 
 def lire_rho_meta():
-    default = {"rho": -0.12, "hia": NHL_HIA_DEFAULT, "nb_matchs": 0}
+    default = {
+        "rho": -0.12, "hia": NHL_HIA_DEFAULT,
+        "prob_tie": 0.12, "prob_en": 0.22,
+        "nb_matchs": 0,
+    }
     if os.path.exists(RHO_META_FILE):
         try:
             with open(RHO_META_FILE, "r", encoding="utf-8") as f:
@@ -1901,6 +1977,14 @@ def lire_rho_dynamique():
 
 def lire_hia_dynamique():
     return float(lire_rho_meta().get("hia", NHL_HIA_DEFAULT))
+
+
+def lire_prob_tie_dynamique():
+    return float(lire_rho_meta().get("prob_tie", 0.12))
+
+
+def lire_prob_en_dynamique():
+    return float(lire_rho_meta().get("prob_en", 0.22))
 
 
 def entrainer_ia_dixon_coles():
@@ -1934,17 +2018,26 @@ def entrainer_ia_dixon_coles():
         return
 
     nouveau_rho, nouveau_hia = optimiser_rho_et_hia_saison(dataset)
+    meta_precedent = lire_rho_meta()
     meta = {
         "rho": nouveau_rho,
         "hia": nouveau_hia,
+        "prob_tie": meta_precedent.get("prob_tie", 0.12),
+        "prob_en": meta_precedent.get("prob_en", 0.22),
         "nb_matchs": nb,
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
+
+    # Empty-net/OT-tie : 2 paramètres de plus, besoin d'un échantillon plus large
+    if nb >= NHL_EMPTY_NET_MIN_MATCHS:
+        nouveau_prob_tie, nouveau_prob_en = optimiser_empty_net_ot(dataset, nouveau_rho, nouveau_hia)
+        meta["prob_tie"], meta["prob_en"] = nouveau_prob_tie, nouveau_prob_en
+
     with open(RHO_META_FILE, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     with open("rho_optimal.txt", "w", encoding="utf-8") as f:
         f.write(str(nouveau_rho))
-    log_nhl(f"💾 Rho+HIA sauvegardés ({nb} matchs, +{nouveaux} depuis dernier run)")
+    log_nhl(f"💾 Rho+HIA+EmptyNet sauvegardés ({nb} matchs, +{nouveaux} depuis dernier run)")
 
 
 def rapport_calibration_journal(chemin=None, min_paris=5):
