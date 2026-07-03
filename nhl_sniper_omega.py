@@ -54,7 +54,6 @@ NHL_SEASON = int(os.environ.get("NHL_SEASON", "2026"))
 EDGE_MINIMUM = float(os.environ.get("NHL_EDGE_MIN", "0.02"))
 KELLY_FRACTION = float(os.environ.get("NHL_KELLY_FRACTION", "0.25"))
 KELLY_FRACTION_GARDIEN_INCERTAIN = float(os.environ.get("NHL_KELLY_GARDIEN", "0.125"))
-NHL_MISE_MAX_EUR = float(os.environ.get("NHL_MISE_MAX_EUR", "25"))
 NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
 NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
 NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
@@ -873,15 +872,18 @@ def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True):
         log_nhl("🛡️ SÉCURITÉ GARDIEN : Alignement non confirmé à 100%. Mise divisée par 2.")
     safe_kelly = ((b * true_prob - (1 - true_prob)) / b) * fraction_kelly
     mise_brute = bankroll * safe_kelly
-    cap_pct = bankroll * (NHL_MISE_MAX_PCT / 100.0)
-    mise = round(min(mise_brute, NHL_MISE_MAX_EUR, cap_pct), 2)
+    if NHL_MISE_MAX_PCT > 0:
+        cap_pct = bankroll * (NHL_MISE_MAX_PCT / 100.0)
+        mise = round(min(mise_brute, cap_pct), 2)
+    else:
+        mise = round(mise_brute, 2)
     if mise <= 0:
         return None
     pct_effectif = round((mise / bankroll) * 100, 2) if bankroll > 0 else 0.0
-    if mise < mise_brute:
+    if NHL_MISE_MAX_PCT > 0 and mise < mise_brute:
         log_nhl(
             f"📉 Cap mise appliqué : {round(mise_brute, 2)} € → {mise} € "
-            f"(max {NHL_MISE_MAX_EUR} € ou {NHL_MISE_MAX_PCT}% bankroll)"
+            f"(max {NHL_MISE_MAX_PCT}% bankroll)"
         )
     return {
         'edge': round(edge * 100, 2),
@@ -1075,10 +1077,8 @@ def run_sniper():
         log_nhl("🧪 NHL_DRY_RUN actif : signaux Telegram sans écriture journal.")
     if NHL_PARIS_JOUR_MAX > 0:
         log_nhl(f"📊 Limite paris/jour : {NHL_PARIS_JOUR_MAX}")
-    log_nhl(
-        f"💶 Cap mise : min(Kelly, {NHL_MISE_MAX_EUR} €, {NHL_MISE_MAX_PCT}% bankroll) | "
-        f"journal → {FICHIER_JOURNAL}"
-    )
+    cap_label = f"{NHL_MISE_MAX_PCT}% bankroll" if NHL_MISE_MAX_PCT > 0 else "Kelly pur (pas de cap %)"
+    log_nhl(f"💶 Cap mise : {cap_label} | journal → {FICHIER_JOURNAL}")
 
     while True:
         try:
@@ -1354,8 +1354,9 @@ if __name__ == "__main__":
         )
         log_nhl("   Le bot peut tourner en veille, mais ne pourra pas parier sans clé Odds API.")
     mode_label = "DRY RUN" if NHL_DRY_RUN else "LIVE"
+    cap_label = f"cap {NHL_MISE_MAX_PCT}%" if NHL_MISE_MAX_PCT > 0 else "Kelly pur"
     log_nhl(
         f"🏒 Sniper NHL Oméga — {mode_label} | saison {NHL_SEASON} | "
-        f"bankroll {BANKROLL_INITIALE} € | cap {NHL_MISE_MAX_EUR}€ / {NHL_MISE_MAX_PCT}%"
+        f"bankroll {BANKROLL_INITIALE} € | {cap_label}"
     )
     run_sniper()
