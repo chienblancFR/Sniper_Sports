@@ -63,6 +63,8 @@ NHL_BLEND_GP_PLEIN = float(os.environ.get("NHL_BLEND_GP_PLEIN", "20"))
 NHL_RHO_MIN_MATCHS = int(os.environ.get("NHL_RHO_MIN_MATCHS", "30"))
 NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
+NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
+HIA_REF_CALIBRATION = 0.05  # HIA utilisé lors du calcul des lambdas historiques du journal
 NHL_MARCHES_ACTIFS = {m.strip().upper() for m in os.environ.get("NHL_MARCHES_ACTIFS", "ML,PL,OU").split(",") if m.strip()}
 RHO_META_FILE = "rho_calibrage_meta.json"
 # Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
@@ -645,30 +647,65 @@ def tau_dixon_coles(lam_home, lam_away, h, a, rho=-0.12):
     elif h == 1 and a == 1: return max(0, 1 - rho)
     return 1.0
 
-def log_likelihood_rho(rho_array, historique_matchs):
-    rho = rho_array[0]
+def _ajuster_lambdas_pour_hia(lam_h, lam_a, hia, hia_ref=HIA_REF_CALIBRATION):
+    """
+    Approximation : les lambdas journalisés intègrent (1+hia_ref) attaque / (1-hia_ref) défense domicile.
+    Recalibre vers un nouveau HIA sans recalculer tout le pipeline xG.
+    """
+    if abs(hia - hia_ref) < 1e-6:
+        return lam_h, lam_a
+    lam_h_adj = lam_h * (1.0 + hia) / (1.0 + hia_ref)
+    lam_a_adj = lam_a * (1.0 - hia) / (1.0 - hia_ref)
+    return max(lam_h_adj, 0.1), max(lam_a_adj, 0.1)
+
+
+def log_likelihood_rho_hia(params, historique_matchs):
+    rho, hia = params[0], params[1]
     ll = 0.0
     for match in historique_matchs:
-        h_goals, a_goals = match['vrai_score_domicile'], match['vrai_score_exterieur']
-        lam_h, lam_a = match['lambda_domicile_calcule'], match['lambda_exterieur_calcule']
+        h_goals, a_goals = match["vrai_score_domicile"], match["vrai_score_exterieur"]
+        lam_h = match["lambda_domicile_calcule"]
+        lam_a = match["lambda_exterieur_calcule"]
+        hia_ref = match.get("hia_ref", HIA_REF_CALIBRATION)
+        lam_h, lam_a = _ajuster_lambdas_pour_hia(lam_h, lam_a, hia, hia_ref)
         p_h = (math.exp(-lam_h) * (lam_h ** h_goals)) / math.factorial(h_goals)
         p_a = (math.exp(-lam_a) * (lam_a ** a_goals)) / math.factorial(a_goals)
         tau = tau_dixon_coles(lam_h, lam_a, h_goals, a_goals, rho)
         ll += math.log(max(p_h * p_a * tau, 1e-10))
     return -ll
 
-def optimiser_rho_saison(historique_matchs):
-    """Calibre le Rho par Maximum de Vraisemblance (MLE), borné [-0.30, 0.05]."""
-    log_nhl(f"🔬 Calibrage rho MLE sur {len(historique_matchs)} matchs...")
-    resultat = minimize(
-        log_likelihood_rho, [-0.12], args=(historique_matchs,),
-        bounds=[(-0.30, 0.05)], method="L-BFGS-B",
-    )
-    meilleur_rho = round(max(-0.30, min(0.05, resultat.x[0])), 4)
-    log_nhl(f"✅ Rho optimal calibré : {meilleur_rho}")
-    return meilleur_rho
 
-def calculate_master_odds_v4(teams_data, home_team, away_team, home_gsax, away_gsax, mom_home=0.0, mom_away=0.0, home_is_b2b=False, away_is_b2b=False, rho=-0.12):
+def optimiser_rho_et_hia_saison(historique_matchs):
+    """Calibre rho et HIA conjointement par MLE sur l'historique du journal."""
+    meta = lire_rho_meta()
+    x0 = [float(meta.get("rho", -0.12)), float(meta.get("hia", NHL_HIA_DEFAULT))]
+    log_nhl(f"🔬 Calibrage MLE rho+HIA sur {len(historique_matchs)} matchs (init {x0})...")
+    resultat = minimize(
+        log_likelihood_rho_hia,
+        x0,
+        args=(historique_matchs,),
+        bounds=[(-0.30, 0.05), (0.0, 0.10)],
+        method="L-BFGS-B",
+    )
+    rho_opt = round(max(-0.30, min(0.05, resultat.x[0])), 4)
+    hia_opt = round(max(0.0, min(0.10, resultat.x[1])), 4)
+    log_nhl(f"✅ Calibrage terminé — rho={rho_opt}, HIA={hia_opt:.1%} (attaque dom +{hia_opt:.1%} / défense dom -{hia_opt:.1%})")
+    return rho_opt, hia_opt
+
+
+def optimiser_rho_saison(historique_matchs):
+    """Rétrocompatibilité : retourne rho seul."""
+    rho, _ = optimiser_rho_et_hia_saison(historique_matchs)
+    return rho
+
+def calculate_master_odds_v4(
+    teams_data, home_team, away_team, home_gsax, away_gsax,
+    mom_home=0.0, mom_away=0.0, home_is_b2b=False, away_is_b2b=False,
+    rho=-0.12, hia=None,
+):
+    if hia is None:
+        hia = lire_hia_dynamique()
+    hia = min(max(float(hia), 0.0), 0.10)
     league_avg_5v5 = sum(t['xGF_per_game'] for t in teams_data) / len(teams_data)
     league_avg_pp = sum(t['xGF_PP'] for t in teams_data) / len(teams_data)
     safe_league_pp = max(league_avg_pp, 0.01)
@@ -677,9 +714,9 @@ def calculate_master_odds_v4(teams_data, home_team, away_team, home_gsax, away_g
     away = next((t for t in teams_data if t['team'] == away_team), None)
     if not home or not away: return None
 
-    # HIA + Momentum
-    home_xgf = home['xGF_per_game'] * 1.05 * (1.0 + mom_home)
-    home_xga = home['xGA_per_game'] * 0.95 * (1.0 - mom_home)
+    # HIA calibré + Momentum
+    home_xgf = home['xGF_per_game'] * (1.0 + hia) * (1.0 + mom_home)
+    home_xga = home['xGA_per_game'] * (1.0 - hia) * (1.0 - mom_home)
     away_xgf = away['xGF_per_game'] * (1.0 + mom_away)
     away_xga = away['xGA_per_game'] * (1.0 - mom_away)
 
@@ -1359,7 +1396,7 @@ def run_sniper():
     log_nhl(
         f"🎯 Marchés actifs : {', '.join(sorted(NHL_MARCHES_ACTIFS)) or 'aucun'} | "
         f"OT home adv ML : {NHL_OT_HOME_ADVANTAGE:.0%} | "
-        f"rho recalibré tous les {NHL_RHO_INTERVAL_MATCHS} matchs (min {NHL_RHO_MIN_MATCHS})"
+        f"rho+HIA recalibrés tous les {NHL_RHO_INTERVAL_MATCHS} matchs (min {NHL_RHO_MIN_MATCHS})"
     )
     if NHL_BLEND_GP_PLEIN > 0:
         log_nhl(f"🔀 Blend MoneyPuck N/N-1 jusqu'à {NHL_BLEND_GP_PLEIN:.0f} GP moyen/ligue")
@@ -1379,7 +1416,8 @@ def run_sniper():
             # ------------------------------------
 
             rho_actuel = lire_rho_dynamique()
-            log_nhl(f"🧠 Configuration Mathématique : Rho = {rho_actuel}")
+            hia_actuel = lire_hia_dynamique()
+            log_nhl(f"🧠 Configuration Mathématique : Rho = {rho_actuel} | HIA = {hia_actuel:.1%}")
 
             log_nhl("📡 Synchronisation bases de données...")
             teams, goalies, stars_vip, momentum_data = (
@@ -1463,7 +1501,7 @@ def run_sniper():
                     teams_match, m['home_team'], m['away_team'], gsax_dom, gsax_ext,
                     mom_home=mom_dom, mom_away=mom_ext,
                     home_is_b2b=home_b2b, away_is_b2b=away_b2b,
-                    rho=rho_actuel
+                    rho=rho_actuel, hia=hia_actuel,
                 )
                 cotes_bookmaker = get_real_live_odds(
                     m['home_team'], m['away_team'], odds_cache, log_si_absent=True,
@@ -1574,7 +1612,7 @@ def lancer_la_balayeuse():
         publier_journal_dashboard()
 
 def lire_rho_meta():
-    default = {"rho": -0.12, "nb_matchs": 0}
+    default = {"rho": -0.12, "hia": NHL_HIA_DEFAULT, "nb_matchs": 0}
     if os.path.exists(RHO_META_FILE):
         try:
             with open(RHO_META_FILE, "r", encoding="utf-8") as f:
@@ -1591,7 +1629,11 @@ def lire_rho_meta():
 
 
 def lire_rho_dynamique():
-    return lire_rho_meta()["rho"]
+    return float(lire_rho_meta()["rho"])
+
+
+def lire_hia_dynamique():
+    return float(lire_rho_meta().get("hia", NHL_HIA_DEFAULT))
 
 
 def entrainer_ia_dixon_coles():
@@ -1619,9 +1661,10 @@ def entrainer_ia_dixon_coles():
     if nb_precedent > 0 and nouveaux < NHL_RHO_INTERVAL_MATCHS:
         return
 
-    nouveau_rho = optimiser_rho_saison(dataset)
+    nouveau_rho, nouveau_hia = optimiser_rho_et_hia_saison(dataset)
     meta = {
         "rho": nouveau_rho,
+        "hia": nouveau_hia,
         "nb_matchs": nb,
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
@@ -1629,7 +1672,7 @@ def entrainer_ia_dixon_coles():
         json.dump(meta, f, indent=2)
     with open("rho_optimal.txt", "w", encoding="utf-8") as f:
         f.write(str(nouveau_rho))
-    log_nhl(f"💾 Rho sauvegardé ({nb} matchs calibrants, +{nouveaux} depuis dernier run)")
+    log_nhl(f"💾 Rho+HIA sauvegardés ({nb} matchs, +{nouveaux} depuis dernier run)")
 
 if __name__ == "__main__":
     manquants = []
