@@ -26,10 +26,13 @@ NHL_SEASON = int(os.environ.get("NHL_SEASON", "2026"))
 EDGE_MINIMUM = float(os.environ.get("NHL_EDGE_MIN", "0.02"))
 KELLY_FRACTION = float(os.environ.get("NHL_KELLY_FRACTION", "0.25"))
 KELLY_FRACTION_GARDIEN_INCERTAIN = float(os.environ.get("NHL_KELLY_GARDIEN", "0.125"))
+FLOAT_TOL = 0.01
+# Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
+GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
 
 # Mappage des abréviations (NHL API) vers noms complets (The-Odds-API)
 NHL_TEAMS_MAPPING = {
-    "ANA": "Anaheim Ducks", "ARI": "Arizona Coyotes", "UTA": "Utah Hockey Club",
+    "ANA": "Anaheim Ducks", "UTA": "Utah Hockey Club",
     "BOS": "Boston Bruins", "BUF": "Buffalo Sabres", "CGY": "Calgary Flames",
     "CAR": "Carolina Hurricanes", "CHI": "Chicago Blackhawks", "COL": "Colorado Avalanche",
     "CBJ": "Columbus Blue Jackets", "DAL": "Dallas Stars", "DET": "Detroit Red Wings",
@@ -39,8 +42,19 @@ NHL_TEAMS_MAPPING = {
     "OTT": "Ottawa Senators", "PHI": "Philadelphia Flyers", "PIT": "Pittsburgh Penguins",
     "SJS": "San Jose Sharks", "SEA": "Seattle Kraken", "STL": "St Louis Blues",
     "TBL": "Tampa Bay Lightning", "TOR": "Toronto Maple Leafs", "VAN": "Vancouver Canucks",
-    "VGK": "Vegas Golden Knights", "WSH": "Washington Capitals", "WPG": "Winnipeg Jets"
+    "VGK": "Vegas Golden Knights", "WSH": "Washington Capitals", "WPG": "Winnipeg Jets",
 }
+
+# Alias The-Odds-API (noms alternatifs Pinnacle → clé interne)
+ODDS_API_ALIASES = {
+    "Montreal Canadiens": ["Montréal Canadiens"],
+    "Utah Hockey Club": ["Utah Mammoth"],
+}
+# Index inverse : alias → nom primaire
+_ODDS_NOM_PRIMAIRE = {}
+for _primaire, _alias_liste in ODDS_API_ALIASES.items():
+    for _alias in _alias_liste:
+        _ODDS_NOM_PRIMAIRE[_alias] = _primaire
 
 # Carte des fuseaux horaires (0 = EST, 1 = CENTRAL, 2 = MOUNTAIN, 3 = PACIFIC)
 NHL_TIMEZONES = {
@@ -54,85 +68,135 @@ NHL_TIMEZONES = {
 # ==========================================
 # 1. ASPIRATEURS DE DONNÉES (MoneyPuck)
 # ==========================================
+def _float_proche(a, b, tol=FLOAT_TOL):
+    return abs(float(a) - float(b)) < tol
+
+
+def _arrondir_cut(point):
+    """Arrondit une ligne O/U au demi-point le plus proche (5.5, 6.0…)."""
+    return round(float(point) * 2) / 2
+
+
+def _trouver_cle_float(dictionnaire, cible):
+    """Retourne (cle, valeur) en tolérant les imprécisions float."""
+    for cle, val in dictionnaire.items():
+        if _float_proche(cle, cible):
+            return cle, val
+    return None, None
+
+
+def _fetch_moneypuck_csv(kind, season):
+    """Télécharge un CSV MoneyPuck (saison N, puis N-1 si échec)."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for s in (season, season - 1):
+        url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{s}/regular/{kind}.csv"
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200 and response.text.strip():
+                return response.text, s
+            print(f"⚠️ MoneyPuck {kind} saison {s} : HTTP {response.status_code}")
+        except Exception as e:
+            print(f"⚠️ MoneyPuck {kind} saison {s} : {e}")
+    return None, None
+
+
 def get_team_stats(season=None):
     if season is None:
         season = NHL_SEASON
     """Aspire les xG à 5 contre 5 et les Unités Spéciales (PP/PK)."""
-    url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{season}/regular/teams.csv"
-    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{season-1}/regular/teams.csv"
-            response = requests.get(url, headers=headers, timeout=15)
-        csv_reader = csv.DictReader(StringIO(response.text))
+        texte, saison_utilisee = _fetch_moneypuck_csv("teams", season)
+        if not texte:
+            return []
+        if saison_utilisee != season:
+            print(f"ℹ️ MoneyPuck équipes : repli sur la saison {saison_utilisee}")
+        csv_reader = csv.DictReader(StringIO(texte))
         teams_dict = {}
         for row in csv_reader:
-            team, sit = row['team'], row.get('situation')
+            team, sit = row["team"], row.get("situation")
             if team not in teams_dict:
-                teams_dict[team] = {'team': team, 'xGF_per_game': 0.0, 'xGA_per_game': 0.0, 'xGF_PP': 0.0, 'xGA_PK': 0.0}
-            gp = max(float(row.get('games_played', 1)), 1)
-            if sit == '5on5':
-                teams_dict[team]['xGF_per_game'] = round(float(row.get('xGoalsFor', 0)) / gp, 3)
-                teams_dict[team]['xGA_per_game'] = round(float(row.get('xGoalsAgainst', 0)) / gp, 3)
-            elif sit == '5on4':
-                teams_dict[team]['xGF_PP'] = round(float(row.get('xGoalsFor', 0)) / gp, 3)
-            elif sit == '4on5':
-                teams_dict[team]['xGA_PK'] = round(float(row.get('xGoalsAgainst', 0)) / gp, 3)
+                teams_dict[team] = {
+                    "team": team, "xGF_per_game": 0.0, "xGA_per_game": 0.0,
+                    "xGF_PP": 0.0, "xGA_PK": 0.0,
+                }
+            gp = max(float(row.get("games_played", 1)), 1)
+            if sit == "5on5":
+                teams_dict[team]["xGF_per_game"] = round(float(row.get("xGoalsFor", 0)) / gp, 3)
+                teams_dict[team]["xGA_per_game"] = round(float(row.get("xGoalsAgainst", 0)) / gp, 3)
+            elif sit == "5on4":
+                teams_dict[team]["xGF_PP"] = round(float(row.get("xGoalsFor", 0)) / gp, 3)
+            elif sit == "4on5":
+                teams_dict[team]["xGA_PK"] = round(float(row.get("xGoalsAgainst", 0)) / gp, 3)
         return list(teams_dict.values())
     except Exception as e:
         print(f"⚠️ Erreur extracteur équipes: {e}")
         return []
 
+
 def get_goalie_stats(season=None):
     if season is None:
         season = NHL_SEASON
     """Aspire les performances avancées des gardiens (GSAx)."""
-    url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{season}/regular/goalies.csv"
-    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{season-1}/regular/goalies.csv"
-            response = requests.get(url, headers=headers, timeout=15)
-        csv_reader = csv.DictReader(StringIO(response.text))
+        texte, saison_utilisee = _fetch_moneypuck_csv("goalies", season)
+        if not texte:
+            return []
+        if saison_utilisee != season:
+            print(f"ℹ️ MoneyPuck gardiens : repli sur la saison {saison_utilisee}")
+        csv_reader = csv.DictReader(StringIO(texte))
         goalies = []
         for row in csv_reader:
-            if row.get('situation') == 'all':
-                if float(row.get('games_played', 0)) < 5: continue
-                games_eq = max(float(row.get('icetime', 1)) / 3600, 1)
-                gsax_per_60 = round((float(row.get('xGoals', 0)) - float(row.get('goals', 0))) / games_eq, 3)
-                goalies.append({'name': row['name'], 'gsax_per_60': gsax_per_60})
+            if row.get("situation") == "all":
+                if float(row.get("games_played", 0)) < 5:
+                    continue
+                games_eq = max(float(row.get("icetime", 1)) / 3600, 1)
+                gsax_per_60 = round(
+                    (float(row.get("xGoals", 0)) - float(row.get("goals", 0))) / games_eq, 3
+                )
+                goalies.append({"name": row["name"], "gsax_per_60": gsax_per_60})
         return goalies
-    except: return []
+    except Exception as e:
+        print(f"⚠️ Erreur extracteur gardiens: {e}")
+        return []
+
 
 def get_stars_impact(season=None):
     if season is None:
         season = NHL_SEASON
     """Génère le Top 30 des patineurs les plus cruciaux de la ligue."""
-    url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{season}/regular/skaters.csv"
-    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{season-1}/regular/skaters.csv"
-            response = requests.get(url, headers=headers, timeout=15)
-        csv_reader = csv.DictReader(StringIO(response.text))
+        texte, saison_utilisee = _fetch_moneypuck_csv("skaters", season)
+        if not texte:
+            return {}
+        if saison_utilisee != season:
+            print(f"ℹ️ MoneyPuck patineurs : repli sur la saison {saison_utilisee}")
+        csv_reader = csv.DictReader(StringIO(texte))
         skaters = []
         for row in csv_reader:
-            if row.get('situation') == '5on5':
-                gp = float(row.get('games_played', 0))
-                if gp < 10: continue
-                skaters.append({'name': row['name'], 'team': row['team'], 'game_score_per_game': float(row.get('gameScore', 0)) / gp})
-        skaters_tries = sorted(skaters, key=lambda x: x['game_score_per_game'], reverse=True)[:30]
+            if row.get("situation") == "5on5":
+                gp = float(row.get("games_played", 0))
+                if gp < 10:
+                    continue
+                skaters.append({
+                    "name": row["name"], "team": row["team"],
+                    "game_score_per_game": float(row.get("gameScore", 0)) / gp,
+                })
+        skaters_tries = sorted(skaters, key=lambda x: x["game_score_per_game"], reverse=True)[:30]
         stars_impact = {}
         for rank, player in enumerate(skaters_tries):
-            if rank < 5: xgf_pen, xga_pen = 0.12, 0.05
-            elif rank < 15: xgf_pen, xga_pen = 0.08, 0.03
-            else: xgf_pen, xga_pen = 0.05, 0.02
-            stars_impact[player['name']] = {"team": player['team'], "xgf_penalty": xgf_pen, "xga_penalty": xga_pen}
+            if rank < 5:
+                xgf_pen, xga_pen = 0.12, 0.05
+            elif rank < 15:
+                xgf_pen, xga_pen = 0.08, 0.03
+            else:
+                xgf_pen, xga_pen = 0.05, 0.02
+            stars_impact[player["name"]] = {
+                "team": player["team"], "xgf_penalty": xgf_pen, "xga_penalty": xga_pen,
+            }
         return stars_impact
-    except: return {}
+    except Exception as e:
+        print(f"⚠️ Erreur extracteur stars: {e}")
+        return {}
 
 # ==========================================
 # 2. RADAR API OFFICIEL NHL & MOMENTUM
@@ -287,6 +351,14 @@ def trouver_gsax(nom_nhl, goalies_data):
             return g['gsax_per_60']
     return 0.0
 
+
+def gsax_per_60_vers_lambda(gsax_per_60):
+    """
+    Convertit GSAx/60 MoneyPuck en ajustement lambda buts/match.
+    GSAx > 0 = gardien performant → réduit les buts encaissés par l'équipe adverse.
+    """
+    return gsax_per_60 * (GSAX_MINUTES_PAR_MATCH / 60.0)
+
 def apply_star_absence_penalty(team_name, base_xgf, base_xga, missing_players_list, stars_dict):
     adjusted_xgf, adjusted_xga = base_xgf, base_xga
     for player in missing_players_list:
@@ -405,8 +477,10 @@ def calculate_master_odds_v4(teams_data, home_team, away_team, home_gsax, away_g
     lam_home_pp = (home_pp_att / safe_league_pp) * (away_pk_def / safe_league_pp) * safe_league_pp
     lam_away_pp = (away_pp_att / safe_league_pp) * (home_pk_def / safe_league_pp) * safe_league_pp
 
-    final_lam_home = max(lam_home_5v5 + lam_home_pp - away_gsax, 0.1)
-    final_lam_away = max(lam_away_5v5 + lam_away_pp - home_gsax, 0.1)
+    adj_gsax_away = gsax_per_60_vers_lambda(away_gsax)
+    adj_gsax_home = gsax_per_60_vers_lambda(home_gsax)
+    final_lam_home = max(lam_home_5v5 + lam_home_pp - adj_gsax_away, 0.1)
+    final_lam_away = max(lam_away_5v5 + lam_away_pp - adj_gsax_home, 0.1)
 
     # Matrice initiale Poisson + Dixon-Coles
     matrice_brute = [[0.0]*12 for _ in range(12)]
@@ -433,6 +507,13 @@ def calculate_master_odds_v4(teams_data, home_team, away_team, home_gsax, away_g
             else:
                 matrice_finale[h][a] += p
 
+    # Renormalisation : garantit des probas cohérentes (PL, ML, O/U)
+    masse_totale = sum(matrice_finale[h][a] for h in range(12) for a in range(12))
+    if masse_totale > 0:
+        for h in range(12):
+            for a in range(12):
+                matrice_finale[h][a] /= masse_totale
+
     # Lecture des probabilités
     prob_1, prob_X, prob_2 = 0, 0, 0
     prob_pl_home, prob_pl_away = 0, 0
@@ -456,12 +537,17 @@ def calculate_master_odds_v4(teams_data, home_team, away_team, home_gsax, away_g
                 else: prob_under_cuts[cut] += p_final
 
     s_1x2 = prob_1 + prob_X + prob_2
-    prob_1, prob_X, prob_2 = prob_1/s_1x2, prob_X/s_1x2, prob_2/s_1x2
+    if s_1x2 > 0:
+        prob_1, prob_X, prob_2 = prob_1 / s_1x2, prob_X / s_1x2, prob_2 / s_1x2
 
-    s_ou = sum(matrice_finale[h][a] for h in range(12) for a in range(12))
+    prob_pl_home = min(prob_pl_home, 1.0)
+    prob_pl_away = min(prob_pl_away, 1.0)
+
     for cut in cuts_cibles:
-        prob_over_cuts[cut] /= s_ou
-        prob_under_cuts[cut] /= s_ou
+        s_ou = prob_over_cuts[cut] + prob_under_cuts[cut]
+        if s_ou > 0:
+            prob_over_cuts[cut] /= s_ou
+            prob_under_cuts[cut] /= s_ou
 
     return {
         'prob_1': prob_1, 'prob_2': prob_2,
@@ -475,6 +561,25 @@ def calculate_master_odds_v4(teams_data, home_team, away_team, home_gsax, away_g
 # ==========================================
 # 5. INTEGRATION THE-ODDS-API & FINANCIAL
 # ==========================================
+def _noms_odds_pour_equipe(abbrev):
+    """Liste des noms possibles pour une équipe (primaire + alias Pinnacle)."""
+    primaire = NHL_TEAMS_MAPPING.get(abbrev)
+    if not primaire:
+        return []
+    return [primaire] + ODDS_API_ALIASES.get(primaire, [])
+
+
+def _nom_odds_vers_primaire(nom_api):
+    """Mappe un nom Odds API vers notre nom primaire interne."""
+    if nom_api in NHL_TEAMS_MAPPING.values():
+        return nom_api
+    return _ODDS_NOM_PRIMAIRE.get(nom_api, nom_api)
+
+
+def _est_puck_line_moins_15(point):
+    return _float_proche(point, -1.5)
+
+
 def _parse_pinnacle_game(game):
     """Extrait h2h, totals et puck line (-1.5) d'un match Pinnacle."""
     if not game.get("bookmakers"):
@@ -494,14 +599,14 @@ def _parse_pinnacle_game(game):
             if "totals" not in cotes:
                 cotes["totals"] = {}
             for o in market["outcomes"]:
-                point = float(o["point"])
+                point = _arrondir_cut(o["point"])
                 name = o["name"]
                 if point not in cotes["totals"]:
                     cotes["totals"][point] = {}
                 cotes["totals"][point][name] = o["price"]
         elif market["key"] == "spreads":
             for o in market["outcomes"]:
-                if o["point"] == -1.5:
+                if _est_puck_line_moins_15(o["point"]):
                     if o["name"] == home_full:
                         cotes["cote_pl_home"] = o["price"]
                     elif o["name"] == away_full:
@@ -509,6 +614,19 @@ def _parse_pinnacle_game(game):
     if "cote_1" not in cotes or "cote_2" not in cotes:
         return None
     return cotes
+
+
+def _indexer_cotes_cache(cache, parsed):
+    """Indexe un match sous toutes les combinaisons de noms connus."""
+    home_api = parsed["home_full"]
+    away_api = parsed["away_full"]
+    home_primaire = _nom_odds_vers_primaire(home_api)
+    away_primaire = _nom_odds_vers_primaire(away_api)
+    cles_home = {home_api, home_primaire} | set(ODDS_API_ALIASES.get(home_primaire, []))
+    cles_away = {away_api, away_primaire} | set(ODDS_API_ALIASES.get(away_primaire, []))
+    for h in cles_home:
+        for a in cles_away:
+            cache[(h, a)] = parsed
 
 
 def fetch_all_pinnacle_odds():
@@ -527,28 +645,42 @@ def fetch_all_pinnacle_odds():
     try:
         response = requests.get(url, params=params, timeout=15)
         if response.status_code != 200:
+            print(f"⚠️ Odds API : HTTP {response.status_code}")
             return {}
         for game in response.json():
             parsed = _parse_pinnacle_game(game)
             if parsed:
-                key = (parsed["home_full"], parsed["away_full"])
-                cache[key] = parsed
+                _indexer_cotes_cache(cache, parsed)
         return cache
     except Exception as e:
         print(f"⚠️ Erreur Odds API globale : {e}")
         return {}
 
 
-def get_odds_for_match(home_team_abbrev, away_team_abbrev, odds_cache=None):
+def get_odds_for_match(home_team_abbrev, away_team_abbrev, odds_cache=None, log_si_absent=False):
     """Retourne les cotes Pinnacle pour un match (depuis le cache ou une requête dédiée)."""
-    home_full = NHL_TEAMS_MAPPING.get(home_team_abbrev)
-    away_full = NHL_TEAMS_MAPPING.get(away_team_abbrev)
-    if not home_full or not away_full:
+    noms_home = _noms_odds_pour_equipe(home_team_abbrev)
+    noms_away = _noms_odds_pour_equipe(away_team_abbrev)
+    if not noms_home or not noms_away:
+        if log_si_absent:
+            print(f"⚠️ Abréviation inconnue : {away_team_abbrev} @ {home_team_abbrev}")
         return None
+
     if odds_cache is not None:
-        return odds_cache.get((home_full, away_full))
+        for home in noms_home:
+            for away in noms_away:
+                hit = odds_cache.get((home, away))
+                if hit:
+                    return hit
+        if log_si_absent:
+            print(
+                f"⚠️ Pas de cotes Pinnacle : {away_team_abbrev} @ {home_team_abbrev} "
+                f"(testé : {noms_away[0]} @ {noms_home[0]})"
+            )
+        return None
+
     single = fetch_all_pinnacle_odds()
-    return single.get((home_full, away_full))
+    return get_odds_for_match(home_team_abbrev, away_team_abbrev, single, log_si_absent)
 
 
 def get_real_live_odds(home_team_abbrev, away_team_abbrev, odds_cache=None):
@@ -642,10 +774,11 @@ def _extraire_cote_clv(home_abbr, away_abbr, type_pari, cote_actuelle, odds_cach
     if "OVER" in type_pari or "UNDER" in type_pari:
         parts = type_pari.split(" ")
         side = parts[0].capitalize()
-        cut = float(parts[1])
+        cut = _arrondir_cut(parts[1])
         totals = cotes.get("totals", {})
-        if cut in totals and side in totals[cut]:
-            return str(totals[cut][side])
+        _, ligne = _trouver_cle_float(totals, cut)
+        if ligne and side in ligne:
+            return str(ligne[side])
     elif "Puck Line" in type_pari:
         if home_abbr in type_pari and "cote_pl_home" in cotes:
             return str(cotes["cote_pl_home"])
@@ -791,7 +924,9 @@ def run_sniper():
                         home_is_b2b=home_b2b, away_is_b2b=away_b2b, # <--- ICI
                         rho=rho_actuel
                     )
-                    cotes_bookmaker = get_real_live_odds(m['home_team'], m['away_team'], odds_cache)
+                    cotes_bookmaker = get_real_live_odds(
+                        m['home_team'], m['away_team'], odds_cache, log_si_absent=True,
+                    )
                     cotes_puckline = get_real_live_odds_puckline(m['home_team'], m['away_team'], odds_cache)
 
                     if cotes_vraies and cotes_bookmaker:
@@ -824,20 +959,24 @@ def run_sniper():
                         # --- Cible Universelle OVER/UNDER ---
                         if 'totals' in cotes_bookmaker:
                             for cut, prices in cotes_bookmaker['totals'].items():
-                                if cut in cotes_vraies['prob_over_cuts']:
-                                    if 'Over' in prices:
-                                        inv_over = calculate_kelly(cotes_vraies['prob_over_cuts'][cut], prices['Over'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                                        if inv_over and inv_over['edge'] > max_edge:
-                                            max_edge = inv_over['edge']
-                                            vraie_cote_over = round(1/max(cotes_vraies['prob_over_cuts'][cut], 0.001), 2)
-                                            best_pari = {"type": f"OVER {cut}", "inv": inv_over, "cote_book": prices['Over'], "cote_vraie": vraie_cote_over}
+                                cut_arrondi = _arrondir_cut(cut)
+                                _, prob_over = _trouver_cle_float(cotes_vraies['prob_over_cuts'], cut_arrondi)
+                                _, prob_under = _trouver_cle_float(cotes_vraies['prob_under_cuts'], cut_arrondi)
+                                if prob_over is None:
+                                    continue
+                                if 'Over' in prices:
+                                    inv_over = calculate_kelly(prob_over, prices['Over'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
+                                    if inv_over and inv_over['edge'] > max_edge:
+                                        max_edge = inv_over['edge']
+                                        vraie_cote_over = round(1 / max(prob_over, 0.001), 2)
+                                        best_pari = {"type": f"OVER {cut_arrondi}", "inv": inv_over, "cote_book": prices['Over'], "cote_vraie": vraie_cote_over}
 
-                                    if 'Under' in prices:
-                                        inv_under = calculate_kelly(cotes_vraies['prob_under_cuts'][cut], prices['Under'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                                        if inv_under and inv_under['edge'] > max_edge:
-                                            max_edge = inv_under['edge']
-                                            vraie_cote_under = round(1/max(cotes_vraies['prob_under_cuts'][cut], 0.001), 2)
-                                            best_pari = {"type": f"UNDER {cut}", "inv": inv_under, "cote_book": prices['Under'], "cote_vraie": vraie_cote_under}
+                                if 'Under' in prices and prob_under is not None:
+                                    inv_under = calculate_kelly(prob_under, prices['Under'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
+                                    if inv_under and inv_under['edge'] > max_edge:
+                                        max_edge = inv_under['edge']
+                                        vraie_cote_under = round(1 / max(prob_under, 0.001), 2)
+                                        best_pari = {"type": f"UNDER {cut_arrondi}", "inv": inv_under, "cote_book": prices['Under'], "cote_vraie": vraie_cote_under}
 
                         # --- Envoi de la transaction finale ---
                         if best_pari:
