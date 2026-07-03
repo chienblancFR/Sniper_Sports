@@ -66,6 +66,10 @@ NHL_GSAX_RECENT_WINDOW = int(os.environ.get("NHL_GSAX_RECENT_WINDOW", "10"))
 NHL_GSAX_RECENT_GP_PLEIN = float(os.environ.get("NHL_GSAX_RECENT_GP_PLEIN", "8"))
 NHL_TEAM_RECENT_WINDOW = int(os.environ.get("NHL_TEAM_RECENT_WINDOW", "10"))
 NHL_TEAM_RECENT_GP_PLEIN = float(os.environ.get("NHL_TEAM_RECENT_GP_PLEIN", "10"))
+NHL_MARCHE_SHRINK_ACTIF = _env_bool("NHL_MARCHE_SHRINK_ACTIF", True)
+NHL_MODEL_TRUST_MIN = float(os.environ.get("NHL_MODEL_TRUST_MIN", "0.70"))
+NHL_MODEL_TRUST_MAX = float(os.environ.get("NHL_MODEL_TRUST_MAX", "0.90"))
+NHL_MODEL_TRUST_GP_PLEIN = float(os.environ.get("NHL_MODEL_TRUST_GP_PLEIN", "20"))
 NHL_RHO_MIN_MATCHS = int(os.environ.get("NHL_RHO_MIN_MATCHS", "30"))
 NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
@@ -984,6 +988,96 @@ def calculate_master_odds_v4(
         'lam_home': round(final_lam_home, 3), 'lam_away': round(final_lam_away, 3),
     }
 
+
+def _proba_no_vig_2way(cote_a, cote_b):
+    """Probabilités 'fair' sans marge bookmaker (dévigorage multiplicatif simple)."""
+    try:
+        cote_a, cote_b = float(cote_a), float(cote_b)
+    except (TypeError, ValueError):
+        return None, None
+    if cote_a <= 1.0 or cote_b <= 1.0:
+        return None, None
+    inv_a, inv_b = 1.0 / cote_a, 1.0 / cote_b
+    total = inv_a + inv_b
+    if total <= 0:
+        return None, None
+    return inv_a / total, inv_b / total
+
+
+def _poids_confiance_modele(gp_moyen):
+    """
+    Poids accordé au modèle (vs marché no-vig) : croît avec la maturité de
+    l'échantillon courant (GP moyen des deux équipes), plafonné à GP_PLEIN.
+    """
+    if NHL_MODEL_TRUST_GP_PLEIN <= 0:
+        return NHL_MODEL_TRUST_MAX
+    part_gp = min(1.0, max(gp_moyen, 0.0) / NHL_MODEL_TRUST_GP_PLEIN)
+    return NHL_MODEL_TRUST_MIN + (NHL_MODEL_TRUST_MAX - NHL_MODEL_TRUST_MIN) * part_gp
+
+
+def _blend_proba_marche(prob_modele_a, prob_modele_b, cote_marche_a, cote_marche_b, w_modele):
+    """Blend (prob_a, prob_b) modèle avec le no-vig marché, renormalisé à 1."""
+    no_vig_a, no_vig_b = _proba_no_vig_2way(cote_marche_a, cote_marche_b)
+    if no_vig_a is None:
+        return prob_modele_a, prob_modele_b
+    blend_a = w_modele * prob_modele_a + (1.0 - w_modele) * no_vig_a
+    blend_b = w_modele * prob_modele_b + (1.0 - w_modele) * no_vig_b
+    total = blend_a + blend_b
+    if total <= 0:
+        return prob_modele_a, prob_modele_b
+    return blend_a / total, blend_b / total
+
+
+def shrink_cotes_vers_marche(cotes_vraies, cotes_bookmaker, cotes_puckline, gp_moyen_match):
+    """
+    Réduit la sur-confiance du modèle en le mélangeant avec la probabilité
+    no-vig du marché (Pinnacle), pondéré par la maturité de l'échantillon (GP).
+    Les lambdas (lam_home/lam_away) restent purs modèle pour la calibration MLE.
+    """
+    if not NHL_MARCHE_SHRINK_ACTIF or not cotes_vraies:
+        return cotes_vraies
+    w = _poids_confiance_modele(gp_moyen_match)
+    resultat = dict(cotes_vraies)
+
+    if cotes_bookmaker and "cote_1" in cotes_bookmaker and "cote_2" in cotes_bookmaker:
+        p1, p2 = _blend_proba_marche(
+            cotes_vraies["prob_1"], cotes_vraies["prob_2"],
+            cotes_bookmaker["cote_1"], cotes_bookmaker["cote_2"], w,
+        )
+        resultat["prob_1"], resultat["prob_2"] = p1, p2
+        resultat["cote_1"] = round(1 / max(p1, 0.001), 2)
+        resultat["cote_2"] = round(1 / max(p2, 0.001), 2)
+
+    if cotes_puckline and "cote_pl_home" in cotes_puckline and "cote_pl_away" in cotes_puckline:
+        p_home, p_away = _blend_proba_marche(
+            cotes_vraies["prob_pl_home"], cotes_vraies["prob_pl_away"],
+            cotes_puckline["cote_pl_home"], cotes_puckline["cote_pl_away"], w,
+        )
+        resultat["prob_pl_home"], resultat["prob_pl_away"] = p_home, p_away
+        resultat["cote_pl_home"] = round(1 / max(p_home, 0.001), 2)
+        resultat["cote_pl_away"] = round(1 / max(p_away, 0.001), 2)
+
+    if cotes_bookmaker and "totals" in cotes_bookmaker:
+        prob_over = dict(cotes_vraies.get("prob_over_cuts", {}))
+        prob_under = dict(cotes_vraies.get("prob_under_cuts", {}))
+        for cut, prix in cotes_bookmaker["totals"].items():
+            if "Over" not in prix or "Under" not in prix:
+                continue
+            cut_arrondi = _arrondir_cut(cut)
+            cle_over, p_over_modele = _trouver_cle_float(prob_over, cut_arrondi)
+            cle_under, p_under_modele = _trouver_cle_float(prob_under, cut_arrondi)
+            if p_over_modele is None or p_under_modele is None:
+                continue
+            p_over, p_under = _blend_proba_marche(
+                p_over_modele, p_under_modele, prix["Over"], prix["Under"], w,
+            )
+            prob_over[cle_over] = p_over
+            prob_under[cle_under] = p_under
+        resultat["prob_over_cuts"] = prob_over
+        resultat["prob_under_cuts"] = prob_under
+
+    return resultat
+
 # ==========================================
 # 5. INTEGRATION THE-ODDS-API & FINANCIAL
 # ==========================================
@@ -1566,6 +1660,11 @@ def run_sniper():
             f"📈 xG équipes : blend forme récente ({NHL_TEAM_RECENT_WINDOW:.0f} derniers matchs) "
             f"+ saison (plein à {NHL_TEAM_RECENT_GP_PLEIN:.0f} GP) — remplace le momentum L10"
         )
+    if NHL_MARCHE_SHRINK_ACTIF:
+        log_nhl(
+            f"⚖️ Shrinkage marché actif — confiance modèle {NHL_MODEL_TRUST_MIN:.0%} à 0 GP → "
+            f"{NHL_MODEL_TRUST_MAX:.0%} à {NHL_MODEL_TRUST_GP_PLEIN:.0f}+ GP (reste : no-vig Pinnacle)"
+        )
     migrer_journal_si_besoin()
 
     while True:
@@ -1671,6 +1770,13 @@ def run_sniper():
                     log_nhl(f"⚠️ Skip cotes Pinnacle — {m['away_team']} @ {m['home_team']}")
                     continue
                 cotes_puckline = get_real_live_odds_puckline(m['home_team'], m['away_team'], odds_cache)
+
+                gp_moyen_match = (
+                    (home_base.get('games_played', 0) + away_base.get('games_played', 0)) / 2.0
+                )
+                cotes_vraies = shrink_cotes_vers_marche(
+                    cotes_vraies, cotes_bookmaker, cotes_puckline, gp_moyen_match,
+                )
 
                 if cotes_vraies and cotes_bookmaker:
                     candidats = _construire_candidats_pari(
