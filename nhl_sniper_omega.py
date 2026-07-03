@@ -537,25 +537,35 @@ def calculate_master_odds_v4(teams_data, home_team, away_team, home_gsax, away_g
                 else: prob_under_cuts[cut] += p_final
 
     s_1x2 = prob_1 + prob_X + prob_2
-    if s_1x2 > 0:
-        prob_1, prob_X, prob_2 = prob_1 / s_1x2, prob_X / s_1x2, prob_2 / s_1x2
+    if s_1x2 <= 0:
+        return None
 
-    prob_pl_home = min(prob_pl_home, 1.0)
-    prob_pl_away = min(prob_pl_away, 1.0)
+    # ML Pinnacle = 2-way incluant prolongation : répartir prob_X (nul régul.) au prorata
+    denom_ml = prob_1 + prob_2
+    if denom_ml > 0:
+        prob_ml_home = prob_1 + prob_X * (prob_1 / denom_ml)
+        prob_ml_away = prob_2 + prob_X * (prob_2 / denom_ml)
+    else:
+        prob_ml_home, prob_ml_away = 0.5, 0.5
+
+    prob_ml_home = min(max(prob_ml_home, 0.001), 0.999)
+    prob_ml_away = min(max(prob_ml_away, 0.001), 0.999)
+    prob_pl_home = min(max(prob_pl_home, 0.001), 0.999)
+    prob_pl_away = min(max(prob_pl_away, 0.001), 0.999)
 
     for cut in cuts_cibles:
         s_ou = prob_over_cuts[cut] + prob_under_cuts[cut]
         if s_ou > 0:
-            prob_over_cuts[cut] /= s_ou
-            prob_under_cuts[cut] /= s_ou
+            prob_over_cuts[cut] = min(max(prob_over_cuts[cut] / s_ou, 0.001), 0.999)
+            prob_under_cuts[cut] = min(max(prob_under_cuts[cut] / s_ou, 0.001), 0.999)
 
     return {
-        'prob_1': prob_1, 'prob_2': prob_2,
+        'prob_1': prob_ml_home, 'prob_2': prob_ml_away,
         'prob_pl_home': prob_pl_home, 'prob_pl_away': prob_pl_away,
         'prob_over_cuts': prob_over_cuts, 'prob_under_cuts': prob_under_cuts,
-        'cote_1': round(1/max(prob_1, 0.001), 2), 'cote_2': round(1/max(prob_2, 0.001), 2),
-        'cote_pl_home': round(1/max(prob_pl_home, 0.001), 2), 'cote_pl_away': round(1/max(prob_pl_away, 0.001), 2),
-        'lam_home': round(final_lam_home, 3), 'lam_away': round(final_lam_away, 3)
+        'cote_1': round(1 / prob_ml_home, 2), 'cote_2': round(1 / prob_ml_away, 2),
+        'cote_pl_home': round(1 / prob_pl_home, 2), 'cote_pl_away': round(1 / prob_pl_away, 2),
+        'lam_home': round(final_lam_home, 3), 'lam_away': round(final_lam_away, 3),
     }
 
 # ==========================================
@@ -576,6 +586,23 @@ def _nom_odds_vers_primaire(nom_api):
     return _ODDS_NOM_PRIMAIRE.get(nom_api, nom_api)
 
 
+def _noms_equipe_equivalents(nom):
+    """Ensemble de noms API interchangeables pour une même franchise."""
+    if not nom:
+        return set()
+    primaire = _nom_odds_vers_primaire(nom)
+    return {nom, primaire} | set(ODDS_API_ALIASES.get(primaire, []))
+
+
+def _outcome_est_equipe(outcome_name, team_name):
+    """True si le libellé Pinnacle correspond à l'équipe (alias inclus)."""
+    if outcome_name == team_name:
+        return True
+    equiv_outcome = _noms_equipe_equivalents(outcome_name)
+    equiv_team = _noms_equipe_equivalents(team_name)
+    return bool(equiv_outcome & equiv_team)
+
+
 def _est_puck_line_moins_15(point):
     return _float_proche(point, -1.5)
 
@@ -591,25 +618,27 @@ def _parse_pinnacle_game(game):
     for market in bookmaker["markets"]:
         if market["key"] == "h2h":
             for o in market["outcomes"]:
-                if o["name"] == home_full:
+                if _outcome_est_equipe(o["name"], home_full):
                     cotes["cote_1"] = o["price"]
-                elif o["name"] == away_full:
+                elif _outcome_est_equipe(o["name"], away_full):
                     cotes["cote_2"] = o["price"]
         elif market["key"] == "totals":
             if "totals" not in cotes:
                 cotes["totals"] = {}
             for o in market["outcomes"]:
                 point = _arrondir_cut(o["point"])
-                name = o["name"]
+                side = o["name"].capitalize()
+                if side not in ("Over", "Under"):
+                    continue
                 if point not in cotes["totals"]:
                     cotes["totals"][point] = {}
-                cotes["totals"][point][name] = o["price"]
+                cotes["totals"][point][side] = o["price"]
         elif market["key"] == "spreads":
             for o in market["outcomes"]:
                 if _est_puck_line_moins_15(o["point"]):
-                    if o["name"] == home_full:
+                    if _outcome_est_equipe(o["name"], home_full):
                         cotes["cote_pl_home"] = o["price"]
-                    elif o["name"] == away_full:
+                    elif _outcome_est_equipe(o["name"], away_full):
                         cotes["cote_pl_away"] = o["price"]
     if "cote_1" not in cotes or "cote_2" not in cotes:
         return None
@@ -704,6 +733,8 @@ def get_real_live_odds_puckline(home_team_abbrev, away_team_abbrev, odds_cache=N
     return pl if pl else None
 
 def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True):
+    if book_odds <= 1.0 or true_prob <= 0.01 or true_prob >= 0.99:
+        return None
     edge = true_prob - (1 / book_odds)
     if edge <= EDGE_MINIMUM:
         return None
