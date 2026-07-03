@@ -21,6 +21,9 @@ Reset (avant de relancer le backtest / dashboard) :
   python backtest_football.py --reset --simulate --report
       → Reset soft + regénération en une commande
 
+  python backtest_football.py --collect --ligue Championship --odds-only
+      → Recollecte cotes historiques pour une seule ligue (fixtures/xG déjà en base)
+
 Dashboard Streamlit : après --report, menu ⋮ → Clear cache → Rerun
 Si le CSV distant PythonAnywhere est utilisé, uploader le nouveau backtest_results.csv.
 
@@ -105,22 +108,22 @@ def verifier_fichier_db(path=DB_PATH):
 SAISONS_BACKTEST = [2023, 2024]  # 2023 = saison 2023-24 pour ligues hivernales
 
 CHAMPIONNATS = [
-    {"nom": "La Liga",          "id": 140, "key": "soccer_spain_la_liga",            "c1": 4,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
-    {"nom": "Bundesliga",       "id": 78,  "key": "soccer_germany_bundesliga",        "c1": 4,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  8},
-    {"nom": "Eredivisie",       "id": 88,  "key": "soccer_netherlands_eredivisie",    "c1": 2,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
-    {"nom": "Serie A",          "id": 135, "key": "soccer_italy_serie_a",             "c1": 4,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
-    {"nom": "Primeira Liga",    "id": 94,  "key": "soccer_portugal_primeira_liga",    "c1": 2,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
-    {"nom": "Süper Lig",        "id": 203, "key": "soccer_turkey_super_league",       "c1": 2,  "rel": 17, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
-    {"nom": "Allsvenskan",      "id": 113, "key": "soccer_sweden_allsvenskan",        "c1": 3,  "rel": 14, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 12},
-    {"nom": "Série A Brésil",   "id": 71,  "key": "soccer_brazil_campeonato",         "c1": 6,  "rel": 17, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
-    {"nom": "Ligue 1",          "id": 61,  "key": "soccer_france_ligue_one",          "c1": 4,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  8},
-    {"nom": "LaLiga 2",         "id": 141, "key": "soccer_spain_segunda_division",    "c1": 2,  "rel": 19, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  8},
-    {"nom": "Premier League",   "id": 39,  "key": "soccer_epl",                       "c1": 4,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
-    {"nom": "Championship",     "id": 40,  "key": "soccer_england_championship",      "c1": 2,  "rel": 22, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
-    {"nom": "MLS",              "id": 253, "key": "soccer_usa_mls",                   "c1": 7,  "rel": 99, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 10},
-    {"nom": "Eliteserien",      "id": 103, "key": "soccer_norway_eliteserien",        "c1": 2,  "rel": 14, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 12},
-    {"nom": "Jupiler Pro",      "id": 144, "key": "soccer_belgium_first_div",         "c1": 6,  "rel": 13, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 11},
-    {"nom": "Serie B",          "id": 136, "key": "soccer_italy_serie_b",             "c1": 2,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 10},
+    {"nom": "La Liga",          "id": 140, "key": "soccer_spain_la_liga",            "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
+    {"nom": "Bundesliga",       "id": 78,  "key": "soccer_germany_bundesliga",        "c1": 4,  "euro": 6,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  8},
+    {"nom": "Eredivisie",       "id": 88,  "key": "soccer_netherlands_eredivisie",    "c1": 2,  "euro": 5,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
+    {"nom": "Serie A",          "id": 135, "key": "soccer_italy_serie_a",             "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
+    {"nom": "Primeira Liga",    "id": 94,  "key": "soccer_portugal_primeira_liga",    "c1": 2,  "euro": 5,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
+    {"nom": "Süper Lig",        "id": 203, "key": "soccer_turkey_super_league",       "c1": 2,  "euro": 4,  "rel": 17, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
+    {"nom": "Allsvenskan",      "id": 113, "key": "soccer_sweden_allsvenskan",        "c1": 3,  "euro": 3,  "rel": 14, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 12},
+    {"nom": "Série A Brésil",   "id": 71,  "key": "soccer_brazil_campeonato",         "c1": 6,  "euro": 6,  "rel": 17, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
+    {"nom": "Ligue 1",          "id": 61,  "key": "soccer_france_ligue_one",          "c1": 4,  "euro": 6,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  8},
+    {"nom": "LaLiga 2",         "id": 141, "key": "soccer_spain_segunda_division",    "c1": 2,  "euro": 6,  "rel": 19, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  8},
+    {"nom": "Premier League",   "id": 39,  "key": "soccer_epl",                       "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
+    {"nom": "Championship",     "id": 40,  "key": "soccer_efl_champ",                 "c1": 2,  "euro": 6,  "rel": 22, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
+    {"nom": "MLS",              "id": 253, "key": "soccer_usa_mls",                   "c1": 7,  "euro": 9,  "rel": 99, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 10},
+    {"nom": "Eliteserien",      "id": 103, "key": "soccer_norway_eliteserien",        "c1": 2,  "euro": 4,  "rel": 14, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 12},
+    {"nom": "Jupiler Pro",      "id": 144, "key": "soccer_belgium_first_div",         "c1": 6,  "euro": 12, "rel": 13, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 11},
+    {"nom": "Serie B",          "id": 136, "key": "soccer_italy_serie_b",             "c1": 2,  "euro": 8,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 10},
 ]
 
 RHO_PAR_LIGUE = {
@@ -451,10 +454,26 @@ async def fetch(session, url, headers=None, params=None):
                 if r.status == 429:
                     print("⏳ Rate limit — pause 30s")
                     await asyncio.sleep(30)
+                else:
+                    print(f"  ⚠️ HTTP {r.status} — {url.split('?')[0][-60:]}")
                 return None
         except Exception as e:
             print(f"  ⚠️ fetch error: {e}")
             return None
+
+
+def filtrer_ligues(nom: str | None):
+    """Filtre CHAMPIONNATS par nom partiel (insensible à la casse)."""
+    if not nom:
+        return list(CHAMPIONNATS)
+    nom_l = nom.lower().strip()
+    matches = [l for l in CHAMPIONNATS if nom_l in l['nom'].lower()]
+    if not matches:
+        print(f"\n❌ Ligue « {nom} » introuvable. Ligues disponibles :")
+        for l in CHAMPIONNATS:
+            print(f"   • {l['nom']} (key: {l['key']})")
+        sys.exit(1)
+    return matches
 
 
 def saison_pour_ligue(ligue_id, annee):
@@ -650,6 +669,7 @@ async def collecter_odds_historiques(conn, session, ligue, date_utc, table, fixt
     Télécharge les cotes Pinnacle à un instant donné pour une ligue entière.
     date_utc : datetime UTC (ex: fixture_date - 24h pour H-24, ou - 5min pour closing)
     Un seul appel API couvre tous les matchs de la ligue à cette date.
+    Retourne le nombre de lignes insérées.
     """
     date_str = date_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
     url = (f"https://api.the-odds-api.com/v4/historical/sports/{ligue['key']}/odds"
@@ -658,12 +678,13 @@ async def collecter_odds_historiques(conn, session, ligue, date_utc, table, fixt
 
     raw = await fetch(session, url)
     if not raw:
-        return
+        return 0
     # L'endpoint /v4/historical/ enveloppe les résultats dans {"timestamp":..., "data":[...]}
     data = raw.get('data', raw) if isinstance(raw, dict) else raw
     if not isinstance(data, list) or not data:
-        return
+        return 0
 
+    inserted = 0
     for event in data:
         # Trouver le fixture correspondant par fuzzy-match sur les noms d'équipes
         match = trouver_fixture(event['home_team'], event['away_team'],
@@ -686,7 +707,66 @@ async def collecter_odds_historiques(conn, session, ligue, date_utc, table, fixt
 
         if rows:
             await conn.executemany(f"INSERT OR IGNORE INTO {table} VALUES (?,?,?,?,?)", rows)
-    await conn.commit()
+            inserted += len(rows)
+    if inserted:
+        await conn.commit()
+    return inserted
+
+
+async def collecter_odds_ligue_saison(conn, session, ligue, saison):
+    """Collecte cotes H-24 + clôture pour une ligue/saison (fixtures déjà en base)."""
+    async with conn.execute(
+        "SELECT id, home_id, away_id, date_utc FROM bt_fixtures WHERE ligue_id=? AND saison=?",
+        (ligue['id'], saison)
+    ) as cur:
+        fixtures = await cur.fetchall()
+
+    if not fixtures:
+        print(f"  ⚠️ Aucun fixture en base pour {ligue['nom']} {saison}")
+        return 0
+
+    par_date = defaultdict(dict)
+    for fid, hid, aid, date_str in fixtures:
+        try:
+            dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            date_key = dt.strftime('%Y-%m-%d')
+            par_date[date_key][(fid, hid, aid)] = dt
+        except Exception:
+            pass
+
+    fixture_name_map = {}
+    for fid, hid, aid, date_str in fixtures:
+        async with conn.execute(
+            "SELECT home_name, away_name FROM bt_fixtures WHERE id=?", (fid,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            fixture_name_map[(row[0], row[1])] = fid
+
+    print(f"  📈 Collecte cotes ({ligue['key']}) — {len(par_date)} journées, {len(fixtures)} matchs…")
+    total = 0
+    for i, (date_key, fixtures_du_jour) in enumerate(par_date.items(), 1):
+        sample_dt = next(iter(fixtures_du_jour.values()))
+        dt_h24 = sample_dt - timedelta(hours=24)
+        dt_close = sample_dt - timedelta(minutes=5)
+        total += await collecter_odds_historiques(
+            conn, session, ligue, dt_h24, "bt_odds_h24", fixture_name_map
+        )
+        total += await collecter_odds_historiques(
+            conn, session, ligue, dt_close, "bt_odds_cloture", fixture_name_map
+        )
+        if i % 20 == 0:
+            print(f"     … {i}/{len(par_date)} journées", flush=True)
+        await asyncio.sleep(0.5)
+
+    async with conn.execute(
+        "SELECT COUNT(DISTINCT o.fixture_id) FROM bt_odds_h24 o "
+        "JOIN bt_fixtures f ON f.id=o.fixture_id WHERE f.ligue_id=? AND f.saison=?",
+        (ligue['id'], saison)
+    ) as cur:
+        n_fix_odds = (await cur.fetchone())[0]
+    print(f"  ✅ {ligue['nom']} {saison} : {total} lignes cotes | {n_fix_odds}/{len(fixtures)} matchs couverts")
+    return n_fix_odds
 
 
 def trouver_fixture(home_odds, away_odds, commence_time, fixture_map):
@@ -707,67 +787,43 @@ def trouver_fixture(home_odds, away_odds, commence_time, fixture_map):
     return best_id
 
 
-async def phase_collecte(conn, session):
+async def phase_collecte(conn, session, ligues=None, odds_only=False):
     print("\n" + "="*60)
     print("📥  PHASE 1 — COLLECTE DES DONNÉES HISTORIQUES")
+    if odds_only:
+        print("  (mode --odds-only : fixtures/xG ignorés, cotes uniquement)")
+    if ligues and len(ligues) < len(CHAMPIONNATS):
+        print(f"  (filtre : {', '.join(l['nom'] for l in ligues)})")
     print("="*60)
 
     if not verifier_cles_api():
         return
 
-    for ligue in CHAMPIONNATS:
+    ligues = ligues or CHAMPIONNATS
+
+    for ligue in ligues:
         for saison in SAISONS_BACKTEST:
             print(f"\n🔄 {ligue['nom']} — Saison {saison}")
 
-            # 1. Fixtures
-            n = await collecter_fixtures(conn, session, ligue, saison)
-            if n == 0:
-                # Essayer saison - 1 pour ligues estivales indexées différemment
-                await collecter_fixtures(conn, session, ligue, saison - 1)
+            if not odds_only:
+                # 1. Fixtures
+                n = await collecter_fixtures(conn, session, ligue, saison)
+                if n == 0:
+                    await collecter_fixtures(conn, session, ligue, saison - 1)
 
-            # 2. xG par fixture
-            async with conn.execute(
-                "SELECT id, home_id, away_id, date_utc FROM bt_fixtures WHERE ligue_id=? AND saison=?",
-                (ligue['id'], saison)
-            ) as cur:
-                fixtures = await cur.fetchall()
+                # 2. xG par fixture
+                async with conn.execute(
+                    "SELECT id, home_id, away_id, date_utc FROM bt_fixtures WHERE ligue_id=? AND saison=?",
+                    (ligue['id'], saison)
+                ) as cur:
+                    fixtures = await cur.fetchall()
 
-            print(f"  📊 Collecte xG pour {len(fixtures)} matchs...")
-            # Grouper les fixtures par date pour les appels odds (1 appel/date/ligue)
-            par_date = defaultdict(dict)
-            for fid, hid, aid, date_str in fixtures:
-                await collecter_xg(conn, session, fid, hid, aid)
-                try:
-                    dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                    date_key = dt.strftime('%Y-%m-%d')
-                    par_date[date_key][(fid, hid, aid)] = dt
-                except Exception:
-                    pass
+                print(f"  📊 Collecte xG pour {len(fixtures)} matchs...")
+                for fid, hid, aid, date_str in fixtures:
+                    await collecter_xg(conn, session, fid, hid, aid)
 
             # 3. Odds historiques H-24 et clôture H-5min
-            print(f"  📈 Collecte cotes historiques ({len(par_date)} journées)...")
-            fixture_name_map = {}
-            for fid, hid, aid, date_str in fixtures:
-                async with conn.execute(
-                    "SELECT home_name, away_name FROM bt_fixtures WHERE id=?", (fid,)
-                ) as cur:
-                    row = await cur.fetchone()
-                if row:
-                    fixture_name_map[(row[0], row[1])] = fid
-
-            for date_key, fixtures_du_jour in par_date.items():
-                # Prendre la première date du jour
-                sample_dt = next(iter(fixtures_du_jour.values()))
-                dt_h24    = sample_dt - timedelta(hours=24)
-                dt_close  = sample_dt - timedelta(minutes=5)
-
-                await collecter_odds_historiques(
-                    conn, session, ligue, dt_h24, "bt_odds_h24", fixture_name_map
-                )
-                await collecter_odds_historiques(
-                    conn, session, ligue, dt_close, "bt_odds_cloture", fixture_name_map
-                )
-                await asyncio.sleep(0.5)  # Respecter les rate limits
+            await collecter_odds_ligue_saison(conn, session, ligue, saison)
 
     print("\n✅ Phase 1 terminée.")
 
@@ -802,6 +858,67 @@ async def calculer_moyennes_venue(conn, ligue_id, saison, avant_date):
     if row and row[0] and row[1]:
         return float(row[0]), float(row[1])
     return 1.4, 1.1
+
+
+async def calculer_mot_luck_bt(conn, ligue_cfg, saison, avant_date):
+    """
+    Reconstruit mot_map et luck_map à partir des matchs joués AVANT avant_date.
+    Réplique actualiser_stats_ligue() du bot live (enjeux c1 + euro + rel, PDO proxy).
+    Pas de lookahead : uniquement les fixtures terminées avec date_utc < avant_date.
+    """
+    async with conn.execute("""
+        SELECT home_id, away_id, gh, ga
+        FROM bt_fixtures
+        WHERE ligue_id=? AND saison=? AND date_utc < ?
+          AND gh IS NOT NULL AND ga IS NOT NULL
+    """, (ligue_cfg['id'], saison, avant_date)) as cur:
+        rows = await cur.fetchall()
+
+    if not rows:
+        return {}, {}
+
+    teams: dict[int, dict] = {}
+    for home_id, away_id, gh, ga in rows:
+        for tid, gf, ga_team, pts in (
+            (home_id, gh, ga, 3 if gh > ga else (1 if gh == ga else 0)),
+            (away_id, ga, gh, 3 if ga > gh else (1 if gh == ga else 0)),
+        ):
+            if tid not in teams:
+                teams[tid] = {'pts': 0, 'gf': 0, 'ga': 0, 'played': 0}
+            teams[tid]['pts'] += pts
+            teams[tid]['gf'] += gf
+            teams[tid]['ga'] += ga_team
+            teams[tid]['played'] += 1
+
+    if len(teams) < 10:
+        neutral = {tid: 1.0 for tid in teams}
+        return neutral, dict(neutral)
+
+    standings = sorted(teams.items(), key=lambda x: x[1]['pts'], reverse=True)
+    n = len(standings)
+
+    pts_c1 = standings[min(ligue_cfg['c1'] - 1, n - 1)][1]['pts']
+    pts_rel = standings[min(ligue_cfg['rel'] - 1, n - 1)][1]['pts']
+    pts_euro = None
+    if ligue_cfg.get('euro'):
+        pts_euro = standings[min(ligue_cfg['euro'] - 1, n - 1)][1]['pts']
+
+    total_played = sum(t['played'] for _, t in standings) or 1
+    league_avg_gf = sum(t['gf'] for _, t in standings) / total_played
+    league_avg_ga = sum(t['ga'] for _, t in standings) / total_played
+
+    mot, luck = {}, {}
+    for tid, stats in teams.items():
+        j = stats['played'] or 1
+        enjeux = [pts_c1, pts_rel] + ([pts_euro] if pts_euro is not None else [])
+        d = min(abs(stats['pts'] - p) for p in enjeux)
+        mot[tid] = 1.0 + (0.10 * (1 / (d + 1))) if d <= 4 else (0.95 if d > 12 else 1.0)
+        gf_ratio = (stats['gf'] / j) / (league_avg_gf or 1)
+        ga_ratio = (stats['ga'] / j) / (league_avg_ga or 1)
+        pdo = (gf_ratio + (2.0 - ga_ratio)) / 2.0
+        luck[tid] = 1.0 - (pdo - 1.0) * 0.30
+
+    return mot, luck
 
 
 async def estimer_parametres_dc_bt(conn, ligue_id, saison, avant_date, mu_h, mu_a):
@@ -957,18 +1074,27 @@ async def estimer_parametres_dc_bt(conn, ligue_id, saison, avant_date, mu_h, mu_
     }
 
 
-def calculer_lambda_blend(dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e, m_dom_l, m_ext_l, ligue_id=None):
+def calculer_lambda_blend(dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e, m_dom_l, m_ext_l,
+                          ligue_id=None, mot_map=None, luck_map=None):
     """
     Calcule L_A / L_B avec la même logique que analyser_un_match() du bot live :
       λ_xg : formule venue-normalisée (xg_off × xg_def_adverse / moyenne ligue)
+      motivation + PDO (mot_map / luck_map) appliqués sur l'attaque
       λ_dc : attack × defense × γ
       blend 50/50 si DC disponible pour les deux équipes, sinon xG pur.
     """
     if not m_dom_l or not m_ext_l:
         m_dom_l, m_ext_l = max(m_dom_l or 1.4, 0.1), max(m_ext_l or 1.1, 0.1)
 
-    L_A_xg = (xg_off_d * xg_def_e) / m_dom_l
-    L_B_xg = (xg_off_e * xg_def_d) / m_ext_l
+    mot_map = mot_map or {}
+    luck_map = luck_map or {}
+    d_d = (mot_map.get(h_id, 1.0) - 1) + (luck_map.get(h_id, 1.0) - 1)
+    d_e = (mot_map.get(a_id, 1.0) - 1) + (luck_map.get(a_id, 1.0) - 1)
+    m_d = 1.0 + max(-0.25, min(0.25, d_d))
+    m_e = 1.0 + max(-0.25, min(0.25, d_e))
+
+    L_A_xg = (xg_off_d * m_d * xg_def_e) / m_dom_l
+    L_B_xg = (xg_off_e * m_e * xg_def_d) / m_ext_l
     rho = RHO_PAR_LIGUE.get(ligue_id, RHO_DEFAULT) if ligue_id else RHO_DEFAULT
 
     if dc and h_id in dc['teams'] and a_id in dc['teams']:
@@ -1053,7 +1179,7 @@ async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, ve
     return xg_off, xg_def, n
 
 
-async def simuler_paris(conn):
+async def simuler_paris(conn, ligues=None):
     print("\n" + "="*60)
     print("🔬  PHASE 2 — SIMULATION DU MODÈLE")
     print("="*60)
@@ -1081,8 +1207,9 @@ async def simuler_paris(conn):
         return -1
 
     all_pending = []
+    ligues = ligues or CHAMPIONNATS
 
-    for ligue in CHAMPIONNATS:
+    for ligue in ligues:
         async with conn.execute(
             "SELECT id, saison, date_utc, home_id, away_id, home_name, away_name, gh, ga "
             "FROM bt_fixtures WHERE ligue_id=? ORDER BY date_utc",
@@ -1110,6 +1237,7 @@ async def simuler_paris(conn):
         dc_cache = {}
         avg_cache = {}
         venue_cache = {}
+        mot_luck_cache = {}
 
         for idx, (fid, saison, date_utc, h_id, a_id, h_name, a_name, gh, ga) in enumerate(fixtures, 1):
             if idx % 200 == 0 or idx == n_fixtures:
@@ -1170,6 +1298,13 @@ async def simuler_paris(conn):
                 )
             m_dom_l, m_ext_l = venue_cache[venue_key]
 
+            mot_luck_key = (ligue['id'], saison, jour)
+            if mot_luck_key not in mot_luck_cache:
+                mot_luck_cache[mot_luck_key] = await calculer_mot_luck_bt(
+                    conn, ligue, saison, date_utc
+                )
+            mot_map, luck_map = mot_luck_cache[mot_luck_key]
+
             dc_key = (ligue['id'], saison, _semaine_dc(date_utc))
             if dc_key not in dc_cache:
                 dc_cache[dc_key] = await estimer_parametres_dc_bt(
@@ -1177,9 +1312,10 @@ async def simuler_paris(conn):
                 )
             dc = dc_cache[dc_key]
 
-            # λ blend 50/50 DC + xG — aligné sur analyser_un_match() du bot live
+            # λ blend 50/50 DC + xG + motivation/PDO — aligné sur analyser_un_match() du bot live
             L_A, L_B, rho = calculer_lambda_blend(
-                dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e, m_dom_l, m_ext_l, ligue['id']
+                dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e, m_dom_l, m_ext_l, ligue['id'],
+                mot_map=mot_map, luck_map=luck_map,
             )
 
             mat = generer_matrice(L_A, L_B, rho)
@@ -1501,7 +1637,17 @@ async def main():
                         help='Vide bt_signaux + supprime backtest_results.csv (garde la DB)')
     parser.add_argument('--reset-full', action='store_true',
                         help='Supprime backtest_data.db + CSV (recollecte API requise)')
+    parser.add_argument('--ligue',      type=str, default=None,
+                        help='Filtrer une ligue (nom partiel, ex: Championship, "Ligue 1")')
+    parser.add_argument('--odds-only',  action='store_true',
+                        help='Avec --collect : recollecte uniquement les cotes (fixtures/xG déjà en base)')
     args = parser.parse_args()
+
+    if args.odds_only and not args.collect:
+        print("\n❌ --odds-only requiert --collect")
+        return
+
+    ligues_filtrees = filtrer_ligues(args.ligue) if args.ligue else None
 
     if args.reset_full:
         await reset_backtest(full=True)
@@ -1525,12 +1671,16 @@ async def main():
         async with aiohttp.ClientSession() as session:
             sim_ok = True
             if args.collect or all_phases:
-                await phase_collecte(conn, session)
+                await phase_collecte(
+                    conn, session,
+                    ligues=ligues_filtrees,
+                    odds_only=args.odds_only,
+                )
             if args.simulate or all_phases:
                 async with aiosqlite.connect(
                     f"file:{DB_PATH}?mode=ro", uri=True, timeout=120.0
                 ) as conn_ro:
-                    sim_ok = (await simuler_paris(conn_ro)) >= 0
+                    sim_ok = (await simuler_paris(conn_ro, ligues=ligues_filtrees)) >= 0
             if args.report or all_phases:
                 if (args.simulate or all_phases) and not sim_ok:
                     print("\n⚠️  Rapport ignoré — la simulation n'a pas pu écrire en base.")
