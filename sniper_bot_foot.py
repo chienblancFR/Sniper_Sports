@@ -1153,7 +1153,7 @@ CHAMPIONNATS = [
     {"nom": "🇫🇷 Ligue 1", "id": 61, "key": "soccer_france_ligue_one", "ev_min": 0.05, "ev_max": 0.15, "c1": 4, "euro": 6, "rel": 16},
     {"nom": "🇪🇸 LaLiga 2", "id": 141, "key": "soccer_spain_segunda_division", "ev_min": 0.05, "ev_max": 0.15, "c1": 2, "euro": 6, "rel": 19},
     {"nom": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League", "id": 39, "key": "soccer_epl", "ev_min": 0.05, "ev_max": 0.15, "c1": 4, "euro": 6, "rel": 18},
-    {"nom": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Championship", "id": 40, "key": "soccer_england_championship", "ev_min": 0.05, "ev_max": 0.15, "c1": 2, "euro": 6, "rel": 22},
+    {"nom": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Championship", "id": 40, "key": "soccer_efl_champ", "ev_min": 0.05, "ev_max": 0.15, "c1": 2, "euro": 6, "rel": 22},
     {"nom": "🇺🇸 MLS", "id": 253, "key": "soccer_usa_mls", "ev_min": 0.05, "ev_max": 0.15, "c1": 7, "euro": 9, "rel": 99},
     {"nom": "🇳🇴 Eliteserien", "id": 103, "key": "soccer_norway_eliteserien", "ev_min": 0.05, "ev_max": 0.15, "c1": 2, "euro": 4, "rel": 14},
     {"nom": "🇧🇪 Jupiler Pro League", "id": 144, "key": "soccer_belgium_first_div", "ev_min": 0.05, "ev_max": 0.15, "c1": 6, "euro": 12, "rel": 13},
@@ -1241,10 +1241,10 @@ async def actualiser_kelly_adaptatif():
     """
     Ajuste KELLY_COURANT selon le drawdown actuel de la bankroll.
 
-    Paliers :
-      • Drawdown < 8%   → Kelly normal (0.10) — performance nominale
-      • Drawdown 8-15%  → Kelly réduit (0.07) — phase de récupération
-      • Drawdown > 15%  → Demi-Kelly   (0.05) — protection capital critique
+    Paliers (basés sur KELLY_FRAC = 0.05) :
+      • Drawdown < 8%   → Kelly normal (0.05)   — performance nominale
+      • Drawdown 8-15%  → Kelly réduit (0.035)  — phase de récupération
+      • Drawdown > 15%  → Kelly réduit (0.025)  — protection capital critique
     """
     global KELLY_COURANT
     try:
@@ -1438,12 +1438,29 @@ async def verifier_resultats_matchs(session):
 
             status_short = f['fixture']['status']['short']
 
-            if status_short in ['NS', '1H', 'HT', '2H']:
+            # Statuts "en cours / pas encore joué" : rien à régler, on garde le pari PENDING.
+            # PST (reporté) et TBD sont inclus ici — le fixture ID reste stable chez API-Football,
+            # le match finira par repasser à FT une fois rejoué (ou CANC s'il est définitivement annulé).
+            if status_short in ['NS', 'TBD', '1H', 'HT', '2H', 'ET', 'BT', 'P', 'SUSP', 'INT', 'PST']:
                 try:
                     dt_obj = datetime.fromisoformat(f['fixture']['date'].replace('Z', '+00:00'))
                     cache_heures_matchs[id_m] = dt_obj
                 except Exception:
                     pass
+                continue
+
+            # Statuts terminaux sans score exploitable : annulé, abandonné, ou résultat technique
+            # (walkover / défaite administrative). On rembourse (VOID) plutôt que de laisser le pari
+            # PENDING indéfiniment — on ne peut pas déterminer un règlement fiable sur handicap/total.
+            if status_short in ['CANC', 'ABD', 'AWD', 'WO']:
+                async with db_lock:
+                    await db_conn.execute(
+                        "UPDATE paris_log SET statut='VOID', resultat=0.0 "
+                        "WHERE id_match=? AND equipe=? AND handicap=?",
+                        (id_m, equipe_pari, h_val)
+                    )
+                    await db_conn.commit()
+                log_info(f"🚫 Match {status_short} : {equipe_pari} ({h_val}) -> VOID (remboursé, non réglable)")
                 continue
 
             if status_short in ['FT', 'AET', 'PEN']:
@@ -2051,6 +2068,7 @@ async def actualiser_stats_ligue(session, ligue_cfg, season):
 
         pts_c1 = standings[min(ligue_cfg['c1']-1, len(standings)-1)]['points']
         pts_rel = standings[min(ligue_cfg['rel']-1, len(standings)-1)]['points']
+        pts_euro = standings[min(ligue_cfg['euro']-1, len(standings)-1)]['points'] if ligue_cfg.get('euro') else None
 
         m_dom_l = sum(t['home']['goals']['for'] for t in standings) / (sum(t['home']['played'] for t in standings) or 1)
         m_ext_l = sum(t['away']['goals']['for'] for t in standings) / (sum(t['away']['played'] for t in standings) or 1)
@@ -2063,7 +2081,11 @@ async def actualiser_stats_ligue(session, ligue_cfg, season):
         for team in standings:
             t_id = team['team']['id']
             j = team['all']['played'] or 1
-            d = min(abs(team['points'] - pts_c1), abs(team['points'] - pts_rel))
+            # Distance minimale à un enjeu de classement : titre/promo (c1), place européenne (euro) ou relégation (rel).
+            # Auparavant seuls c1/rel étaient pris en compte : les équipes en course pour l'Europe
+            # (souvent en milieu de tableau, loin du podium et de la zone rouge) restaient à tort neutres.
+            enjeux = [pts_c1, pts_rel] + ([pts_euro] if pts_euro is not None else [])
+            d = min(abs(team['points'] - p_enjeu) for p_enjeu in enjeux)
             mot[t_id] = 1.0 + (0.10 * (1/(d+1))) if d <= 4 else (0.95 if d > 12 else 1.0)
             sos[t_id]        = team['all']['goals']['against'] / j  # buts concédés : force défensive adverse (normalise notre attaque)
             sos_attack[t_id] = team['all']['goals']['for']     / j  # buts marqués  : force offensive adverse (normalise notre défense)
