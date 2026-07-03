@@ -204,6 +204,188 @@ def calculer_drawdown_serie(profits, capital_initial: float = 100.0) -> float:
 
 
 # ──────────────────────────────────────────────────────────────
+# 🎯  CALIBRATION & BRIER (journal live / backtest)
+# ──────────────────────────────────────────────────────────────
+TRANCHES_EDGE_CALIBRATION = [
+    (2.0, 4.0, "2-4%"),
+    (4.0, 6.0, "4-6%"),
+    (6.0, 9.0, "6-9%"),
+    (9.0, 15.0, "9-15%"),
+    (15.0, 30.0, "15%+"),
+]
+
+
+def preparer_calibration_journal(
+    df: pd.DataFrame,
+    col_cote: str = "Vraie_Cote_Bot",
+    col_statut: str = "Statut",
+) -> pd.DataFrame:
+    """Paris clôturés avec probabilité modèle (1 / cote fair) et issue binaire."""
+    if df.empty or col_cote not in df.columns or col_statut not in df.columns:
+        return pd.DataFrame()
+    out = df[df[col_statut].isin(["GAGNÉ", "PERDU"])].copy()
+    out["cote_modele"] = pd.to_numeric(out[col_cote], errors="coerce")
+    out = out[out["cote_modele"] > 1.0]
+    out["p_model"] = 1.0 / out["cote_modele"]
+    out["outcome"] = (out[col_statut] == "GAGNÉ").astype(float)
+    if "Edge(%)" in out.columns:
+        out["edge_pct"] = pd.to_numeric(out["Edge(%)"], errors="coerce")
+    return out
+
+
+def calculer_brier_score(df_cal: pd.DataFrame) -> float | None:
+    if df_cal.empty:
+        return None
+    return float(((df_cal["p_model"] - df_cal["outcome"]) ** 2).mean())
+
+
+def calibration_par_probabilite(
+    df_cal: pd.DataFrame,
+    bin_width: float = 0.05,
+    p_min: float = 0.35,
+    p_max: float = 0.70,
+) -> pd.DataFrame:
+    """Reliability diagram : prob prédite vs fréquence réelle par tranche."""
+    if df_cal.empty:
+        return pd.DataFrame()
+    rows = []
+    p = p_min
+    while p < p_max:
+        hi = min(p + bin_width, p_max)
+        sub = df_cal[(df_cal["p_model"] >= p) & (df_cal["p_model"] < hi)]
+        if not sub.empty:
+            rows.append({
+                "Tranche": f"{p:.0%}-{hi:.0%}",
+                "p_pred": sub["p_model"].mean(),
+                "p_reel": sub["outcome"].mean(),
+                "N": len(sub),
+            })
+        p = hi
+    return pd.DataFrame(rows)
+
+
+def calibration_par_edge(
+    df_cal: pd.DataFrame,
+    tranches: list | None = None,
+) -> pd.DataFrame:
+    """Win rate réel vs edge détecté (comme backtest foot)."""
+    if df_cal.empty or "edge_pct" not in df_cal.columns:
+        return pd.DataFrame()
+    tranches = tranches or TRANCHES_EDGE_CALIBRATION
+    rows = []
+    for lo, hi, label in tranches:
+        if label.endswith("+"):
+            sub = df_cal[df_cal["edge_pct"] >= lo]
+        else:
+            sub = df_cal[(df_cal["edge_pct"] >= lo) & (df_cal["edge_pct"] < hi)]
+        if sub.empty:
+            continue
+        rows.append({
+            "Tranche": label,
+            "Win_Rate_Reel": sub["outcome"].mean() * 100,
+            "Edge_Moyen": sub["edge_pct"].mean(),
+            "N": len(sub),
+        })
+    return pd.DataFrame(rows)
+
+
+def formater_rapport_calibration_texte(
+    df_cal: pd.DataFrame,
+    min_paris: int = 5,
+) -> str:
+    """Rapport texte pour CLI / logs."""
+    n = len(df_cal)
+    if n < min_paris:
+        return f"Calibration : {n} pari(s) clôturé(s) — minimum {min_paris} requis."
+    brier = calculer_brier_score(df_cal)
+    lines = [
+        f"{'-' * 50}",
+        f"  CALIBRATION NHL — {n} paris clôturés",
+        f"{'-' * 50}",
+        f"  Brier score : {brier:.4f}  (0 = parfait, ~0.25 = coin flip 50/50)",
+    ]
+    df_prob = calibration_par_probabilite(df_cal)
+    if not df_prob.empty:
+        lines.append(f"\n  Par probabilité modèle (1 / Vraie_Cote_Bot) :")
+        for _, r in df_prob.iterrows():
+            lines.append(
+                f"    {r['Tranche']:<12} n={int(r['N']):>3}  "
+                f"prédit={r['p_pred']:.1%}  réel={r['p_reel']:.1%}"
+            )
+    df_edge = calibration_par_edge(df_cal)
+    if not df_edge.empty:
+        lines.append(f"\n  Par tranche d'edge :")
+        for _, r in df_edge.iterrows():
+            lines.append(
+                f"    Edge {r['Tranche']:<8} n={int(r['N']):>3}  "
+                f"win={r['Win_Rate_Reel']:.1f}%  edge_moy={r['Edge_Moyen']:+.1f}%"
+            )
+    return "\n".join(lines)
+
+
+def creer_graphique_calibration_prob(df_bins: pd.DataFrame) -> go.Figure:
+    """Courbe fiabilité : prob prédite vs observée + diagonale parfaite."""
+    fig = go.Figure()
+    if df_bins.empty:
+        return fig
+    fig.add_trace(go.Scatter(
+        x=df_bins["p_pred"] * 100,
+        y=df_bins["p_reel"] * 100,
+        mode="lines+markers",
+        name="Observé",
+        line=dict(color="#00BFFF", width=2.5),
+        marker=dict(size=10),
+        text=[f"n={n}" for n in df_bins["N"]],
+        textposition="top center",
+    ))
+    lo = max(0, df_bins["p_pred"].min() * 100 - 5)
+    hi = min(100, df_bins["p_pred"].max() * 100 + 5)
+    fig.add_trace(go.Scatter(
+        x=[lo, hi], y=[lo, hi],
+        mode="lines",
+        name="Calibration parfaite",
+        line=dict(color="#FFD700", dash="dot", width=1.5),
+    ))
+    fig.update_layout(
+        xaxis_title="Probabilité modèle (%)",
+        yaxis_title="Fréquence de victoire réelle (%)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    appliquer_theme_dark(fig)
+    return fig
+
+
+def creer_graphique_calibration_edge(df_calib: pd.DataFrame) -> go.Figure:
+    """Barres win rate réel par tranche d'edge."""
+    fig = go.Figure()
+    if df_calib.empty:
+        return fig
+    fig.add_trace(go.Bar(
+        x=df_calib["Tranche"],
+        y=df_calib["Win_Rate_Reel"],
+        marker_color="#00BFFF",
+        name="Win rate réel (%)",
+        text=[
+            f"{v:.1f}%<br>n={n}<br>edge {e:+.1f}%"
+            for v, n, e in zip(df_calib["Win_Rate_Reel"], df_calib["N"], df_calib["Edge_Moyen"])
+        ],
+        textposition="outside",
+    ))
+    fig.add_hline(
+        y=50, line_dash="dot", line_color="#FFD700",
+        annotation_text="50% (neutre)", annotation_position="bottom right",
+    )
+    fig.update_layout(
+        yaxis_title="Fréquence de victoire (%)",
+        xaxis_title="Tranche d'edge détecté",
+        yaxis_range=[0, max(100, df_calib["Win_Rate_Reel"].max() + 10)],
+        showlegend=False,
+    )
+    appliquer_theme_dark(fig)
+    return fig
+
+
+# ──────────────────────────────────────────────────────────────
 # 📈  GRAPHIQUES PLOTLY
 # ──────────────────────────────────────────────────────────────
 def appliquer_theme_dark(fig: go.Figure):

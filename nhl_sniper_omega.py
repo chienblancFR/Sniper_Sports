@@ -1714,7 +1714,35 @@ def entrainer_ia_dixon_coles():
         f.write(str(nouveau_rho))
     log_nhl(f"💾 Rho+HIA sauvegardés ({nb} matchs, +{nouveaux} depuis dernier run)")
 
+
+def rapport_calibration_journal(chemin=None, min_paris=5):
+    """Diagnostic Brier + calibration sur le journal (sans impact live)."""
+    from utils import formater_rapport_calibration_texte, preparer_calibration_journal
+
+    chemin = chemin or FICHIER_JOURNAL
+    if not os.path.exists(chemin):
+        print(f"Journal introuvable : {chemin}")
+        return
+    migrer_journal_si_besoin()
+    with open(chemin, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        print("Journal vide.")
+        return
+    import pandas as pd
+
+    df = pd.DataFrame(rows)
+    df_cal = preparer_calibration_journal(df)
+    print(formater_rapport_calibration_texte(df_cal, min_paris=min_paris))
+
+
 if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] in ("--calibration", "--calib"):
+        rapport_calibration_journal()
+        sys.exit(0)
+
     manquants = []
     if not ODDS_API_KEY:
         manquants.append("ODDS_API_KEY")

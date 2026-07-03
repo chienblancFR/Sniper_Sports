@@ -5,14 +5,20 @@ import streamlit as st
 
 from utils import (
     afficher_alertes_chargement,
+    calculer_brier_score,
     calculer_max_drawdown,
+    calibration_par_edge,
+    calibration_par_probabilite,
     convertir_dates,
     creer_graphique_bankroll,
+    creer_graphique_calibration_edge,
+    creer_graphique_calibration_prob,
     creer_graphique_clv_cumule,
     creer_graphique_pl_marche,
     filtre_marche_sidebar,
     filtre_temporel_sidebar,
     nettoyer_colonnes_numeriques,
+    preparer_calibration_journal,
     verifier_authentification,
 )
 
@@ -220,6 +226,69 @@ with col_droite:
         st.write("En attente de données de clôture Pinnacle.")
     else:
         st.write("Données insuffisantes.")
+
+# ==========================================
+# 🎯 CALIBRATION & BRIER
+# ==========================================
+st.markdown("---")
+st.subheader("🎯 Calibration du modèle (Brier)")
+st.caption(
+    "Diagnostic post-match : probabilité fair du bot (1 / Vraie_Cote_Bot) vs résultats réels. "
+    "N'influence pas les paris live."
+)
+
+NHL_CALIB_MIN = 5
+df_cal = preparer_calibration_journal(df_termines)
+
+if len(df_cal) >= NHL_CALIB_MIN:
+    brier = calculer_brier_score(df_cal)
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Brier score", f"{brier:.4f}", help="0 = parfait · ~0.25 = aléatoire sur 50/50")
+    b2.metric("Paris analysés", len(df_cal))
+    b3.metric(
+        "Prob. moyenne modèle",
+        f"{df_cal['p_model'].mean() * 100:.1f} %",
+        help="Moyenne des probabilités implicites au moment du pari",
+    )
+
+    col_cal_prob, col_cal_edge = st.columns(2)
+
+    with col_cal_prob:
+        st.markdown("**Fiabilité par probabilité modèle**")
+        df_bins = calibration_par_probabilite(df_cal)
+        if not df_bins.empty:
+            st.plotly_chart(creer_graphique_calibration_prob(df_bins), use_container_width=True)
+        else:
+            st.info("Pas assez de paris dans les tranches de probabilité.")
+
+    with col_cal_edge:
+        st.markdown("**Win rate par tranche d'edge**")
+        df_edge_cal = calibration_par_edge(df_cal)
+        if not df_edge_cal.empty:
+            st.plotly_chart(creer_graphique_calibration_edge(df_edge_cal), use_container_width=True)
+        else:
+            st.info("Colonne Edge(%) absente ou tranches vides.")
+
+    filtre_cal = st.selectbox(
+        "Filtrer la calibration par marché",
+        ["Tous"] + sorted(df_cal["Type_Marche"].dropna().unique().tolist())
+        if "Type_Marche" in df_cal.columns else ["Tous"],
+        key="nhl_cal_marche",
+    )
+    if filtre_cal != "Tous" and "Type_Marche" in df_cal.columns:
+        df_cal_f = df_cal[df_cal["Type_Marche"] == filtre_cal]
+        if len(df_cal_f) >= 3:
+            st.caption(
+                f"**{filtre_cal}** — Brier {calculer_brier_score(df_cal_f):.4f} "
+                f"({len(df_cal_f)} paris)"
+            )
+        else:
+            st.caption(f"**{filtre_cal}** — trop peu de paris pour un sous-échantillon fiable.")
+else:
+    st.info(
+        f"En attente de **{NHL_CALIB_MIN} paris clôturés** minimum "
+        f"({len(df_cal)} actuellement). Le diagnostic s'affichera au fil de la saison."
+    )
 
 # ==========================================
 # 📡 PARIS EN ATTENTE
