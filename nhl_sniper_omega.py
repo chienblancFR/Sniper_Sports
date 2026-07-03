@@ -64,6 +64,8 @@ NHL_PP_PK_SHRINK_GP = float(os.environ.get("NHL_PP_PK_SHRINK_GP", "20"))
 # MoneyPuck fournit nativement des CSV "forme récente" (10 ou 20 derniers matchs)
 NHL_GSAX_RECENT_WINDOW = int(os.environ.get("NHL_GSAX_RECENT_WINDOW", "10"))
 NHL_GSAX_RECENT_GP_PLEIN = float(os.environ.get("NHL_GSAX_RECENT_GP_PLEIN", "8"))
+NHL_TEAM_RECENT_WINDOW = int(os.environ.get("NHL_TEAM_RECENT_WINDOW", "10"))
+NHL_TEAM_RECENT_GP_PLEIN = float(os.environ.get("NHL_TEAM_RECENT_GP_PLEIN", "10"))
 NHL_RHO_MIN_MATCHS = int(os.environ.get("NHL_RHO_MIN_MATCHS", "30"))
 NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
@@ -87,6 +89,7 @@ XG_AGAINST_COLONNES = (
 _xg_colonnes_actives = {"for": None, "against": None}
 _pp_pk_shrink_logue = False
 _gsax_recent_logue = False
+_team_recent_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -276,10 +279,46 @@ def _blend_team_stats(teams_courant, teams_precedent, poids_courant):
     return blended
 
 
+def _blend_team_recent_form(teams, teams_recent):
+    """
+    Blend base (saison, déjà shrink + blend N-1 si besoin) + forme récente
+    (teams_{N}.csv MoneyPuck) : w = min(1, GP_fenêtre / GP_plein).
+    Remplace le momentum L10 (point %) par un signal xG directement actionnable.
+    """
+    global _team_recent_logue
+    if NHL_TEAM_RECENT_WINDOW <= 0 or not teams or not teams_recent:
+        return teams
+
+    recent_map = {t["team"]: t for t in teams_recent}
+    nb_blend = 0
+    for team in teams:
+        recent = recent_map.get(team["team"])
+        gp_fenetre = recent.get("games_played", 0) if recent else 0
+        if not recent or gp_fenetre <= 0:
+            continue
+        w = min(1.0, gp_fenetre / NHL_TEAM_RECENT_GP_PLEIN) if NHL_TEAM_RECENT_GP_PLEIN > 0 else 1.0
+        for key in ("xGF_per_game", "xGA_per_game", "xGF_PP", "xGA_PK"):
+            base_val = team.get(key, 0.0)
+            recent_val = recent.get(key, base_val)
+            team[key] = round(w * recent_val + (1.0 - w) * base_val, 3)
+        if w < 1.0:
+            nb_blend += 1
+
+    if not _team_recent_logue:
+        _team_recent_logue = True
+        log_nhl(
+            f"📈 Forme récente équipes actif — fenêtre {NHL_TEAM_RECENT_WINDOW} derniers matchs "
+            f"(teams_{NHL_TEAM_RECENT_WINDOW}.csv), confiance pleine à {NHL_TEAM_RECENT_GP_PLEIN:.0f} GP "
+            f"({nb_blend}/{len(teams)} équipes partiellement blendées)"
+        )
+    return teams
+
+
 def get_team_stats(season=None, blend=True):
     if season is None:
         season = NHL_SEASON
-    """Aspire les xG score/venue-adjusted (5v5 + PP/PK), blend N/N-1 en début de saison."""
+    """Aspire les xG score/venue-adjusted (5v5 + PP/PK), blend N/N-1 en début de saison,
+    puis blend de forme récente (teams_{N}.csv) par-dessus."""
     try:
         texte, saison_utilisee = _fetch_moneypuck_csv("teams", season)
         if not texte:
@@ -289,27 +328,35 @@ def get_team_stats(season=None, blend=True):
         teams = _shrink_special_teams(_parser_team_stats_csv(texte))
         if not teams:
             return []
-        if not blend or NHL_BLEND_GP_PLEIN <= 0:
-            return teams
 
-        gp_values = [t["games_played"] for t in teams if t.get("games_played", 0) > 0]
-        gp_moyen = sum(gp_values) / len(gp_values) if gp_values else NHL_BLEND_GP_PLEIN
-        poids_n = min(1.0, gp_moyen / NHL_BLEND_GP_PLEIN)
-        if poids_n >= 1.0:
-            return teams
+        if blend and NHL_BLEND_GP_PLEIN > 0:
+            gp_values = [t["games_played"] for t in teams if t.get("games_played", 0) > 0]
+            gp_moyen = sum(gp_values) / len(gp_values) if gp_values else NHL_BLEND_GP_PLEIN
+            poids_n = min(1.0, gp_moyen / NHL_BLEND_GP_PLEIN)
+            if poids_n < 1.0:
+                texte_n1, _ = _fetch_moneypuck_csv("teams", season - 1)
+                teams_n1 = _shrink_special_teams(_parser_team_stats_csv(texte_n1)) if texte_n1 else None
+                if teams_n1:
+                    log_nhl(
+                        f"🔀 Blend MoneyPuck : {round(poids_n * 100)}% saison {season} / "
+                        f"{round((1 - poids_n) * 100)}% {season - 1} (GP moyen {gp_moyen:.1f})"
+                    )
+                    teams = _blend_team_stats(teams, teams_n1, poids_n)
 
-        texte_n1, _ = _fetch_moneypuck_csv("teams", season - 1)
-        if not texte_n1:
-            return teams
-        teams_n1 = _shrink_special_teams(_parser_team_stats_csv(texte_n1))
-        if not teams_n1:
-            return teams
+        if NHL_TEAM_RECENT_WINDOW > 0:
+            kind_recent = f"teams_{NHL_TEAM_RECENT_WINDOW}"
+            texte_recent, saison_recent = _fetch_moneypuck_csv(kind_recent, season)
+            if texte_recent:
+                if saison_recent != season:
+                    log_nhl(f"ℹ️ MoneyPuck équipes forme récente : repli saison {saison_recent}")
+                    texte_recent = None
+            if texte_recent:
+                teams_recent = _shrink_special_teams(_parser_team_stats_csv(texte_recent))
+                teams = _blend_team_recent_form(teams, teams_recent)
+            else:
+                log_nhl("ℹ️ Forme récente équipes indisponible — saison seule", level="warning")
 
-        log_nhl(
-            f"🔀 Blend MoneyPuck : {round(poids_n * 100)}% saison {season} / "
-            f"{round((1 - poids_n) * 100)}% {season - 1} (GP moyen {gp_moyen:.1f})"
-        )
-        return _blend_team_stats(teams, teams_n1, poids_n)
+        return teams
     except Exception as e:
         log_nhl(f"⚠️ Erreur extracteur équipes: {e}", level="warning")
         return []
@@ -593,30 +640,6 @@ def get_rosters_avec_fallback(game_id):
 
     return g_ext, g_dom, sk_ext, sk_dom, "indisponible"
 
-def get_nhl_momentum():
-    """Calcule le différentiel de forme L10 (Momentum)."""
-    url = "https://api-web.nhle.com/v1/standings/now"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    momentum_dict = {}
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200: return {}
-        data = response.json()
-        for team in data.get("standings", []):
-            abbrev = team.get("teamAbbrev", {}).get("default")
-            gp = team.get("gamesPlayed", 1)
-            if gp < 10:
-                momentum_dict[abbrev] = 0.0
-                continue
-            season_pts_pct = team.get("points", 0) / (gp * 2.0)
-            l10_wins = team.get("l10Wins", 0)
-            l10_ot_losses = team.get("l10OtLosses", 0)
-            l10_pts_pct = ((l10_wins * 2) + l10_ot_losses) / 20.0
-            delta_form = l10_pts_pct - season_pts_pct
-            momentum_dict[abbrev] = round(delta_form * 0.15, 3) # Modérateur conservateur
-        return momentum_dict
-    except: return {}
-
 def get_goalie_confirmation_status(game_id):
     """
     Explore le Landing Page du match pour détecter si les gardiens
@@ -829,7 +852,7 @@ def optimiser_rho_saison(historique_matchs):
 
 def calculate_master_odds_v4(
     teams_data, home_team, away_team, home_gsax, away_gsax,
-    mom_home=0.0, mom_away=0.0, home_is_b2b=False, away_is_b2b=False,
+    home_is_b2b=False, away_is_b2b=False,
     rho=-0.12, hia=None,
 ):
     if hia is None:
@@ -843,16 +866,16 @@ def calculate_master_odds_v4(
     away = next((t for t in teams_data if t['team'] == away_team), None)
     if not home or not away: return None
 
-    # HIA calibré + Momentum
-    home_xgf = home['xGF_per_game'] * (1.0 + hia) * (1.0 + mom_home)
-    home_xga = home['xGA_per_game'] * (1.0 - hia) * (1.0 - mom_home)
-    away_xgf = away['xGF_per_game'] * (1.0 + mom_away)
-    away_xga = away['xGA_per_game'] * (1.0 - mom_away)
+    # HIA calibré (le xG utilisé intègre déjà la forme récente via get_team_stats)
+    home_xgf = home['xGF_per_game'] * (1.0 + hia)
+    home_xga = home['xGA_per_game'] * (1.0 - hia)
+    away_xgf = away['xGF_per_game']
+    away_xga = away['xGA_per_game']
 
-    home_pp_att = home['xGF_PP'] * (1.0 + mom_home)
-    home_pk_def = home['xGA_PK'] * (1.0 - mom_home)
-    away_pp_att = away['xGF_PP'] * (1.0 + mom_away)
-    away_pk_def = away['xGA_PK'] * (1.0 - mom_away)
+    home_pp_att = home['xGF_PP']
+    home_pk_def = home['xGA_PK']
+    away_pp_att = away['xGF_PP']
+    away_pk_def = away['xGA_PK']
 
     # Matrice de Fatigue Circadienne et Kilométrique
     home_fatigue_atk, home_fatigue_def = calculate_circadian_fatigue(home_team, away_team, home_is_b2b, is_home=True)
@@ -1538,6 +1561,11 @@ def run_sniper():
             f"🥅 GSAx gardiens : blend forme récente ({NHL_GSAX_RECENT_WINDOW:.0f} derniers matchs) "
             f"+ saison (plein à {NHL_GSAX_RECENT_GP_PLEIN:.0f} GP)"
         )
+    if NHL_TEAM_RECENT_WINDOW > 0:
+        log_nhl(
+            f"📈 xG équipes : blend forme récente ({NHL_TEAM_RECENT_WINDOW:.0f} derniers matchs) "
+            f"+ saison (plein à {NHL_TEAM_RECENT_GP_PLEIN:.0f} GP) — remplace le momentum L10"
+        )
     migrer_journal_si_besoin()
 
     while True:
@@ -1558,9 +1586,7 @@ def run_sniper():
             log_nhl(f"🧠 Configuration Mathématique : Rho = {rho_actuel} | HIA = {hia_actuel:.1%}")
 
             log_nhl("📡 Synchronisation bases de données...")
-            teams, goalies, stars_vip, momentum_data = (
-                get_team_stats(), get_goalie_stats(), get_stars_impact(), get_nhl_momentum()
-            )
+            teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
             equipes_en_b2b_hier = get_teams_played_yesterday()
             odds_cache = fetch_all_pinnacle_odds()
 
@@ -1633,11 +1659,8 @@ def run_sniper():
                 away_base['xGF_per_game'], away_base['xGA_per_game'] = adj_xgf_ext, adj_xga_ext
                 home_base['xGF_per_game'], home_base['xGA_per_game'] = adj_xgf_dom, adj_xga_dom
 
-                mom_dom, mom_ext = momentum_data.get(m['home_team'], 0.0), momentum_data.get(m['away_team'], 0.0)
-
                 cotes_vraies = calculate_master_odds_v4(
                     teams_match, m['home_team'], m['away_team'], gsax_dom, gsax_ext,
-                    mom_home=mom_dom, mom_away=mom_ext,
                     home_is_b2b=home_b2b, away_is_b2b=away_b2b,
                     rho=rho_actuel, hia=hia_actuel,
                 )
