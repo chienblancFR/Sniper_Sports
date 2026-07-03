@@ -1,0 +1,29 @@
+---
+description: Commit automatique après chaque modification de fichier
+alwaysApply: true
+---
+
+# Commit après modification
+
+Dès qu'un ou plusieurs fichiers du projet sont modifiés ou créés, **créer un commit git immédiatement** avant de terminer la réponse.
+
+## Protocole
+
+1. `git status` + `git diff` pour voir les changements
+2. Message concis (1–2 phrases), style impératif, focus sur le *why*
+3. `git add` uniquement les fichiers pertinents au changement
+4. `git commit` puis `git status` pour confirmer
+
+## Exclusions
+
+- Ne pas committer sans demande explicite : `.env`, secrets, `backtest_data.db*`, fichiers gitignorés volontairement
+- Ne pas push sauf demande explicite de l'utilisateur
+- Ne pas committer si aucun fichier tracké n'a été modifié
+
+## Exemple de message
+
+```
+fix(nhl): corriger le tracking CLV puck line
+
+Une seule requête Odds API par cycle pour économiser le quota.
+```
