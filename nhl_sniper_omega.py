@@ -4,7 +4,7 @@ import csv
 import math
 import time
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 import traceback
 from scipy.optimize import minimize
@@ -29,6 +29,12 @@ KELLY_FRACTION_GARDIEN_INCERTAIN = float(os.environ.get("NHL_KELLY_GARDIEN", "0.
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
+NHL_SCAN_HEURES_AVANCE = float(os.environ.get("NHL_SCAN_HEURES_AVANCE", "18"))
+# Minutes avant le puck drop où l'on arrête de chercher de nouveaux paris
+NHL_MINUTES_AVANT_PUCK = float(os.environ.get("NHL_MINUTES_AVANT_PUCK", "5"))
+
+ETATS_MATCH_EXCLUS = {"FINAL", "OFF", "OFFICIAL", "POSTPONED", "PPD", "LIVE", "CRIT"}
+ETATS_MATCH_PRIORITAIRES = {"FUT", "PRE"}
 
 # Mappage des abréviations (NHL API) vers noms complets (The-Odds-API)
 NHL_TEAMS_MAPPING = {
@@ -201,28 +207,76 @@ def get_stars_impact(season=None):
 # ==========================================
 # 2. RADAR API OFFICIEL NHL & MOMENTUM
 # ==========================================
+def _parse_utc(iso_str):
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _match_eligible_pour_scan(game):
+    """True si le match n'a pas commencé et reste dans la fenêtre de scan."""
+    etat = game.get("gameState", "")
+    if etat in ETATS_MATCH_EXCLUS:
+        return False
+
+    now = datetime.now(timezone.utc)
+    debut = _parse_utc(game.get("startTimeUTC"))
+
+    if debut and now >= debut:
+        return False
+    if debut and (debut - now).total_seconds() > NHL_SCAN_HEURES_AVANCE * 3600:
+        return False
+    if debut and (debut - now).total_seconds() < NHL_MINUTES_AVANT_PUCK * 60:
+        return False
+
+    if etat in ETATS_MATCH_PRIORITAIRES:
+        return True
+    return debut is not None
+
+
 def get_nhl_games_today():
+    """Matchs du jour éligibles au scan (FUT/PRE + fenêtre horaire, hors LIVE/FINAL)."""
     date_str = datetime.now().strftime("%Y-%m-%d")
     url = f"https://api-web.nhle.com/v1/score/{date_str}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200: return []
+        if response.status_code != 200:
+            return []
         data = response.json()
-        if "games" not in data: return []
+        if "games" not in data:
+            return []
+
         matchs = []
         for game in data["games"]:
-            if game["gameState"] in ["FUT", "PRE"]:
-                matchs.append({'game_id': game["id"], 'away_team': game["awayTeam"]["abbrev"], 'home_team': game["homeTeam"]["abbrev"]})
+            if not _match_eligible_pour_scan(game):
+                continue
+            matchs.append({
+                "game_id": game["id"],
+                "away_team": game["awayTeam"]["abbrev"],
+                "home_team": game["homeTeam"]["abbrev"],
+                "game_state": game.get("gameState", "?"),
+                "start_utc": game.get("startTimeUTC"),
+            })
         return matchs
-    except: return []
+    except Exception as e:
+        print(f"⚠️ Erreur calendrier NHL : {e}")
+        return []
+
 
 def get_active_rosters(game_id):
     url = f"https://api-web.nhle.com/v1/gamecenter/{game_id}/boxscore"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200: return None, None, [], []
+        if response.status_code != 200:
+            return None, None, [], []
         data = response.json()
         away_goalies = data.get("playerByGameStats", {}).get("awayTeam", {}).get("goalies", [])
         home_goalies = data.get("playerByGameStats", {}).get("homeTeam", {}).get("goalies", [])
@@ -230,10 +284,53 @@ def get_active_rosters(game_id):
         home_starter = home_goalies[0]["name"]["default"] if home_goalies else None
         away_skaters, home_skaters = [], []
         for pos in ["forwards", "defense"]:
-            for player in data.get("playerByGameStats", {}).get("awayTeam", {}).get(pos, []): away_skaters.append(player["name"]["default"])
-            for player in data.get("playerByGameStats", {}).get("homeTeam", {}).get(pos, []): home_skaters.append(player["name"]["default"])
+            for player in data.get("playerByGameStats", {}).get("awayTeam", {}).get(pos, []):
+                away_skaters.append(player["name"]["default"])
+            for player in data.get("playerByGameStats", {}).get("homeTeam", {}).get(pos, []):
+                home_skaters.append(player["name"]["default"])
         return away_starter, home_starter, away_skaters, home_skaters
-    except: return None, None, [], []
+    except Exception:
+        return None, None, [], []
+
+
+def _extraire_nom_gardien(probable_entry):
+    if not probable_entry:
+        return None
+    name = probable_entry.get("name")
+    if isinstance(name, dict):
+        return name.get("default")
+    return name
+
+
+def get_rosters_avec_fallback(game_id):
+    """
+    Boxscore NHL en priorité ; repli sur les gardiens probables (landing)
+    si le boxscore n'est pas encore publié.
+    Retourne (g_ext, g_dom, skaters_ext, skaters_dom, source).
+    """
+    g_ext, g_dom, sk_ext, sk_dom = get_active_rosters(game_id)
+    if g_ext and g_dom:
+        return g_ext, g_dom, sk_ext, sk_dom, "boxscore"
+
+    url = f"https://api-web.nhle.com/v1/gamecenter/{game_id}/landing"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return g_ext, g_dom, sk_ext, sk_dom, "indisponible"
+        data = response.json()
+        away_list = data.get("awayTeam", {}).get("probableGoalies", [])
+        home_list = data.get("homeTeam", {}).get("probableGoalies", [])
+        if not g_ext and away_list:
+            g_ext = _extraire_nom_gardien(away_list[0])
+        if not g_dom and home_list:
+            g_dom = _extraire_nom_gardien(home_list[0])
+        if g_ext and g_dom:
+            return g_ext, g_dom, sk_ext, sk_dom, "landing_probable"
+    except Exception:
+        pass
+
+    return g_ext, g_dom, sk_ext, sk_dom, "indisponible"
 
 def get_nhl_momentum():
     """Calcule le différentiel de forme L10 (Momentum)."""
@@ -823,6 +920,16 @@ def _extraire_cote_clv(home_abbr, away_abbr, type_pari, cote_actuelle, odds_cach
     return cote_actuelle
 
 
+def compter_paris_en_attente():
+    if not os.path.exists(FICHIER_JOURNAL):
+        return 0
+    try:
+        with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+            return sum(1 for row in csv.DictReader(f) if row.get("Statut") == "EN ATTENTE")
+    except Exception:
+        return 0
+
+
 def traquer_et_actualiser_clv():
     if not os.path.exists(FICHIER_JOURNAL):
         return
@@ -882,12 +989,10 @@ def run_sniper():
             lancer_la_balayeuse()
             entrainer_ia_dixon_coles()
 
-            heure_actuelle = datetime.now().hour
-            if 18 <= heure_actuelle or heure_actuelle <= 1:
-                print("🕵️ Tracking CLV en cours...")
-                traquer_et_actualiser_clv()
+            nb_attente = compter_paris_en_attente()
+            print(f"🕵️ Tracking CLV ({nb_attente} pari(s) en attente)...")
+            traquer_et_actualiser_clv()
 
-            # ---> NOUVEAU : MISE À JOUR DU CAPITAL
             bankroll_actuelle = calculer_bankroll_dynamique(BANKROLL_INITIALE)
             print(f"💰 Capital Dynamique Disponible : {bankroll_actuelle} €")
             # ------------------------------------
@@ -909,113 +1014,135 @@ def run_sniper():
 
             matchs = get_nhl_games_today()
             if not matchs:
-                print("🏒 Aucun match NHL programmé aujourd'hui — veille active.")
+                print("🏒 Aucun match NHL éligible dans la fenêtre de scan — veille active.")
+            else:
+                print(f"🏒 {len(matchs)} match(s) dans la fenêtre de scan.")
             for m in matchs:
                 id_match = f"{m['game_id']}_notified"
-                if match_deja_notifie(id_match): continue
+                if match_deja_notifie(id_match):
+                    continue
 
-                g_ext, g_dom, skaters_ext, skaters_dom = get_active_rosters(m['game_id'])
-                if g_ext and g_dom:
-                    statut_confirmation = get_goalie_confirmation_status(m['game_id'])
-                    gardiens_verrouilles = statut_confirmation["away_confirmed"] and statut_confirmation["home_team_confirmed"]
-
-                    # ---> NOUVEAU : Détection automatique du drapeau B2B
-                    home_b2b = m['home_team'] in equipes_en_b2b_hier
-                    away_b2b = m['away_team'] in equipes_en_b2b_hier
-
-                    if home_b2b: print(f"🔄 {m['home_team']} détecté en Back-to-Back !")
-                    if away_b2b: print(f"🔄 {m['away_team']} détecté en Back-to-Back !")
-
-                    gsax_ext, gsax_dom = trouver_gsax(g_ext, goalies), trouver_gsax(g_dom, goalies)
-                    absents_ext = detecter_stars_absentes(m['away_team'], skaters_ext, stars_vip)
-                    absents_dom = detecter_stars_absentes(m['home_team'], skaters_dom, stars_vip)
-
-                    teams_match = copy.deepcopy(teams)
-                    home_base = next((t for t in teams_match if t['team'] == m['home_team']), None)
-                    away_base = next((t for t in teams_match if t['team'] == m['away_team']), None)
-                    if not home_base or not away_base:
-                        continue
-
-                    adj_xgf_ext, adj_xga_ext = apply_star_absence_penalty(
-                        m['away_team'], away_base['xGF_per_game'], away_base['xGA_per_game'],
-                        absents_ext, stars_vip,
+                g_ext, g_dom, skaters_ext, skaters_dom, source_roster = get_rosters_avec_fallback(m["game_id"])
+                if not g_ext or not g_dom:
+                    print(
+                        f"⏳ Alignement indisponible — {m['away_team']} @ {m['home_team']} "
+                        f"(id {m['game_id']}, état {m.get('game_state', '?')}) — retry prochain cycle."
                     )
-                    adj_xgf_dom, adj_xga_dom = apply_star_absence_penalty(
-                        m['home_team'], home_base['xGF_per_game'], home_base['xGA_per_game'],
-                        absents_dom, stars_vip,
+                    continue
+
+                if source_roster == "landing_probable":
+                    print(
+                        f"ℹ️ Gardiens probables (landing) pour {m['away_team']} @ {m['home_team']} : "
+                        f"{g_ext} / {g_dom}"
                     )
-                    away_base['xGF_per_game'], away_base['xGA_per_game'] = adj_xgf_ext, adj_xga_ext
-                    home_base['xGF_per_game'], home_base['xGA_per_game'] = adj_xgf_dom, adj_xga_dom
-
-                    mom_dom, mom_ext = momentum_data.get(m['home_team'], 0.0), momentum_data.get(m['away_team'], 0.0)
-
-                    cotes_vraies = calculate_master_odds_v4(
-                        teams_match, m['home_team'], m['away_team'], gsax_dom, gsax_ext,
-                        mom_home=mom_dom, mom_away=mom_ext,
-                        home_is_b2b=home_b2b, away_is_b2b=away_b2b, # <--- ICI
-                        rho=rho_actuel
+                elif not skaters_ext and not skaters_dom:
+                    print(
+                        f"ℹ️ Rosters patineurs non publiés pour {m['away_team']} @ {m['home_team']} "
+                        f"— analyse sans détection d'absences stars."
                     )
-                    cotes_bookmaker = get_real_live_odds(
-                        m['home_team'], m['away_team'], odds_cache, log_si_absent=True,
-                    )
-                    cotes_puckline = get_real_live_odds_puckline(m['home_team'], m['away_team'], odds_cache)
 
-                    if cotes_vraies and cotes_bookmaker:
-                        pari_trouve, best_pari, max_edge = False, None, 0.0
+                statut_confirmation = get_goalie_confirmation_status(m['game_id'])
+                gardiens_verrouilles = statut_confirmation["away_confirmed"] and statut_confirmation["home_team_confirmed"]
 
-                        # --- Domicile ---
-                        inv_ml_home = calculate_kelly(cotes_vraies['prob_1'], cotes_bookmaker['cote_1'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                        if inv_ml_home and inv_ml_home['edge'] > max_edge:
-                            max_edge = inv_ml_home['edge']
-                            best_pari = {"type": f"Victoire {m['home_team']}", "inv": inv_ml_home, "cote_book": cotes_bookmaker['cote_1'], "cote_vraie": cotes_vraies['cote_1']}
+                home_b2b = m['home_team'] in equipes_en_b2b_hier
+                away_b2b = m['away_team'] in equipes_en_b2b_hier
 
-                        if cotes_puckline and 'cote_pl_home' in cotes_puckline:
-                            inv_pl_home = calculate_kelly(cotes_vraies['prob_pl_home'], cotes_puckline['cote_pl_home'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                            if inv_pl_home and inv_pl_home['edge'] > max_edge:
-                                max_edge = inv_pl_home['edge']
-                                best_pari = {"type": f"Puck Line {m['home_team']} -1.5", "inv": inv_pl_home, "cote_book": cotes_puckline['cote_pl_home'], "cote_vraie": cotes_vraies['cote_pl_home']}
+                if home_b2b:
+                    print(f"🔄 {m['home_team']} détecté en Back-to-Back !")
+                if away_b2b:
+                    print(f"🔄 {m['away_team']} détecté en Back-to-Back !")
 
-                        # --- Extérieur ---
-                        inv_ml_away = calculate_kelly(cotes_vraies['prob_2'], cotes_bookmaker['cote_2'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                        if inv_ml_away and inv_ml_away['edge'] > max_edge:
-                            max_edge = inv_ml_away['edge']
-                            best_pari = {"type": f"Victoire {m['away_team']}", "inv": inv_ml_away, "cote_book": cotes_bookmaker['cote_2'], "cote_vraie": cotes_vraies['cote_2']}
+                gsax_ext, gsax_dom = trouver_gsax(g_ext, goalies), trouver_gsax(g_dom, goalies)
+                absents_ext = detecter_stars_absentes(m['away_team'], skaters_ext, stars_vip)
+                absents_dom = detecter_stars_absentes(m['home_team'], skaters_dom, stars_vip)
 
-                        if cotes_puckline and 'cote_pl_away' in cotes_puckline:
-                            inv_pl_away = calculate_kelly(cotes_vraies['prob_pl_away'], cotes_puckline['cote_pl_away'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                            if inv_pl_away and inv_pl_away['edge'] > max_edge:
-                                max_edge = inv_pl_away['edge']
-                                best_pari = {"type": f"Puck Line {m['away_team']} -1.5", "inv": inv_pl_away, "cote_book": cotes_puckline['cote_pl_away'], "cote_vraie": cotes_vraies['cote_pl_away']}
+                teams_match = copy.deepcopy(teams)
+                home_base = next((t for t in teams_match if t['team'] == m['home_team']), None)
+                away_base = next((t for t in teams_match if t['team'] == m['away_team']), None)
+                if not home_base or not away_base:
+                    continue
 
-                        # --- Cible Universelle OVER/UNDER ---
-                        if 'totals' in cotes_bookmaker:
-                            for cut, prices in cotes_bookmaker['totals'].items():
-                                cut_arrondi = _arrondir_cut(cut)
-                                _, prob_over = _trouver_cle_float(cotes_vraies['prob_over_cuts'], cut_arrondi)
-                                _, prob_under = _trouver_cle_float(cotes_vraies['prob_under_cuts'], cut_arrondi)
-                                if prob_over is None:
-                                    continue
-                                if 'Over' in prices:
-                                    inv_over = calculate_kelly(prob_over, prices['Over'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                                    if inv_over and inv_over['edge'] > max_edge:
-                                        max_edge = inv_over['edge']
-                                        vraie_cote_over = round(1 / max(prob_over, 0.001), 2)
-                                        best_pari = {"type": f"OVER {cut_arrondi}", "inv": inv_over, "cote_book": prices['Over'], "cote_vraie": vraie_cote_over}
+                adj_xgf_ext, adj_xga_ext = apply_star_absence_penalty(
+                    m['away_team'], away_base['xGF_per_game'], away_base['xGA_per_game'],
+                    absents_ext, stars_vip,
+                )
+                adj_xgf_dom, adj_xga_dom = apply_star_absence_penalty(
+                    m['home_team'], home_base['xGF_per_game'], home_base['xGA_per_game'],
+                    absents_dom, stars_vip,
+                )
+                away_base['xGF_per_game'], away_base['xGA_per_game'] = adj_xgf_ext, adj_xga_ext
+                home_base['xGF_per_game'], home_base['xGA_per_game'] = adj_xgf_dom, adj_xga_dom
 
-                                if 'Under' in prices and prob_under is not None:
-                                    inv_under = calculate_kelly(prob_under, prices['Under'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
-                                    if inv_under and inv_under['edge'] > max_edge:
-                                        max_edge = inv_under['edge']
-                                        vraie_cote_under = round(1 / max(prob_under, 0.001), 2)
-                                        best_pari = {"type": f"UNDER {cut_arrondi}", "inv": inv_under, "cote_book": prices['Under'], "cote_vraie": vraie_cote_under}
+                mom_dom, mom_ext = momentum_data.get(m['home_team'], 0.0), momentum_data.get(m['away_team'], 0.0)
 
-                        # --- Envoi de la transaction finale ---
-                        if best_pari:
-                            envoyer_alerte(m['away_team'], g_ext, m['home_team'], g_dom, best_pari['cote_vraie'], best_pari['inv'], best_pari['type'])
-                            enregistrer_transaction(id_match, m['away_team'], m['home_team'], best_pari['type'], best_pari['cote_vraie'], cotes_vraies, best_pari['inv'], best_pari['cote_book'])
-                            pari_trouve = True
+                cotes_vraies = calculate_master_odds_v4(
+                    teams_match, m['home_team'], m['away_team'], gsax_dom, gsax_ext,
+                    mom_home=mom_dom, mom_away=mom_ext,
+                    home_is_b2b=home_b2b, away_is_b2b=away_b2b,
+                    rho=rho_actuel
+                )
+                cotes_bookmaker = get_real_live_odds(
+                    m['home_team'], m['away_team'], odds_cache, log_si_absent=True,
+                )
+                cotes_puckline = get_real_live_odds_puckline(m['home_team'], m['away_team'], odds_cache)
 
-                        if pari_trouve: enregistrer_notification(id_match)
+                if cotes_vraies and cotes_bookmaker:
+                    pari_trouve, best_pari, max_edge = False, None, 0.0
+
+                    # --- Domicile ---
+                    inv_ml_home = calculate_kelly(cotes_vraies['prob_1'], cotes_bookmaker['cote_1'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
+                    if inv_ml_home and inv_ml_home['edge'] > max_edge:
+                        max_edge = inv_ml_home['edge']
+                        best_pari = {"type": f"Victoire {m['home_team']}", "inv": inv_ml_home, "cote_book": cotes_bookmaker['cote_1'], "cote_vraie": cotes_vraies['cote_1']}
+
+                    if cotes_puckline and 'cote_pl_home' in cotes_puckline:
+                        inv_pl_home = calculate_kelly(cotes_vraies['prob_pl_home'], cotes_puckline['cote_pl_home'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
+                        if inv_pl_home and inv_pl_home['edge'] > max_edge:
+                            max_edge = inv_pl_home['edge']
+                            best_pari = {"type": f"Puck Line {m['home_team']} -1.5", "inv": inv_pl_home, "cote_book": cotes_puckline['cote_pl_home'], "cote_vraie": cotes_vraies['cote_pl_home']}
+
+                    # --- Extérieur ---
+                    inv_ml_away = calculate_kelly(cotes_vraies['prob_2'], cotes_bookmaker['cote_2'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
+                    if inv_ml_away and inv_ml_away['edge'] > max_edge:
+                        max_edge = inv_ml_away['edge']
+                        best_pari = {"type": f"Victoire {m['away_team']}", "inv": inv_ml_away, "cote_book": cotes_bookmaker['cote_2'], "cote_vraie": cotes_vraies['cote_2']}
+
+                    if cotes_puckline and 'cote_pl_away' in cotes_puckline:
+                        inv_pl_away = calculate_kelly(cotes_vraies['prob_pl_away'], cotes_puckline['cote_pl_away'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
+                        if inv_pl_away and inv_pl_away['edge'] > max_edge:
+                            max_edge = inv_pl_away['edge']
+                            best_pari = {"type": f"Puck Line {m['away_team']} -1.5", "inv": inv_pl_away, "cote_book": cotes_puckline['cote_pl_away'], "cote_vraie": cotes_vraies['cote_pl_away']}
+
+                    # --- Cible Universelle OVER/UNDER ---
+                    if 'totals' in cotes_bookmaker:
+                        for cut, prices in cotes_bookmaker['totals'].items():
+                            cut_arrondi = _arrondir_cut(cut)
+                            _, prob_over = _trouver_cle_float(cotes_vraies['prob_over_cuts'], cut_arrondi)
+                            _, prob_under = _trouver_cle_float(cotes_vraies['prob_under_cuts'], cut_arrondi)
+                            if prob_over is None:
+                                continue
+                            if 'Over' in prices:
+                                inv_over = calculate_kelly(prob_over, prices['Over'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
+                                if inv_over and inv_over['edge'] > max_edge:
+                                    max_edge = inv_over['edge']
+                                    vraie_cote_over = round(1 / max(prob_over, 0.001), 2)
+                                    best_pari = {"type": f"OVER {cut_arrondi}", "inv": inv_over, "cote_book": prices['Over'], "cote_vraie": vraie_cote_over}
+
+                            if 'Under' in prices and prob_under is not None:
+                                inv_under = calculate_kelly(prob_under, prices['Under'], bankroll_actuelle, gardiens_confirmes=gardiens_verrouilles)
+                                if inv_under and inv_under['edge'] > max_edge:
+                                    max_edge = inv_under['edge']
+                                    vraie_cote_under = round(1 / max(prob_under, 0.001), 2)
+                                    best_pari = {"type": f"UNDER {cut_arrondi}", "inv": inv_under, "cote_book": prices['Under'], "cote_vraie": vraie_cote_under}
+
+                    # --- Envoi de la transaction finale ---
+                    if best_pari:
+                        envoyer_alerte(m['away_team'], g_ext, m['home_team'], g_dom, best_pari['cote_vraie'], best_pari['inv'], best_pari['type'])
+                        enregistrer_transaction(id_match, m['away_team'], m['home_team'], best_pari['type'], best_pari['cote_vraie'], cotes_vraies, best_pari['inv'], best_pari['cote_book'])
+                        pari_trouve = True
+
+                    if pari_trouve:
+                        enregistrer_notification(id_match)
             time.sleep(900)
         except Exception as e:
             print(f"⚠️ Erreur système : {e}")
