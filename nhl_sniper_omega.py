@@ -57,6 +57,7 @@ KELLY_FRACTION_GARDIEN_INCERTAIN = float(os.environ.get("NHL_KELLY_GARDIEN", "0.
 NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
 NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
 NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
+NHL_ODDS_QUOTA_ALERT = int(os.environ.get("NHL_ODDS_QUOTA_ALERT", "100"))
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -101,6 +102,16 @@ NHL_TIMEZONES = {
     "COL": 2, "UTA": 2, "CGY": 2, "EDM": 2,
     "ANA": 3, "LAK": 3, "SJS": 3, "SEA": 3, "VAN": 3, "VGK": 3
 }
+
+JOURNAL_COLONNES = [
+    "Date", "ID_Match", "Visiteur", "Local", "Pari",
+    "Vraie_Cote_Bot", "Cote_Prise", "Cote_CLV",
+    "Lam_Ext", "Lam_Dom", "Score_Ext", "Score_Dom",
+    "Edge(%)", "Risque(%)", "Mise_€", "Statut", "P&L",
+    "Gardien_Ext", "Gardien_Dom", "Gardiens_Confirmes", "B2B_Home", "B2B_Away", "Rho",
+]
+
+_odds_quota_state = {"derniere_alerte": None}
 
 # ==========================================
 # 1. ASPIRATEURS DE DONNÉES (MoneyPuck)
@@ -801,17 +812,46 @@ def fetch_all_pinnacle_odds():
     cache = {}
     try:
         response = requests.get(url, params=params, timeout=15)
+        _traiter_quota_odds_api(response)
         if response.status_code != 200:
-            print(f"⚠️ Odds API : HTTP {response.status_code}")
+            log_nhl(f"⚠️ Odds API : HTTP {response.status_code}", level="warning")
             return {}
         for game in response.json():
             parsed = _parse_pinnacle_game(game)
             if parsed:
                 _indexer_cotes_cache(cache, parsed)
+        log_nhl(f"📡 Odds API : {len(cache)} clé(s) de match indexées")
         return cache
     except Exception as e:
-        print(f"⚠️ Erreur Odds API globale : {e}")
+        log_nhl(f"⚠️ Erreur Odds API globale : {e}", level="warning")
         return {}
+
+
+def _traiter_quota_odds_api(response):
+    """Log le quota mensuel et alerte Telegram si seuil bas."""
+    restant_raw = response.headers.get("x-requests-remaining")
+    utilise_raw = response.headers.get("x-requests-used")
+    if restant_raw is None:
+        return
+    try:
+        restant = int(restant_raw)
+        utilise = int(utilise_raw) if utilise_raw else "?"
+    except ValueError:
+        return
+    log_nhl(f"📊 Odds API quota : {restant} restantes ({utilise} utilisées ce mois)")
+    if restant > NHL_ODDS_QUOTA_ALERT:
+        _odds_quota_state["derniere_alerte"] = None
+        return
+    now = datetime.now()
+    last = _odds_quota_state.get("derniere_alerte")
+    if last and (now - last).total_seconds() < 6 * 3600:
+        return
+    _odds_quota_state["derniere_alerte"] = now
+    envoyer_alerte_systeme(
+        f"⚠️ **QUOTA ODDS API BAS**\n\n"
+        f"Il reste **{restant}** requêtes ce mois (seuil {NHL_ODDS_QUOTA_ALERT}).\n"
+        f"Envisager de réduire la fréquence CLV ou d'upgrader le plan Odds API."
+    )
 
 
 def get_odds_for_match(home_team_abbrev, away_team_abbrev, odds_cache=None, log_si_absent=False):
@@ -820,7 +860,7 @@ def get_odds_for_match(home_team_abbrev, away_team_abbrev, odds_cache=None, log_
     noms_away = _noms_odds_pour_equipe(away_team_abbrev)
     if not noms_home or not noms_away:
         if log_si_absent:
-            print(f"⚠️ Abréviation inconnue : {away_team_abbrev} @ {home_team_abbrev}")
+            log_nhl(f"⚠️ Abréviation inconnue : {away_team_abbrev} @ {home_team_abbrev}", level="warning")
         return None
 
     if odds_cache is not None:
@@ -830,9 +870,10 @@ def get_odds_for_match(home_team_abbrev, away_team_abbrev, odds_cache=None, log_
                 if hit:
                     return hit
         if log_si_absent:
-            print(
+            log_nhl(
                 f"⚠️ Pas de cotes Pinnacle : {away_team_abbrev} @ {home_team_abbrev} "
-                f"(testé : {noms_away[0]} @ {noms_home[0]})"
+                f"(testé : {noms_away[0]} @ {noms_home[0]})",
+                level="warning",
             )
         return None
 
@@ -910,6 +951,32 @@ def limite_paris_jour_atteinte():
     return NHL_PARIS_JOUR_MAX > 0 and compter_paris_du_jour() >= NHL_PARIS_JOUR_MAX
 
 
+def migrer_journal_si_besoin():
+    """Ajoute les colonnes P4 aux anciens journaux sans les perdre."""
+    if not os.path.exists(FICHIER_JOURNAL):
+        return
+    with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return
+        if all(col in reader.fieldnames for col in JOURNAL_COLONNES):
+            return
+        lignes = list(reader)
+    with open(FICHIER_JOURNAL, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES, extrasaction="ignore")
+        writer.writeheader()
+        for row in lignes:
+            writer.writerow({col: row.get(col, "-") for col in JOURNAL_COLONNES})
+    log_nhl("📋 Journal migré vers le schéma enrichi (colonnes gardiens, B2B, rho)")
+
+
+def _ecrire_journal(rows):
+    with open(FICHIER_JOURNAL, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def publier_journal_dashboard():
     """Journal déjà sur PA, ou upload FTP optionnel depuis une machine locale."""
     if os.path.isdir(PA_DATA_DIR) and FICHIER_JOURNAL.startswith(PA_DATA_DIR):
@@ -941,25 +1008,57 @@ def match_deja_notifie(id_match):
 def enregistrer_notification(id_match):
     with open(FICHIER_MEMOIRE, "a") as f: f.write(id_match + "\n")
 
-def enregistrer_transaction(id_match, ext, dom, type_pari, vraie_cote_pari, cotes_vraies_dict, investissement, cote_bookmaker):
+
+def envoyer_alerte_systeme(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log_nhl(f"⚠️ Alerte système (Telegram absent) : {message}", level="warning")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+    except Exception as e:
+        log_nhl(f"⚠️ Erreur Telegram système : {e}", level="warning")
+
+
+def enregistrer_transaction(
+    id_match, ext, dom, type_pari, vraie_cote_pari, cotes_vraies_dict, investissement, cote_bookmaker,
+    gardien_ext="-", gardien_dom="-", gardiens_confirmes=False, b2b_home=False, b2b_away=False, rho=-0.12,
+):
+    migrer_journal_si_besoin()
     fichier_existe = os.path.isfile(FICHIER_JOURNAL)
-    with open(FICHIER_JOURNAL, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
+    row = {
+        "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "ID_Match": id_match,
+        "Visiteur": ext,
+        "Local": dom,
+        "Pari": type_pari,
+        "Vraie_Cote_Bot": vraie_cote_pari,
+        "Cote_Prise": cote_bookmaker,
+        "Cote_CLV": cote_bookmaker,
+        "Lam_Ext": cotes_vraies_dict["lam_away"],
+        "Lam_Dom": cotes_vraies_dict["lam_home"],
+        "Score_Ext": "-",
+        "Score_Dom": "-",
+        "Edge(%)": investissement["edge"],
+        "Risque(%)": investissement["pct_bankroll"],
+        "Mise_€": investissement["mise"],
+        "Statut": "EN ATTENTE",
+        "P&L": "0.00",
+        "Gardien_Ext": gardien_ext,
+        "Gardien_Dom": gardien_dom,
+        "Gardiens_Confirmes": "OUI" if gardiens_confirmes else "NON",
+        "B2B_Home": "OUI" if b2b_home else "NON",
+        "B2B_Away": "OUI" if b2b_away else "NON",
+        "Rho": rho,
+    }
+    with open(FICHIER_JOURNAL, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES, extrasaction="ignore")
         if not fichier_existe:
-            writer.writerow([
-                "Date", "ID_Match", "Visiteur", "Local", "Pari",
-                "Vraie_Cote_Bot", "Cote_Prise", "Cote_CLV",
-                "Lam_Ext", "Lam_Dom", "Score_Ext", "Score_Dom",
-                "Edge(%)", "Risque(%)", "Mise_€", "Statut", "P&L"
-            ])
-        date_jour = datetime.now().strftime("%Y-%m-%d %H:%M")
-        writer.writerow([
-            date_jour, id_match, ext, dom, type_pari,
-            vraie_cote_pari, cote_bookmaker, cote_bookmaker,
-            cotes_vraies_dict['lam_away'], cotes_vraies_dict['lam_home'], "-", "-",
-            investissement['edge'], investissement['pct_bankroll'],
-            investissement['mise'], "EN ATTENTE", "0.00"
-        ])
+            writer.writeheader()
+        writer.writerow(row)
     publier_journal_dashboard()
 
 def envoyer_alerte(ext, g_ext, dom, g_dom, vraie_cote_pari, investissement, type_pari, dry_run=False):
@@ -1021,22 +1120,20 @@ def compter_paris_en_attente():
 def traquer_et_actualiser_clv():
     if not os.path.exists(FICHIER_JOURNAL):
         return
+    migrer_journal_si_besoin()
     odds_cache = fetch_all_pinnacle_odds()
-    lignes, mise_a_jour_effectuee = [], False
-    with open(FICHIER_JOURNAL, 'r', encoding='utf-8') as f:
-        reader = csv.reader(f)
-        lignes.append(next(reader))
-        for row in reader:
-            if len(row) > 15 and row[15] == "EN ATTENTE":
-                ext, dom, type_pari = row[2], row[3], row[4]
-                nv_cote = _extraire_cote_clv(dom, ext, type_pari, row[7], odds_cache)
-                if nv_cote != row[7]:
-                    row[7] = nv_cote
+    rows, mise_a_jour_effectuee = [], False
+    with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("Statut") == "EN ATTENTE":
+                ext, dom, type_pari = row["Visiteur"], row["Local"], row["Pari"]
+                nv_cote = _extraire_cote_clv(dom, ext, type_pari, row["Cote_CLV"], odds_cache)
+                if nv_cote != row["Cote_CLV"]:
+                    row["Cote_CLV"] = nv_cote
                     mise_a_jour_effectuee = True
-            lignes.append(row)
+            rows.append(row)
     if mise_a_jour_effectuee:
-        with open(FICHIER_JOURNAL, 'w', encoding='utf-8', newline='') as f:
-            csv.writer(f).writerows(lignes)
+        _ecrire_journal(rows)
         publier_journal_dashboard()
 
 def calculer_bankroll_dynamique(capital_de_base=1000.0):
@@ -1079,6 +1176,8 @@ def run_sniper():
         log_nhl(f"📊 Limite paris/jour : {NHL_PARIS_JOUR_MAX}")
     cap_label = f"{NHL_MISE_MAX_PCT}% bankroll" if NHL_MISE_MAX_PCT > 0 else "Kelly pur (pas de cap %)"
     log_nhl(f"💶 Cap mise : {cap_label} | journal → {FICHIER_JOURNAL}")
+    log_nhl(f"📊 Alerte quota Odds API si ≤ {NHL_ODDS_QUOTA_ALERT} requêtes restantes")
+    migrer_journal_si_besoin()
 
     while True:
         try:
@@ -1264,6 +1363,9 @@ def run_sniper():
                             enregistrer_transaction(
                                 id_match, m['away_team'], m['home_team'], best_pari['type'],
                                 best_pari['cote_vraie'], cotes_vraies, best_pari['inv'], best_pari['cote_book'],
+                                gardien_ext=g_ext, gardien_dom=g_dom,
+                                gardiens_confirmes=gardiens_verrouilles,
+                                b2b_home=home_b2b, b2b_away=away_b2b, rho=rho_actuel,
                             )
                             enregistrer_notification(id_match)
                             pari_trouve = True
@@ -1289,39 +1391,43 @@ def get_match_result(game_id):
 def lancer_la_balayeuse():
     if not os.path.exists(FICHIER_JOURNAL):
         return
-    lignes = []
+    migrer_journal_si_besoin()
+    rows = []
     modifie = False
-    with open(FICHIER_JOURNAL, 'r', encoding='utf-8') as f:
-        reader = csv.reader(f)
-        lignes.append(next(reader))
-        for row in reader:
-            if row[15] == "EN ATTENTE":
-                res = get_match_result(row[1].split('_')[0])
+    with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("Statut") == "EN ATTENTE":
+                game_id = row["ID_Match"].split("_")[0]
+                res = get_match_result(game_id)
                 if res:
                     modifie = True
                     score_v, score_d = res
-                    row[10], row[11] = str(score_v), str(score_d)
-                    ext, dom, pari = row[2], row[3], row[4]
-                    mise, cote_book = float(row[14]), float(row[6])
+                    row["Score_Ext"] = str(score_v)
+                    row["Score_Dom"] = str(score_d)
+                    ext, dom, pari = row["Visiteur"], row["Local"], row["Pari"]
+                    mise, cote_book = float(row["Mise_€"]), float(row["Cote_Prise"])
 
                     gagne = False
                     if "Victoire" in pari:
-                        if (score_d > score_v and dom in pari) or (score_v > score_d and ext in pari): gagne = True
+                        if (score_d > score_v and dom in pari) or (score_v > score_d and ext in pari):
+                            gagne = True
                     elif "Puck Line" in pari:
-                        if (score_d - score_v >= 2 and dom in pari) or (score_v - score_d >= 2 and ext in pari): gagne = True
+                        if (score_d - score_v >= 2 and dom in pari) or (score_v - score_d >= 2 and ext in pari):
+                            gagne = True
                     elif "OVER" in pari or "UNDER" in pari:
                         parts = pari.split(" ")
                         cut = float(parts[1])
                         total_buts = score_d + score_v
-                        if "OVER" in pari and total_buts > cut: gagne = True
-                        elif "UNDER" in pari and total_buts < cut: gagne = True
+                        if "OVER" in pari and total_buts > cut:
+                            gagne = True
+                        elif "UNDER" in pari and total_buts < cut:
+                            gagne = True
 
-                    row[15] = "GAGNÉ" if gagne else "PERDU"
-                    row[16] = f"{round(mise * (cote_book - 1), 2) if gagne else -mise}"
-            lignes.append(row)
+                    row["Statut"] = "GAGNÉ" if gagne else "PERDU"
+                    row["P&L"] = f"{round(mise * (cote_book - 1), 2) if gagne else -mise}"
+            rows.append(row)
     if modifie:
-        with open(FICHIER_JOURNAL, 'w', encoding='utf-8', newline='') as f:
-            csv.writer(f).writerows(lignes)
+        _ecrire_journal(rows)
         publier_journal_dashboard()
 
 def lire_rho_dynamique():
