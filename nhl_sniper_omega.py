@@ -60,6 +60,7 @@ NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
 NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
 NHL_ODDS_QUOTA_ALERT = int(os.environ.get("NHL_ODDS_QUOTA_ALERT", "100"))
 NHL_BLEND_GP_PLEIN = float(os.environ.get("NHL_BLEND_GP_PLEIN", "20"))
+NHL_PP_PK_SHRINK_GP = float(os.environ.get("NHL_PP_PK_SHRINK_GP", "20"))
 NHL_RHO_MIN_MATCHS = int(os.environ.get("NHL_RHO_MIN_MATCHS", "30"))
 NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
@@ -81,6 +82,7 @@ XG_AGAINST_COLONNES = (
     "xGoalsAgainst",
 )
 _xg_colonnes_actives = {"for": None, "against": None}
+_pp_pk_shrink_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -217,6 +219,40 @@ def _parser_team_stats_csv(texte):
     return list(teams_dict.values())
 
 
+def _shrink_special_teams(teams):
+    """
+    Régularise PP/PK vers la moyenne ligue quand peu de matchs joués.
+    shrink = w * valeur_equipe + (1-w) * moyenne_ligue, w = min(1, GP / NHL_PP_PK_SHRINK_GP)
+    """
+    global _pp_pk_shrink_logue
+    if NHL_PP_PK_SHRINK_GP <= 0 or not teams:
+        return teams
+
+    pp_vals = [t["xGF_PP"] for t in teams if t.get("xGF_PP", 0) > 0]
+    pk_vals = [t["xGA_PK"] for t in teams if t.get("xGA_PK", 0) > 0]
+    league_pp = sum(pp_vals) / len(pp_vals) if pp_vals else 0.0
+    league_pk = sum(pk_vals) / len(pk_vals) if pk_vals else 0.0
+
+    nb_shrink = 0
+    for team in teams:
+        gp = max(team.get("games_played", 0), 0)
+        w = min(1.0, gp / NHL_PP_PK_SHRINK_GP)
+        if w < 1.0:
+            nb_shrink += 1
+        raw_pp = team.get("xGF_PP", league_pp)
+        raw_pk = team.get("xGA_PK", league_pk)
+        team["xGF_PP"] = round(w * raw_pp + (1.0 - w) * league_pp, 3)
+        team["xGA_PK"] = round(w * raw_pk + (1.0 - w) * league_pk, 3)
+
+    if not _pp_pk_shrink_logue:
+        _pp_pk_shrink_logue = True
+        log_nhl(
+            f"📉 Shrinkage PP/PK actif — confiance pleine à {NHL_PP_PK_SHRINK_GP:.0f} GP "
+            f"(ligue PP≈{league_pp:.3f} PK≈{league_pk:.3f}, {nb_shrink}/{len(teams)} équipes partiellement rétrécies)"
+        )
+    return teams
+
+
 def _blend_team_stats(teams_courant, teams_precedent, poids_courant):
     prev_map = {t["team"]: t for t in teams_precedent}
     blended = []
@@ -244,8 +280,10 @@ def get_team_stats(season=None, blend=True):
             return []
         if saison_utilisee != season:
             log_nhl(f"ℹ️ MoneyPuck équipes : repli sur la saison {saison_utilisee}")
-        teams = _parser_team_stats_csv(texte)
-        if not teams or not blend or NHL_BLEND_GP_PLEIN <= 0:
+        teams = _shrink_special_teams(_parser_team_stats_csv(texte))
+        if not teams:
+            return []
+        if not blend or NHL_BLEND_GP_PLEIN <= 0:
             return teams
 
         gp_values = [t["games_played"] for t in teams if t.get("games_played", 0) > 0]
@@ -257,7 +295,7 @@ def get_team_stats(season=None, blend=True):
         texte_n1, _ = _fetch_moneypuck_csv("teams", season - 1)
         if not texte_n1:
             return teams
-        teams_n1 = _parser_team_stats_csv(texte_n1)
+        teams_n1 = _shrink_special_teams(_parser_team_stats_csv(texte_n1))
         if not teams_n1:
             return teams
 
@@ -1400,6 +1438,8 @@ def run_sniper():
     )
     if NHL_BLEND_GP_PLEIN > 0:
         log_nhl(f"🔀 Blend MoneyPuck N/N-1 jusqu'à {NHL_BLEND_GP_PLEIN:.0f} GP moyen/ligue")
+    if NHL_PP_PK_SHRINK_GP > 0:
+        log_nhl(f"📉 Shrinkage PP/PK vers moyenne ligue jusqu'à {NHL_PP_PK_SHRINK_GP:.0f} GP/équipe")
     migrer_journal_si_besoin()
 
     while True:
