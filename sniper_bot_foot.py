@@ -100,6 +100,16 @@ API_METEO_KEY = os.getenv("OPENWEATHER_KEY")
 KELLY_FRAC = 0.05       # Fraction Kelly de base (ajustée dynamiquement selon le drawdown)
 KELLY_COURANT = 0.05   # Mise à jour chaque cycle par actualiser_kelly_adaptatif()
 
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.environ.get(key, str(default)).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+FOOT_KELLY_BRIER_ACTIF = _env_bool("FOOT_KELLY_BRIER_ACTIF", True)
+FOOT_KELLY_BRIER_FENETRE = int(os.environ.get("FOOT_KELLY_BRIER_FENETRE", "40"))
+FOOT_KELLY_BRIER_MIN_PARIS = int(os.environ.get("FOOT_KELLY_BRIER_MIN_PARIS", "20"))
+FOOT_KELLY_BSS_SENSIBILITE = float(os.environ.get("FOOT_KELLY_BSS_SENSIBILITE", "0.30"))
+FOOT_KELLY_BSS_MULT_MIN = float(os.environ.get("FOOT_KELLY_BSS_MULT_MIN", "0.4"))
+
 # Shrinkage bayésien adaptatif : plus la ligue est petite / données xG peu fiables,
 # plus on maintient longtemps les estimations proches de la moyenne de ligue.
 # Grandes ligues 20 clubs / 38J → prior faible (on fait confiance aux données équipe plus vite)
@@ -1239,9 +1249,10 @@ async def exporter_historique_csv():
 
 async def actualiser_kelly_adaptatif():
     """
-    Ajuste KELLY_COURANT selon le drawdown actuel de la bankroll.
+    Ajuste KELLY_COURANT selon le drawdown actuel de la bankroll,
+    puis applique un multiplicateur Brier (BSS récent) si activé.
 
-    Paliers (basés sur KELLY_FRAC = 0.05) :
+    Paliers drawdown (basés sur KELLY_FRAC = 0.05) :
       • Drawdown < 8%   → Kelly normal (0.05)   — performance nominale
       • Drawdown 8-15%  → Kelly réduit (0.035)  — phase de récupération
       • Drawdown > 15%  → Kelly réduit (0.025)  — protection capital critique
@@ -1268,16 +1279,76 @@ async def actualiser_kelly_adaptatif():
         drawdown = (peak - bankroll) / peak if peak > 0 else 0.0
 
         if drawdown > 0.15:
-            KELLY_COURANT = 0.025
+            kelly_base = 0.025
             log_info(f"⚠️ Kelly réduit à 0.025 — Drawdown critique : {drawdown:.1%}")
         elif drawdown > 0.08:
-            KELLY_COURANT = 0.035
+            kelly_base = 0.035
             log_info(f"⚠️ Kelly réduit à 0.035 — Drawdown modéré : {drawdown:.1%}")
         else:
-            KELLY_COURANT = KELLY_FRAC
+            kelly_base = KELLY_FRAC
+
+        mult_brier = await _multiplicateur_kelly_brier_foot()
+        KELLY_COURANT = round(kelly_base * mult_brier, 4)
     except Exception as e:
         log_info(f"⚠️ actualiser_kelly_adaptatif : {e}")
         KELLY_COURANT = KELLY_FRAC
+
+
+async def _lire_brier_recent_foot(fenetre: int | None = None):
+    """
+    Brier score sur les N derniers paris clôturés + baseline p*(1-p).
+    Utilise p_modele (probabilité fair implicite 1/cote_fair, pas l'EV).
+    Exclut les anciennes lignes où p_modele stockait par erreur ev_modele (~0.05-0.15).
+    """
+    fenetre = fenetre or FOOT_KELLY_BRIER_FENETRE
+    async with db_lock:
+        async with db_conn.execute(
+            """SELECT p_modele, statut FROM paris_log
+               WHERE statut IN ('WON','HALF-WON','LOST','HALF-LOST')
+               ORDER BY timestamp ASC"""
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        return None, None, 0
+
+    # p_modele valide : probabilité implicite (0.15–0.95), pas un EV historique
+    valid = [
+        (p, 1.0 if s in ('WON', 'HALF-WON') else 0.0)
+        for p, s in rows
+        if p and 0.15 < p < 0.95
+    ]
+    if len(valid) < FOOT_KELLY_BRIER_MIN_PARIS:
+        return None, None, len(valid)
+
+    recent = valid[-fenetre:]
+    if len(recent) < FOOT_KELLY_BRIER_MIN_PARIS:
+        return None, None, len(recent)
+
+    ps = np.array([p for p, _ in recent])
+    outcomes = np.array([o for _, o in recent])
+    brier = float(((ps - outcomes) ** 2).mean())
+    brier_baseline = float((ps * (1 - ps)).mean())
+    return brier, brier_baseline, len(recent)
+
+
+async def _multiplicateur_kelly_brier_foot() -> float:
+    """Réduit Kelly si BSS récent négatif (modèle mal calibré vs confiance affichée)."""
+    if not FOOT_KELLY_BRIER_ACTIF:
+        return 1.0
+    brier, brier_baseline, n = await _lire_brier_recent_foot()
+    if brier is None or not brier_baseline or FOOT_KELLY_BSS_SENSIBILITE <= 0:
+        return 1.0
+    bss = 1.0 - (brier / brier_baseline)
+    if bss >= 0:
+        return 1.0
+    mult = round(min(max(1.0 + bss / FOOT_KELLY_BSS_SENSIBILITE, FOOT_KELLY_BSS_MULT_MIN), 1.0), 3)
+    if mult < 1.0:
+        log_info(
+            f"⚠️ Kelly Brier : BSS récent {bss:+.2f} sur {n} paris "
+            f"(Brier {brier:.3f} vs baseline {brier_baseline:.3f}) → mises x{mult:.2f}"
+        )
+    return mult
 
 
 def obtenir_saison_api(nom_ligue):
@@ -1817,6 +1888,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                 ev_modele = calculer_ev_ah(mat_actif, h, is_h_odds, cote)
                 ev_pinnacle = calculer_ev_ah(mat_actif, h, is_h_odds, cote_novig)
                 kelly_theorique = calculer_kelly_ah(mat_actif, h, is_h_odds, cote)
+                p_modele = calculer_prob_modele_pari(mat_actif, 'spreads', h, is_h_odds=is_h_odds)
                 market_label = "🏆 HANDICAP"
                 pari_display = f"{nom} ({h:+g})"
             else:
@@ -1834,6 +1906,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                 ev_modele = calculer_ev_total_asiatique(mat_actif, h, is_over, cote)
                 ev_pinnacle = calculer_ev_total_asiatique(mat_actif, h, is_over, cote_novig)
                 kelly_theorique = calculer_kelly_total(mat_actif, h, is_over, cote)
+                p_modele = calculer_prob_modele_pari(mat_actif, 'totals', h, is_over=is_over)
                 market_label = "⚽ TOTAL"
                 pari_display = f"{nom} {h:g}"
 
@@ -1846,6 +1919,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                     candidats.append({
                         'ev_final': ev_final, 'ev_modele': ev_modele, 'ev_pinnacle': ev_pinnacle,
                         'h': h, 'cote': cote, 'nom': nom, 'mise_u': mise_u,
+                        'p_modele': p_modele,
                         'market_key': market_key, 'market_label': market_label,
                         'pari_display': pari_display,
                     })
@@ -1855,8 +1929,8 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
 
     best = max(candidats, key=lambda x: x['ev_final'])
     h, cote, nom = best['h'], best['cote'], best['nom']
-    ev_final, ev_modele, ev_pinnacle, mise_u = (
-        best['ev_final'], best['ev_modele'], best['ev_pinnacle'], best['mise_u']
+    ev_final, ev_modele, ev_pinnacle, mise_u, p_modele = (
+        best['ev_final'], best['ev_modele'], best['ev_pinnacle'], best['mise_u'], best['p_modele']
     )
 
     badge = "✅ *XI CONFIRMÉ*" if lineup_ok else "⏳ *Compo Probable*"
@@ -1866,6 +1940,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
            f"🏟️ {n_d} - {n_e}\n{badge} | {hko_label}{rotation_note}\n"
            f"💎 Pari : *{best['pari_display']}* @ {cote:.2f}\n"
            f"🔥 Value : *+{ev_final:.1%}* (Mod: {ev_modele:+.1%} | Pin: {ev_pinnacle:+.1%})\n"
+           f"📊 Prob. modèle : *{p_modele:.1%}* (fair @ {1/p_modele:.2f})\n"
            f"📏 Mise Kelly : *{mise_u} u*")
     await envoyer_telegram_async(session, msg)
 
@@ -1875,7 +1950,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
             (id_match, equipe, handicap, cote_prise, mise, edge_detecte, p_modele, ligue,
              is_lineup_official, timestamp, equipe_dom, equipe_ext, kickoff)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (id_m, nom, h, cote, mise_u, round(ev_final, 4), round(ev_modele, 4), ligue_tag,
+            (id_m, nom, h, cote, mise_u, round(ev_final, 4), round(p_modele, 4), ligue_tag,
              int(lineup_ok), datetime.now().isoformat(),
              home_team_odds, away_team_odds, m['fixture']['date']))
         await db_conn.commit()
@@ -2176,6 +2251,54 @@ def calculer_ev_total_asiatique(matrice, ligne, is_over, cote):
 
             esperance += prob * payout
     return esperance - 1.0
+
+def _calculer_cote_fair(ev_fn, cote_max=500.0):
+    """
+    Résout EV(cote)=0 par bisection.
+    EV croît avec la cote : on cherche lo (EV<=0) et hi (EV>=0).
+    """
+    def ev_at(c):
+        return ev_fn(max(c, 1.001))
+
+    lo = 1.01
+    if ev_at(lo) >= 0:
+        return lo
+
+    hi = 2.0
+    while ev_at(hi) < 0:
+        hi = min(hi * 1.5, cote_max)
+        if hi >= cote_max and ev_at(hi) < 0:
+            return cote_max
+
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if ev_at(mid) <= 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def calculer_cote_fair_ah(matrice, h, is_h):
+    """Cote décimale fair (EV=0) pour un pari handicap asiatique."""
+    return _calculer_cote_fair(lambda c: calculer_ev_ah(matrice, h, is_h, c))
+
+
+def calculer_cote_fair_total(matrice, ligne, is_over):
+    """Cote décimale fair (EV=0) pour un total asiatique."""
+    return _calculer_cote_fair(lambda c: calculer_ev_total_asiatique(matrice, ligne, is_over, c))
+
+
+def calculer_prob_modele_pari(matrice, market_key, h, is_h_odds=None, is_over=None):
+    """
+    Probabilité implicite du modèle pour le pari (1 / cote_fair).
+    Aligné sur le NHL bot (Vraie_Cote_Bot → p_model = 1/cote_fair).
+    """
+    if market_key == 'spreads':
+        c_fair = calculer_cote_fair_ah(matrice, h, is_h_odds)
+    else:
+        c_fair = calculer_cote_fair_total(matrice, h, is_over)
+    return min(max(1.0 / c_fair, 0.001), 0.999)
 
 def calculer_kelly_ah(matrice, h, is_h, cote):
     """
@@ -2580,6 +2703,32 @@ async def main_loop():
             log_info(f"⚠️ Erreur Critique : {e}")
             await asyncio.sleep(60)
 
+async def rapport_calibration_foot(min_paris: int = 5):
+    """Diagnostic Brier + calibration sur paris_log (sans impact live)."""
+    from utils import formater_rapport_calibration_texte, preparer_calibration_foot
+    import pandas as pd
+
+    global db_lock, db_conn
+    if db_conn is None:
+        db_lock = asyncio.Lock()
+        await init_db()
+
+    async with db_lock:
+        async with db_conn.execute(
+            """SELECT p_modele AS Prob_Modele, statut AS Statut, edge_detecte AS Edge
+               FROM paris_log
+               WHERE statut IN ('WON','HALF-WON','LOST','HALF-LOST')
+               ORDER BY timestamp ASC"""
+        ) as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+
+    df_cal = preparer_calibration_foot(pd.DataFrame(rows, columns=cols))
+    print(formater_rapport_calibration_texte(
+        df_cal, min_paris=min_paris, titre="CALIBRATION FOOT"
+    ))
+
+
 async def _graceful_shutdown(sig_name: str):
     """Ferme la connexion DB proprement avant de quitter."""
     log_info(f"🛑 Signal {sig_name} reçu — fermeture propre en cours...")
@@ -2594,8 +2743,15 @@ async def _graceful_shutdown(sig_name: str):
 
 
 if __name__ == "__main__":
+    import sys
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    if len(sys.argv) > 1 and sys.argv[1] in ("--calibration", "--calib"):
+        try:
+            loop.run_until_complete(rapport_calibration_foot())
+        finally:
+            loop.close()
+        raise SystemExit(0)
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, lambda s=sig: asyncio.ensure_future(_graceful_shutdown(s.name)))

@@ -233,6 +233,29 @@ def preparer_calibration_journal(
     return out
 
 
+def preparer_calibration_foot(
+    df: pd.DataFrame,
+    col_prob: str = "Prob_Modele",
+    col_statut: str = "Statut",
+    col_edge: str = "Edge",
+) -> pd.DataFrame:
+    """
+    Journal foot (historique_sniper.csv / paris_log export) :
+    p_model = Prob_Modele (probabilité implicite 1/cote_fair),
+    outcome = 1 si profit positif (WON ou HALF-WON).
+    Exclut les lignes historiques où Prob_Modele stockait par erreur l'EV (~0.05-0.15).
+    """
+    if df.empty or col_prob not in df.columns or col_statut not in df.columns:
+        return pd.DataFrame()
+    termines = df[df[col_statut].isin(["WON", "HALF-WON", "LOST", "HALF-LOST"])].copy()
+    termines["p_model"] = pd.to_numeric(termines[col_prob], errors="coerce")
+    termines = termines[termines["p_model"].between(0.15, 0.95)]
+    termines["outcome"] = termines[col_statut].isin(["WON", "HALF-WON"]).astype(float)
+    if col_edge in termines.columns:
+        termines["edge_pct"] = pd.to_numeric(termines[col_edge], errors="coerce") * 100
+    return termines
+
+
 def calculer_brier_score(df_cal: pd.DataFrame) -> float | None:
     if df_cal.empty:
         return None
@@ -292,21 +315,28 @@ def calibration_par_edge(
 def formater_rapport_calibration_texte(
     df_cal: pd.DataFrame,
     min_paris: int = 5,
+    titre: str = "CALIBRATION",
 ) -> str:
     """Rapport texte pour CLI / logs."""
     n = len(df_cal)
     if n < min_paris:
         return f"Calibration : {n} pari(s) clôturé(s) — minimum {min_paris} requis."
     brier = calculer_brier_score(df_cal)
+    bss = None
+    baseline = float((df_cal["p_model"] * (1 - df_cal["p_model"])).mean())
+    if baseline > 0:
+        bss = 1.0 - (brier / baseline)
     lines = [
         f"{'-' * 50}",
-        f"  CALIBRATION NHL — {n} paris clôturés",
+        f"  {titre} — {n} paris clôturés",
         f"{'-' * 50}",
         f"  Brier score : {brier:.4f}  (0 = parfait, ~0.25 = coin flip 50/50)",
     ]
+    if bss is not None:
+        lines.append(f"  BSS (vs baseline p*(1-p)) : {bss:+.3f}")
     df_prob = calibration_par_probabilite(df_cal)
     if not df_prob.empty:
-        lines.append(f"\n  Par probabilité modèle (1 / Vraie_Cote_Bot) :")
+        lines.append(f"\n  Par probabilité modèle :")
         for _, r in df_prob.iterrows():
             lines.append(
                 f"    {r['Tranche']:<12} n={int(r['N']):>3}  "
