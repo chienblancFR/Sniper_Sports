@@ -45,9 +45,19 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 from config_env import env_files_hint, load_project_env
+from foot_params import (
+    N_PRIOR_DEFAULT,
+    RHO_DEFAULT,
+    get_dc_half_life_days,
+    get_n_prior,
+    get_rho_fallback,
+    get_xg_half_life_days,
+    save_tuned_params,
+    xg_decay_rate,
+)
+from odds_devig import cote_fair_2way
 
 load_project_env("foot")
-from odds_devig import cote_fair_2way
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 API_ODDS_KEY     = os.getenv("API_ODDS_KEY")
 
@@ -109,33 +119,26 @@ def verifier_fichier_db(path=DB_PATH):
 SAISONS_BACKTEST = [2023, 2024]  # 2023 = saison 2023-24 pour ligues hivernales
 
 CHAMPIONNATS = [
-    {"nom": "La Liga",          "id": 140, "key": "soccer_spain_la_liga",            "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
-    {"nom": "Bundesliga",       "id": 78,  "key": "soccer_germany_bundesliga",        "c1": 4,  "euro": 6,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  8},
-    {"nom": "Eredivisie",       "id": 88,  "key": "soccer_netherlands_eredivisie",    "c1": 2,  "euro": 5,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
-    {"nom": "Serie A",          "id": 135, "key": "soccer_italy_serie_a",             "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
-    {"nom": "Primeira Liga",    "id": 94,  "key": "soccer_portugal_primeira_liga",    "c1": 2,  "euro": 5,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
-    {"nom": "Süper Lig",        "id": 203, "key": "soccer_turkey_super_league",       "c1": 2,  "euro": 4,  "rel": 17, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
-    {"nom": "Allsvenskan",      "id": 113, "key": "soccer_sweden_allsvenskan",        "c1": 3,  "euro": 3,  "rel": 14, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 12},
-    {"nom": "Série A Brésil",   "id": 71,  "key": "soccer_brazil_campeonato",         "c1": 6,  "euro": 6,  "rel": 17, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  9},
-    {"nom": "Ligue 1",          "id": 61,  "key": "soccer_france_ligue_one",          "c1": 4,  "euro": 6,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  8},
-    {"nom": "LaLiga 2",         "id": 141, "key": "soccer_spain_segunda_division",    "c1": 2,  "euro": 6,  "rel": 19, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  8},
-    {"nom": "Premier League",   "id": 39,  "key": "soccer_epl",                       "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
-    {"nom": "Championship",     "id": 40,  "key": "soccer_efl_champ",                 "c1": 2,  "euro": 6,  "rel": 22, "ev_min": 0.05, "ev_max": 0.15, "n_prior":  7},
-    {"nom": "MLS",              "id": 253, "key": "soccer_usa_mls",                   "c1": 7,  "euro": 9,  "rel": 99, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 10},
-    {"nom": "Eliteserien",      "id": 103, "key": "soccer_norway_eliteserien",        "c1": 2,  "euro": 4,  "rel": 14, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 12},
-    {"nom": "Jupiler Pro",      "id": 144, "key": "soccer_belgium_first_div",         "c1": 6,  "euro": 12, "rel": 13, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 11},
-    {"nom": "Serie B",          "id": 136, "key": "soccer_italy_serie_b",             "c1": 2,  "euro": 8,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15, "n_prior": 10},
+    {"nom": "La Liga",          "id": 140, "key": "soccer_spain_la_liga",            "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Bundesliga",       "id": 78,  "key": "soccer_germany_bundesliga",        "c1": 4,  "euro": 6,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Eredivisie",       "id": 88,  "key": "soccer_netherlands_eredivisie",    "c1": 2,  "euro": 5,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Serie A",          "id": 135, "key": "soccer_italy_serie_a",             "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Primeira Liga",    "id": 94,  "key": "soccer_portugal_primeira_liga",    "c1": 2,  "euro": 5,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Süper Lig",        "id": 203, "key": "soccer_turkey_super_league",       "c1": 2,  "euro": 4,  "rel": 17, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Allsvenskan",      "id": 113, "key": "soccer_sweden_allsvenskan",        "c1": 3,  "euro": 3,  "rel": 14, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Série A Brésil",   "id": 71,  "key": "soccer_brazil_campeonato",         "c1": 6,  "euro": 6,  "rel": 17, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Ligue 1",          "id": 61,  "key": "soccer_france_ligue_one",          "c1": 4,  "euro": 6,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "LaLiga 2",         "id": 141, "key": "soccer_spain_segunda_division",    "c1": 2,  "euro": 6,  "rel": 19, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Premier League",   "id": 39,  "key": "soccer_epl",                       "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Championship",     "id": 40,  "key": "soccer_efl_champ",                 "c1": 2,  "euro": 6,  "rel": 22, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "MLS",              "id": 253, "key": "soccer_usa_mls",                   "c1": 7,  "euro": 9,  "rel": 99, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Eliteserien",      "id": 103, "key": "soccer_norway_eliteserien",        "c1": 2,  "euro": 4,  "rel": 14, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Jupiler Pro",      "id": 144, "key": "soccer_belgium_first_div",         "c1": 6,  "euro": 12, "rel": 13, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Serie B",          "id": 136, "key": "soccer_italy_serie_b",             "c1": 2,  "euro": 8,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15},
 ]
 
-RHO_PAR_LIGUE = {
-    78: -0.16, 88: -0.15, 39: -0.13, 40: -0.12, 61: -0.12,
-    141: -0.12, 136: -0.11, 140: -0.10, 94: -0.10, 135: -0.09,
-    203: -0.08, 71: -0.08, 113: -0.11, 103: -0.10, 144: -0.12, 253: -0.09,
-}
-RHO_DEFAULT  = -0.12
-KELLY_FRAC      = 0.05   # fraction Kelly (5% — aligné avec le bot)
-MIN_COTE        = 1.70   # ignorer les handicaps trop courts (< 1.70)
-N_PRIOR_DEFAULT = 8      # fallback shrinkage bayésien (valeur par ligue dans CHAMPIONNATS)
+KELLY_FRAC = 0.05
+MIN_COTE = 1.70
 # Cotes backtest collectées à H-24 (table bt_odds_h24)
 H_ODDS_BACKTEST = 24.0
 
@@ -922,11 +925,12 @@ async def calculer_mot_luck_bt(conn, ligue_cfg, saison, avant_date):
     return mot, luck
 
 
-async def estimer_parametres_dc_bt(conn, ligue_id, saison, avant_date, mu_h, mu_a):
+async def estimer_parametres_dc_bt(conn, ligue_id, saison, avant_date, mu_h, mu_a,
+                                   dc_half_life_days=None):
     """
     MLE joint Dixon-Coles (α, β, γ, ρ) par équipe — réplique estimer_parametres_dc_complet().
     Utilise UNIQUEMENT les matchs avec date_utc < avant_date (pas de lookahead).
-    Pondération temporelle (demi-vie 90j) relative à avant_date.
+    Pondération temporelle (demi-vie configurable) relative à avant_date.
     """
     async with conn.execute("""
         SELECT gh, ga, home_id, away_id, date_utc
@@ -969,7 +973,7 @@ async def estimer_parametres_dc_bt(conn, ligue_id, saison, avant_date, mu_h, mu_
     except Exception:
         ref_ts = datetime.now(timezone.utc)
 
-    HALF_LIFE_DAYS = 90.0
+    HALF_LIFE_DAYS = float(dc_half_life_days or get_dc_half_life_days(ligue_id))
     decay = np.log(2) / HALF_LIFE_DAYS
 
     def weight(match_date_str, base_w):
@@ -1076,7 +1080,7 @@ async def estimer_parametres_dc_bt(conn, ligue_id, saison, avant_date, mu_h, mu_
 
 
 def calculer_lambda_blend(dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e, m_dom_l, m_ext_l,
-                          ligue_id=None, mot_map=None, luck_map=None):
+                          ligue_id=None, mot_map=None, luck_map=None, rho_fallback=None):
     """
     Calcule L_A / L_B avec la même logique que analyser_un_match() du bot live :
       λ_xg : formule venue-normalisée (xg_off × xg_def_adverse / moyenne ligue)
@@ -1096,7 +1100,10 @@ def calculer_lambda_blend(dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e
 
     L_A_xg = (xg_off_d * m_d * xg_def_e) / m_dom_l
     L_B_xg = (xg_off_e * m_e * xg_def_d) / m_ext_l
-    rho = RHO_PAR_LIGUE.get(ligue_id, RHO_DEFAULT) if ligue_id else RHO_DEFAULT
+    if rho_fallback is not None:
+        rho = rho_fallback
+    else:
+        rho = get_rho_fallback(ligue_id) if ligue_id else RHO_DEFAULT
 
     if dc and h_id in dc['teams'] and a_id in dc['teams']:
         td = dc['teams'][h_id]
@@ -1112,18 +1119,20 @@ def calculer_lambda_blend(dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e
     return max(0.4, L_A), max(0.4, L_B), rho
 
 
-async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, venue='all', ligue_avg=1.3, n_prior=None):
+async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, venue='all',
+                                 ligue_avg=1.3, n_prior=None, xg_half_life_days=None):
     """
     Calcule le xG moyen de l'équipe en utilisant UNIQUEMENT les matchs
     joués AVANT avant_date. Réplique la logique du bot principal :
     - split home/away (venue='home'|'away'|'all')
-    - decay exponentiel (demi-vie 46j)
-    - shrinkage bayésien adaptatif (n_prior par ligue)
+    - decay exponentiel (demi-vie configurable, défaut foot_params)
+    - shrinkage bayésien adaptatif (n_prior)
     - fallback saison précédente si < 10 matchs
     Retourne (xg_off, xg_def, n_matchs).
     """
     if n_prior is None:
-        n_prior = N_PRIOR_DEFAULT
+        n_prior = get_n_prior(ligue_id)
+    decay = np.log(2) / max(float(xg_half_life_days or get_xg_half_life_days(ligue_id)), 1.0)
     if venue == 'home':
         venue_filter = "AND f.home_id = ?"
         params = (team_id, ligue_id, saison, saison - 1, avant_date, team_id)
@@ -1150,7 +1159,10 @@ async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, ve
 
     # Fallback sur toutes les venues si < 5 matchs dans le venue demandé
     if len(rows) < 5 and venue != 'all':
-        return await reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, venue='all', ligue_avg=ligue_avg, n_prior=n_prior)
+        return await reconstruire_xg_equipe(
+            conn, team_id, ligue_id, avant_date, saison, venue='all',
+            ligue_avg=ligue_avg, n_prior=n_prior, xg_half_life_days=xg_half_life_days,
+        )
 
     if len(rows) < 5:
         return 1.3, 1.1, len(rows)  # Promu / données insuffisantes
@@ -1163,7 +1175,7 @@ async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, ve
             jours = max(0, (now - dt).days)
         except Exception:
             jours = 30
-        w = np.exp(-0.015 * jours)
+        w = np.exp(-decay * jours)
         if saison_m < saison:
             w *= 0.80
         tp += xg_p * w
@@ -1178,6 +1190,188 @@ async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, ve
     xg_off = w_eq * xg_off_brut + (1 - w_eq) * ligue_avg
     xg_def = w_eq * xg_def_brut + (1 - w_eq) * ligue_avg
     return xg_off, xg_def, n
+
+
+# ─────────────────────────────────────────────────────────────
+# 🔧  CALIBRATION WALK-FORWARD (n_prior / rho / demi-vies)
+# ─────────────────────────────────────────────────────────────
+TUNE_GRID_N_PRIOR = [6, 8, 11]
+TUNE_GRID_RHO = [-0.14, -0.11, -0.08]
+TUNE_GRID_XG_HL = [35, 46, 58]
+TUNE_GRID_DC_HL = [75, 90, 120]
+TUNE_MIN_MATCHS = 80
+
+
+async def _lambdas_pour_match(conn, ligue, saison, date_utc, h_id, a_id,
+                              n_prior, xg_half_life, dc_half_life, rho_fallback, caches):
+    """λ_home / λ_away / rho — données strictement avant date_utc."""
+    ligue_id = ligue['id']
+    jour = _jour_cache(date_utc)
+
+    avg_key = (ligue_id, saison, jour, n_prior, xg_half_life)
+    if avg_key not in caches['avg']:
+        caches['avg'][avg_key] = await calculer_ligue_avg(conn, ligue_id, saison, date_utc)
+    avg_ligue = caches['avg'][avg_key]
+
+    async def xg(team, venue):
+        k = (team, ligue_id, date_utc, saison, venue, n_prior, xg_half_life)
+        if k not in caches['xg']:
+            caches['xg'][k] = await reconstruire_xg_equipe(
+                conn, team, ligue_id, date_utc, saison, venue=venue,
+                ligue_avg=avg_ligue, n_prior=n_prior, xg_half_life_days=xg_half_life,
+            )
+        return caches['xg'][k]
+
+    xg_off_d_sp, xg_def_d_sp, n_d = await xg(h_id, 'home')
+    xg_off_e_sp, xg_def_e_sp, n_e = await xg(a_id, 'away')
+    xg_off_d_gl, xg_def_d_gl, _ = await xg(h_id, 'all')
+    xg_off_e_gl, xg_def_e_gl, _ = await xg(a_id, 'all')
+
+    def w_venue(n_spec, max_w=0.80):
+        return min(max_w, (n_spec / 10.0) * max_w)
+
+    wd, we = w_venue(n_d), w_venue(n_e)
+    xg_off_d = xg_off_d_sp * wd + xg_off_d_gl * (1 - wd)
+    xg_def_d = xg_def_d_sp * wd + xg_def_d_gl * (1 - wd)
+    xg_off_e = xg_off_e_sp * we + xg_off_e_gl * (1 - we)
+    xg_def_e = xg_def_e_sp * we + xg_def_e_gl * (1 - we)
+
+    venue_key = (ligue_id, saison, jour)
+    if venue_key not in caches['venue']:
+        caches['venue'][venue_key] = await calculer_moyennes_venue(conn, ligue_id, saison, date_utc)
+    m_dom_l, m_ext_l = caches['venue'][venue_key]
+
+    mot_luck_key = (ligue_id, saison, jour)
+    if mot_luck_key not in caches['mot_luck']:
+        caches['mot_luck'][mot_luck_key] = await calculer_mot_luck_bt(conn, ligue, saison, date_utc)
+    mot_map, luck_map = caches['mot_luck'][mot_luck_key]
+
+    dc_key = (ligue_id, saison, _semaine_dc(date_utc), dc_half_life)
+    if dc_key not in caches['dc']:
+        caches['dc'][dc_key] = await estimer_parametres_dc_bt(
+            conn, ligue_id, saison, date_utc, m_dom_l, m_ext_l,
+            dc_half_life_days=dc_half_life,
+        )
+    dc = caches['dc'][dc_key]
+
+    return calculer_lambda_blend(
+        dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e, m_dom_l, m_ext_l, ligue_id,
+        mot_map=mot_map, luck_map=luck_map, rho_fallback=rho_fallback,
+    )
+
+
+async def _log_prob_score(conn, ligue, match_row, params, caches):
+    _, saison, date_utc, h_id, a_id, _, _, gh, ga = match_row
+    if gh is None or ga is None:
+        return None
+    L_A, L_B, rho = await _lambdas_pour_match(
+        conn, ligue, saison, date_utc, h_id, a_id,
+        params['n_prior'], params['xg_half_life_days'], params['dc_half_life_days'],
+        params['rho'], caches,
+    )
+    mat = generer_matrice(L_A, L_B, rho)
+    gi = min(int(gh), mat.shape[0] - 1)
+    ga_i = min(int(ga), mat.shape[1] - 1)
+    return float(np.log(max(float(mat[gi, ga_i]), 1e-12)))
+
+
+async def _eval_params_walkforward(conn, ligue, fixtures, params, start_idx=0):
+    caches = {'avg': {}, 'xg': {}, 'venue': {}, 'mot_luck': {}, 'dc': {}}
+    total, n = 0.0, 0
+    for row in fixtures[start_idx:]:
+        ll = await _log_prob_score(conn, ligue, row, params, caches)
+        if ll is not None:
+            total += ll
+            n += 1
+    return total / n if n else float('-inf')
+
+
+async def tune_ligue_walkforward(conn, ligue, fixtures):
+    if len(fixtures) < TUNE_MIN_MATCHS:
+        print(f"  ⚠️ {ligue['nom']} : {len(fixtures)} matchs (< {TUNE_MIN_MATCHS}) — ignorée", flush=True)
+        return None
+
+    n_eval = len(TUNE_GRID_N_PRIOR) * len(TUNE_GRID_XG_HL) + len(TUNE_GRID_RHO) * len(TUNE_GRID_DC_HL)
+    start = max(TUNE_MIN_MATCHS // 2, len(fixtures) // 4)
+    n_scored = len(fixtures) - start
+    print(
+        f"  ▶ {ligue['nom']} : {len(fixtures)} matchs, {n_scored} scorés (burn-in {start}), "
+        f"{n_eval} combinaisons…",
+        flush=True,
+    )
+
+    best = {
+        'n_prior': get_n_prior(ligue['id']),
+        'rho': get_rho_fallback(ligue['id']),
+        'xg_half_life_days': get_xg_half_life_days(ligue['id']),
+        'dc_half_life_days': get_dc_half_life_days(ligue['id']),
+    }
+    best_ll = float('-inf')
+    step = 0
+
+    for np_ in TUNE_GRID_N_PRIOR:
+        for xg_hl in TUNE_GRID_XG_HL:
+            step += 1
+            p = {**best, 'n_prior': np_, 'xg_half_life_days': xg_hl}
+            ll = await _eval_params_walkforward(conn, ligue, fixtures, p, start)
+            print(
+                f"     [{step}/{n_eval}] n_prior={np_} xg_hl={xg_hl}j → log P={ll:.4f}",
+                flush=True,
+            )
+            if ll > best_ll:
+                best_ll, best = ll, p
+
+    for rho in TUNE_GRID_RHO:
+        for dc_hl in TUNE_GRID_DC_HL:
+            step += 1
+            p = {**best, 'rho': rho, 'dc_half_life_days': dc_hl}
+            ll = await _eval_params_walkforward(conn, ligue, fixtures, p, start)
+            print(
+                f"     [{step}/{n_eval}] rho={rho:.2f} dc_hl={dc_hl}j → log P={ll:.4f}",
+                flush=True,
+            )
+            if ll > best_ll:
+                best_ll, best = ll, p
+
+    best['mean_log_score'] = round(best_ll, 5)
+    print(
+        f"  ✅ {ligue['nom']} : n_prior={best['n_prior']} rho={best['rho']:.2f} "
+        f"xg_hl={best['xg_half_life_days']:.0f}j dc_hl={best['dc_half_life_days']:.0f}j "
+        f"(log P score={best_ll:.4f})",
+        flush=True,
+    )
+    return best
+
+
+async def tune_hyperparams_walkforward(conn, ligues=None):
+    print("\n" + "=" * 60)
+    print("🔧  CALIBRATION WALK-FORWARD (n_prior / rho / demi-vies)")
+    print("=" * 60)
+    print("  Métrique : log P(score réel | modèle) — pas de lookahead, pas de ROI", flush=True)
+    print(f"  Grilles : n_prior{TUNE_GRID_N_PRIOR}, rho{TUNE_GRID_RHO}, "
+          f"xg_hl{TUNE_GRID_XG_HL}, dc_hl{TUNE_GRID_DC_HL}", flush=True)
+    print("  (1ère combinaison lente : DC MLE + xG par match — ~5–15 min/ligue)", flush=True)
+
+    ligues = ligues or CHAMPIONNATS
+    results = {}
+    for ligue in ligues:
+        async with conn.execute(
+            "SELECT id, saison, date_utc, home_id, away_id, home_name, away_name, gh, ga "
+            "FROM bt_fixtures WHERE ligue_id=? AND gh IS NOT NULL ORDER BY date_utc",
+            (ligue['id'],),
+        ) as cur:
+            fixtures = await cur.fetchall()
+        tuned = await tune_ligue_walkforward(conn, ligue, fixtures)
+        if tuned:
+            results[ligue['id']] = tuned
+
+    if not results:
+        print("\n❌ Aucune ligue calibrée (données insuffisantes).")
+        return
+
+    path = save_tuned_params(results)
+    print(f"\n✅ Paramètres enregistrés → {path}")
+    print("   Bot live + backtest : rechargement auto via foot_params.py")
 
 
 async def simuler_paris(conn, ligues=None):
@@ -1258,14 +1452,18 @@ async def simuler_paris(conn, ligues=None):
                     conn, ligue['id'], saison, date_utc
                 )
             avg_ligue = avg_cache[avg_key]
-            n_prior_l = ligue.get('n_prior', N_PRIOR_DEFAULT)
+            n_prior_l = get_n_prior(ligue['id'])
+            xg_hl = get_xg_half_life_days(ligue['id'])
+            dc_hl = get_dc_half_life_days(ligue['id'])
 
             # Reconstituer xG AVANT ce match — split home/away + global comme le bot principal
             xg_off_d_sp, xg_def_d_sp, n_d = await reconstruire_xg_equipe(
-                conn, h_id, ligue['id'], date_utc, saison, venue='home', ligue_avg=avg_ligue, n_prior=n_prior_l
+                conn, h_id, ligue['id'], date_utc, saison, venue='home',
+                ligue_avg=avg_ligue, n_prior=n_prior_l, xg_half_life_days=xg_hl,
             )
             xg_off_e_sp, xg_def_e_sp, n_e = await reconstruire_xg_equipe(
-                conn, a_id, ligue['id'], date_utc, saison, venue='away', ligue_avg=avg_ligue, n_prior=n_prior_l
+                conn, a_id, ligue['id'], date_utc, saison, venue='away',
+                ligue_avg=avg_ligue, n_prior=n_prior_l, xg_half_life_days=xg_hl,
             )
 
             # Filtre : ignorer si l'une des équipes manque d'historique suffisant
@@ -1275,10 +1473,12 @@ async def simuler_paris(conn, ligues=None):
             # Venue blending adaptatif : réplique w_venue() du bot
             # Moins de matchs venue-spécifiques → on se fie davantage aux stats globales
             xg_off_d_gl, xg_def_d_gl, _ = await reconstruire_xg_equipe(
-                conn, h_id, ligue['id'], date_utc, saison, venue='all', ligue_avg=avg_ligue, n_prior=n_prior_l
+                conn, h_id, ligue['id'], date_utc, saison, venue='all',
+                ligue_avg=avg_ligue, n_prior=n_prior_l, xg_half_life_days=xg_hl,
             )
             xg_off_e_gl, xg_def_e_gl, _ = await reconstruire_xg_equipe(
-                conn, a_id, ligue['id'], date_utc, saison, venue='all', ligue_avg=avg_ligue, n_prior=n_prior_l
+                conn, a_id, ligue['id'], date_utc, saison, venue='all',
+                ligue_avg=avg_ligue, n_prior=n_prior_l, xg_half_life_days=xg_hl,
             )
 
             def w_venue(n_spec, max_w=0.80):
@@ -1306,10 +1506,11 @@ async def simuler_paris(conn, ligues=None):
                 )
             mot_map, luck_map = mot_luck_cache[mot_luck_key]
 
-            dc_key = (ligue['id'], saison, _semaine_dc(date_utc))
+            dc_key = (ligue['id'], saison, _semaine_dc(date_utc), dc_hl)
             if dc_key not in dc_cache:
                 dc_cache[dc_key] = await estimer_parametres_dc_bt(
-                    conn, ligue['id'], saison, date_utc, m_dom_l, m_ext_l
+                    conn, ligue['id'], saison, date_utc, m_dom_l, m_ext_l,
+                    dc_half_life_days=dc_hl,
                 )
             dc = dc_cache[dc_key]
 
@@ -1636,6 +1837,8 @@ async def main():
                         help='Vide bt_signaux + supprime backtest_results.csv (garde la DB)')
     parser.add_argument('--reset-full', action='store_true',
                         help='Supprime backtest_data.db + CSV (recollecte API requise)')
+    parser.add_argument('--tune',       action='store_true',
+                        help='Calibration walk-forward n_prior / rho / demi-vies → foot_params_tuned.json')
     parser.add_argument('--ligue',      type=str, default=None,
                         help='Filtrer une ligue (nom partiel, ex: Championship, "Ligue 1")')
     parser.add_argument('--odds-only',  action='store_true',
@@ -1653,13 +1856,13 @@ async def main():
     elif args.reset:
         await reset_backtest(full=False)
 
-    run_phases = args.collect or args.simulate or args.report
+    run_phases = args.collect or args.simulate or args.report or args.tune
     all_phases = not run_phases and not args.reset and not args.reset_full
 
     if not run_phases and not all_phases:
         return
 
-    needs_db = args.simulate or args.report or all_phases
+    needs_db = args.simulate or args.report or args.tune or all_phases
     if needs_db and os.path.exists(DB_PATH) and not verifier_fichier_db():
         return
 
@@ -1675,6 +1878,8 @@ async def main():
                     ligues=ligues_filtrees,
                     odds_only=args.odds_only,
                 )
+            if args.tune:
+                await tune_hyperparams_walkforward(conn, ligues=ligues_filtrees)
             if args.simulate or all_phases:
                 async with aiosqlite.connect(
                     f"file:{DB_PATH}?mode=ro", uri=True, timeout=120.0

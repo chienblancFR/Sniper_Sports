@@ -8,6 +8,7 @@ from config_env import load_project_env
 
 load_project_env("foot")
 from odds_devig import cote_fair_2way
+from foot_params import RHO_DEFAULT, get_dc_half_life_days, get_n_prior, get_rho_fallback, xg_decay_rate
 import asyncio
 import aiohttp
 import aiosqlite
@@ -111,29 +112,7 @@ FOOT_KELLY_BRIER_MIN_PARIS = int(os.environ.get("FOOT_KELLY_BRIER_MIN_PARIS", "2
 FOOT_KELLY_BSS_SENSIBILITE = float(os.environ.get("FOOT_KELLY_BSS_SENSIBILITE", "0.30"))
 FOOT_KELLY_BSS_MULT_MIN = float(os.environ.get("FOOT_KELLY_BSS_MULT_MIN", "0.4"))
 
-# Shrinkage bayésien adaptatif : plus la ligue est petite / données xG peu fiables,
-# plus on maintient longtemps les estimations proches de la moyenne de ligue.
-# Grandes ligues 20 clubs / 38J → prior faible (on fait confiance aux données équipe plus vite)
-# Petites ligues 16 clubs / 30J → prior élevé (on reste prudent plus longtemps)
-N_PRIOR_PAR_LIGUE = {
-    140: 7,   # La Liga         (20 clubs, 38J)
-    39:  7,   # Premier League  (20 clubs, 38J)
-    135: 7,   # Serie A         (20 clubs, 38J)
-    40:  7,   # Championship    (24 clubs, 46J — beaucoup de matchs)
-    78:  8,   # Bundesliga      (18 clubs, 34J)
-    61:  8,   # Ligue 1         (18 clubs, 34J)
-    141: 8,   # LaLiga 2        (22 clubs, 42J)
-    88:  9,   # Eredivisie      (18 clubs, 34J — moins de couverture médiatique)
-    94:  9,   # Primeira Liga   (18 clubs, 34J)
-    203: 9,   # Süper Lig       (19 clubs, 36J)
-    71:  9,   # Série A Brésil  (20 clubs, 38J — xG parfois incomplets)
-    136: 10,  # Serie B         (20 clubs, 38J — xG souvent absents → fallback buts)
-    253: 10,  # MLS             (29 clubs, calendrier irrégulier, hétérogénéité élevée)
-    144: 11,  # Jupiler Pro     (16 clubs + championship round)
-    113: 12,  # Allsvenskan     (16 clubs, 30J — petite ligue nordique)
-    103: 12,  # Eliteserien     (16 clubs, 30J — petite ligue nordique)
-}
-N_PRIOR_DEFAULT = 8
+# n_prior / ρ fallback / demi-vies : foot_params.py (+ foot_params_tuned.json via backtest --tune)
 
 # Ligues confirmées sans xG via auto-détection (voir detecter_ligues_sans_xg).
 # Ce set est peuplé dynamiquement au démarrage — les valeurs ci-dessous sont
@@ -237,31 +216,7 @@ async def detecter_ligues_sans_xg(session):
     LIGUES_SANS_XG = nouvelles_sans_xg
     log_info(f"🔬 Couverture xG détectée. Ligues sans xG : {LIGUES_SANS_XG}")
 
-# ρ de Dixon-Coles calibré par ligue (issu de la littérature académique).
-# Les ligues à fort volume de buts (Bundesliga, Eredivisie) ont un ρ plus négatif
-# car la correction 0-0/1-1 est plus marquée relativement.
-RHO_PAR_LIGUE = {
-    78:  -0.16,  # Bundesliga (scores élevés)
-    88:  -0.15,  # Eredivisie
-    39:  -0.13,  # Premier League
-    40:  -0.12,  # Championship
-    61:  -0.12,  # Ligue 1
-    141: -0.12,  # LaLiga 2
-    136: -0.11,  # Serie B
-    140: -0.10,  # La Liga
-    94:  -0.10,  # Primeira Liga
-    135: -0.09,  # Serie A (faible scoring)
-    203: -0.08,  # Süper Lig
-    71:  -0.08,  # Brésil Série A
-    113: -0.11,  # Allsvenskan
-    103: -0.10,  # Eliteserien
-    144: -0.12,  # Jupiler Pro League
-    253: -0.09,  # MLS
-}
-RHO_DEFAULT = -0.12  # Fallback pour toute ligue non listée
-
-# Dict mis à jour dynamiquement chaque saison par estimer_rho_saison()
-# Prioritaire sur RHO_PAR_LIGUE quand on dispose d'assez de données.
+# ρ dynamique (MLE saison) prioritaire sur get_rho_fallback() — voir generer_matrice_dixon().
 RHO_DYNAMIQUE: dict[tuple, float] = {}  # clé = (ligue_id, saison)
 
 # Paramètres Dixon-Coles complets par équipe — estimés conjointement par MLE
@@ -392,9 +347,9 @@ async def estimer_parametres_dc_complet(ligue_id: int, saison: int,
     N = len(teams)
     idx = {t: i for i, t in enumerate(teams)}
 
-    # Pondération temporelle : demi-vie 90 jours
+    # Pondération temporelle (demi-vie configurable via foot_params)
     now_ts = datetime.now(timezone.utc)
-    HALF_LIFE_DAYS = 90.0
+    HALF_LIFE_DAYS = get_dc_half_life_days(ligue_id)
     decay = np.log(2) / HALF_LIFE_DAYS
 
     def weight(match_date_str: str | None, base_w: float) -> float:
@@ -2054,14 +2009,13 @@ async def obtenir_xg_moyenne_async(session, team_id, l_id, saison_actuelle, sos_
                 )
                 await db_conn.commit()
 
-        # Décroissance temporelle réelle (demi-vie ≈ 46 jours)
-        # Un match joué il y a 1 semaine pèse ~0.90, il y a 3 mois ~0.15
+        # Décroissance temporelle (demi-vie xG via foot_params, défaut 46 j)
         try:
             match_date = datetime.fromisoformat(m['fixture']['date'].replace('Z', '+00:00'))
             days_ago = max(0, (maintenant_utc - match_date).days)
         except Exception:
             days_ago = (len(matchs_a_analyser) - 1 - i) * 7  # fallback : 1 match/semaine
-        weight = np.exp(-0.015 * days_ago)
+        weight = np.exp(-xg_decay_rate(l_id) * days_ago)
 
         if m['league']['season'] < saison_actuelle:
             weight *= ALPHA_DEGRADATION
@@ -2084,7 +2038,7 @@ async def obtenir_xg_moyenne_async(session, team_id, l_id, saison_actuelle, sos_
     # Régresse les estimations vers la moyenne de ligue pour éviter la sur-réaction
     # aux petits échantillons (ex: 5-8 matchs en début de saison).
     # N_PRIOR varie selon la ligue : plus elle est petite / données peu fiables → prior élevé.
-    n_prior = N_PRIOR_PAR_LIGUE.get(l_id, N_PRIOR_DEFAULT)
+    n_prior = get_n_prior(l_id)
     n = len(matchs_a_analyser)
     w_equipe = n / (n + n_prior)
     w_ligue  = 1.0 - w_equipe
@@ -2198,7 +2152,7 @@ def generer_matrice_dixon(l_dom, l_ext, ligue_id=None, saison=None):
     la troncature sur les ligues à fort volume de buts (Bundesliga, Eredivisie, λ ≥ 3.5).
     """
     rho = (RHO_DYNAMIQUE.get((ligue_id, saison))
-           or RHO_PAR_LIGUE.get(ligue_id, RHO_DEFAULT) if ligue_id
+           or get_rho_fallback(ligue_id) if ligue_id
            else RHO_DEFAULT)
     max_goals = max(10, min(int(np.ceil(poisson.ppf(0.998, max(l_dom, l_ext)))) + 1, 15))
     p_d = [poisson.pmf(i, l_dom) for i in range(max_goals)]
