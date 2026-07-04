@@ -98,15 +98,27 @@ def save_tuned_params(
     results: dict,
     source: str = "backtest_walkforward",
     metric: str = "mean_log_score_prob",
+    merge_existing: bool = True,
 ) -> Path:
-    """Écrit foot_params_tuned.json (clés ligue_id en string)."""
+    """Écrit foot_params_tuned.json (clés ligue_id en string).
+
+    merge_existing=True : conserve les ligues déjà calibrées (tuning ligue par ligue).
+    """
+    existing = _load_tuned() if merge_existing else {}
+    merged = {
+        k: v for k, v in existing.items()
+        if k != "_meta" and not str(k).startswith("_")
+    }
+    merged.update({str(k): v for k, v in results.items() if not str(k).startswith("_")})
+
     payload = {
         "_meta": {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "source": source,
             "metric": metric,
+            "ligues_tuned": len(merged),
         },
-        **{str(k): v for k, v in results.items() if not str(k).startswith("_")},
+        **merged,
     }
     with open(_PARAMS_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
