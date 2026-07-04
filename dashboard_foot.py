@@ -39,6 +39,8 @@ st.title("⚽ Centre de Commandement : Sniper Football")
 URL_FOOT      = "https://chienblanc.pythonanywhere.com/data/historique_sniper.csv"
 URL_BACKTEST  = "https://chienblanc.pythonanywhere.com/data/backtest_results.csv"
 CAPITAL_INITIAL = 100.0
+PA_DATA_DIR = "/home/chienblanc/data"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 LIGUE_NOMS = {
     140: "La Liga",        78: "Bundesliga",     88: "Eredivisie",
@@ -50,28 +52,72 @@ LIGUE_NOMS = {
 }
 
 
-def _charger_csv(url: str, fichier_local: str):
-    """Local (si présent) → URL PA (HTTP 200) → SQLite sniper_data.db."""
-    erreurs = []
-    local_path = os.path.join(os.getcwd(), fichier_local)
+def _candidats_fichiers(nom: str) -> list[str]:
+    """Chemins possibles CSV / DB (PA data dir en priorité)."""
+    paths = []
+    env_key = "FOOT_HISTORIQUE_CSV" if nom.endswith(".csv") else "FOOT_SNIPER_DB"
+    if os.environ.get(env_key):
+        paths.append(os.environ[env_key])
+    if os.path.isdir(PA_DATA_DIR):
+        paths.append(os.path.join(PA_DATA_DIR, nom))
+    paths.extend([
+        os.path.join(_SCRIPT_DIR, nom),
+        os.path.join(os.getcwd(), nom),
+        os.path.join(os.path.expanduser("~"), nom),
+        os.path.join(os.path.expanduser("~"), "sniper_bot_foot", nom),
+    ])
+    seen, out = set(), []
+    for p in paths:
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
 
-    if os.path.exists(local_path):
+
+def _score_csv(df: pd.DataFrame, mtime: float) -> tuple:
+    n_pending = 0
+    if "Statut" in df.columns:
+        n_pending = int(
+            (df["Statut"].astype(str).str.strip().str.upper() == "PENDING").sum()
+        )
+    return (n_pending, mtime)
+
+
+def _charger_csv(url: str, fichier_local: str):
+    """Fichier local le plus récent / avec le plus de PENDING → URL PA → absent."""
+    erreurs = []
+    best_df, best_src, best_score = None, None, (-1, -1.0)
+
+    for path in _candidats_fichiers(fichier_local):
+        if not os.path.isfile(path):
+            continue
         try:
-            df = pd.read_csv(local_path)
-            if not df.empty:
-                mtime = datetime.fromtimestamp(os.path.getmtime(local_path))
-                return df, "ok", f"local · {fichier_local} ({mtime:%d/%m %H:%M})"
-            return df, "empty", f"local · {fichier_local} (vide)"
+            df = pd.read_csv(path)
+            if df.empty:
+                erreurs.append(f"{path}: vide")
+                continue
+            score = _score_csv(df, os.path.getmtime(path))
+            if score > best_score:
+                best_score, best_df = score, df
+                mtime = datetime.fromtimestamp(score[1])
+                best_src = (
+                    f"fichier · {path} ({mtime:%d/%m %H:%M}, "
+                    f"{score[0]} PENDING / {len(df)} lignes)"
+                )
         except Exception as e:
-            erreurs.append(f"local: {e}")
+            erreurs.append(f"{path}: {e}")
+
+    if best_df is not None:
+        return best_df, "ok", best_src
 
     try:
         r = requests.get(url, timeout=20)
         if r.status_code == 200:
             df = pd.read_csv(StringIO(r.text))
             if not df.empty:
-                return df, "ok", f"PA · {fichier_local}"
-            return df, "empty", f"PA · {fichier_local} (vide)"
+                n_p = _score_csv(df, 0)[0]
+                return df, "ok", f"URL PA · {fichier_local} ({n_p} PENDING / {len(df)} lignes)"
+            return df, "empty", f"URL PA · {fichier_local} (vide)"
         erreurs.append(f"URL HTTP {r.status_code}")
     except Exception as e:
         erreurs.append(f"URL: {e}")
@@ -79,10 +125,8 @@ def _charger_csv(url: str, fichier_local: str):
     return pd.DataFrame(), "missing", " | ".join(erreurs) if erreurs else "introuvable"
 
 
-def _charger_foot_depuis_db(db_path: str = "sniper_data.db"):
-    """Fallback : lit paris_log directement (même requête que l'export bot)."""
-    if not os.path.isfile(db_path):
-        return pd.DataFrame(), "missing", db_path
+def _charger_foot_depuis_db(db_path: str | None = None):
+    """Fallback SQLite — essaie plusieurs emplacements sniper_data.db."""
     sql = """
         SELECT
             id_match AS ID_Match, equipe AS Equipe, handicap AS Handicap,
@@ -94,21 +138,42 @@ def _charger_foot_depuis_db(db_path: str = "sniper_data.db"):
             timestamp AS Date
         FROM paris_log ORDER BY timestamp DESC
     """
-    try:
-        conn = sqlite3.connect(db_path)
-        df = pd.read_sql_query(sql, conn)
-        conn.close()
-        if df.empty:
-            return df, "empty", f"SQLite · {db_path} (vide)"
-        return df, "ok", f"SQLite · {db_path}"
-    except Exception as e:
-        return pd.DataFrame(), "error", f"SQLite · {db_path} ({e})"
+    sql_legacy = """
+        SELECT
+            id_match AS ID_Match, equipe AS Equipe, handicap AS Handicap,
+            cote_prise AS Cote_Prise, mise AS Mise, cote_cloture AS Cote_Cloture,
+            edge_detecte AS Edge, p_modele AS Prob_Modele, clv AS CLV,
+            statut AS Statut, resultat AS Profit_Unites, ligue AS Ligue,
+            is_lineup_official AS Compo_Officielle, timestamp AS Date
+        FROM paris_log ORDER BY timestamp DESC
+    """
+    candidates = [db_path] if db_path else _candidats_fichiers("sniper_data.db")
+    last_err = ""
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            conn = sqlite3.connect(path)
+            try:
+                df = pd.read_sql_query(sql, conn)
+            except Exception:
+                df = pd.read_sql_query(sql_legacy, conn)
+            conn.close()
+            if df.empty:
+                return df, "empty", f"SQLite · {path} (vide)"
+            n_p = int((df["Statut"].astype(str).str.strip().str.upper() == "PENDING").sum())
+            return df, "ok", f"SQLite · {path} ({n_p} PENDING / {len(df)} lignes)"
+        except Exception as e:
+            last_err = f"{path}: {e}"
+    return pd.DataFrame(), "missing", last_err or "sniper_data.db introuvable"
 
 
 def _enrichir_df_live(df: pd.DataFrame) -> pd.DataFrame:
     colonnes_numeriques = ["Cote_Prise", "Mise", "Cote_Cloture", "Edge", "Prob_Modele", "CLV", "Profit_Unites"]
     df = nettoyer_colonnes_numeriques(df, colonnes_numeriques)
     df = convertir_dates(df)
+    if "Statut" in df.columns:
+        df["Statut"] = df["Statut"].astype(str).str.strip().str.upper()
     df['Type_Marche'] = df['Ligue'].apply(
         lambda x: "Totals (Buts)" if "[totals]" in str(x).lower() else "Handicap Asiatique"
     )
@@ -138,16 +203,29 @@ def _enrichir_df_live(df: pd.DataFrame) -> pd.DataFrame:
 # ==========================================
 @st.cache_data(ttl=60)
 def load_football_data():
-    df, statut, source = _charger_csv(URL_FOOT, "historique_sniper.csv")
-    if statut != "ok":
-        df_db, statut_db, source_db = _charger_foot_depuis_db()
-        if statut_db == "ok":
-            df, statut, source = df_db, statut_db, source_db
-        elif statut != "ok":
-            source = f"{source} · fallback DB: {source_db}"
-    if statut != "ok":
-        return df, statut, source
-    return _enrichir_df_live(df), "ok", source
+    df_csv, stat_csv, src_csv = _charger_csv(URL_FOOT, "historique_sniper.csv")
+    df_db, stat_db, src_db = _charger_foot_depuis_db()
+
+    def _n_pending(d: pd.DataFrame) -> int:
+        if d is None or d.empty or "Statut" not in d.columns:
+            return 0
+        return int((d["Statut"].astype(str).str.strip().str.upper() == "PENDING").sum())
+
+    candidates = []
+    if stat_csv == "ok" and not df_csv.empty:
+        candidates.append((df_csv, src_csv, _n_pending(df_csv), len(df_csv)))
+    if stat_db == "ok" and not df_db.empty:
+        candidates.append((df_db, src_db, _n_pending(df_db), len(df_db)))
+
+    if not candidates:
+        src = src_csv if stat_csv != "ok" else src_db
+        if stat_csv != "ok" and stat_db != "ok":
+            src = f"{src_csv} · DB: {src_db}"
+        return pd.DataFrame(), "missing", src
+
+    # Priorité : plus de PENDING, puis plus de lignes
+    df, src, _, _ = max(candidates, key=lambda x: (x[2], x[3]))
+    return _enrichir_df_live(df), "ok", src
 
 @st.cache_data(ttl=300)
 def load_backtest_data():
@@ -209,6 +287,17 @@ if section == "📡 Live Performance":
         statut_chargement, df,
         msg_succes="⚽ Le radar Football V25 est armé. En attente des premières transactions..."
     )
+    if df.empty:
+        st.warning("Journal chargé mais **0 ligne** — lancez `python export_foot_csv.py` sur PA.")
+        st.stop()
+
+    n_pending_raw = int((df["Statut"] == "PENDING").sum()) if "Statut" in df.columns else 0
+    with st.sidebar.expander("🔍 Diagnostic données", expanded=(n_pending_raw == 0)):
+        st.write(f"**Source :** {src_live}")
+        st.write(f"**Lignes totales :** {len(df)}")
+        st.write(f"**PENDING (brut) :** {n_pending_raw}")
+        if "Statut" in df.columns:
+            st.write("**Statuts :**", df["Statut"].value_counts().to_dict())
 
     st.sidebar.markdown("---")
     st.sidebar.header("🎯 Filtres Live")
@@ -221,8 +310,11 @@ if section == "📡 Live Performance":
         st.stop()
     if df_live.empty:
         if df.empty:
-            st.stop()  # message déjà affiché par afficher_alertes_chargement
-        st.info("Aucune transaction ne correspond aux filtres sélectionnés.")
+            st.stop()
+        st.info(
+            "Aucune transaction ne correspond aux filtres sidebar "
+            "(période / ligue / marché). Remettez **Tout** / **Toutes les Ligues**."
+        )
         st.stop()
 
     df_termines = df_live[df_live['Statut'].isin(['WON', 'HALF-WON', 'VOID', 'HALF-LOST', 'LOST'])].copy()
