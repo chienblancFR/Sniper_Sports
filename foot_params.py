@@ -94,13 +94,17 @@ def xg_decay_rate(ligue_id: int) -> float:
     return math.log(2) / max(get_xg_half_life_days(ligue_id), 1.0)
 
 
-def save_tuned_params(results: dict, source: str = "backtest_walkforward") -> Path:
+def save_tuned_params(
+    results: dict,
+    source: str = "backtest_walkforward",
+    metric: str = "mean_log_score_prob",
+) -> Path:
     """Écrit foot_params_tuned.json (clés ligue_id en string)."""
     payload = {
         "_meta": {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "source": source,
-            "metric": "mean_log_score_prob",
+            "metric": metric,
         },
         **{str(k): v for k, v in results.items() if not str(k).startswith("_")},
     }

@@ -24,6 +24,12 @@ Reset (avant de relancer le backtest / dashboard) :
   python backtest_football.py --collect --ligue Championship --odds-only
       → Recollecte cotes historiques pour une seule ligue (fixtures/xG déjà en base)
 
+  python backtest_football.py --tune --tune-metric clv
+      → Calibration walk-forward orientee CLV AH (H-24 vs cloture Pinnacle)
+
+  python backtest_football.py --tune --tune-metric blend --tune-clv-weight 0.6
+      → Mix 60% CLV + 40% log P(score)
+
 Dashboard Streamlit : après --report, menu ⋮ → Clear cache → Rerun
 Si le CSV distant PythonAnywhere est utilisé, uploader le nouveau backtest_results.csv.
 
@@ -1310,6 +1316,8 @@ TUNE_GRID_RHO = [-0.14, -0.11, -0.08]
 TUNE_GRID_XG_HL = [35, 46, 58]
 TUNE_GRID_DC_HL = [75, 90, 120]
 TUNE_MIN_MATCHS = 80
+TUNE_MIN_CLV_SIGNALS = 30
+TUNE_METRICS = ('loglik', 'clv', 'blend')
 
 
 async def _lambdas_pour_match(conn, ligue, saison, date_utc, h_id, a_id,
@@ -1360,43 +1368,207 @@ async def _lambdas_pour_match(conn, ligue, saison, date_utc, h_id, a_id,
     )
 
 
-async def _log_prob_score(conn, ligue, match_row, params, caches):
-    _, saison, date_utc, h_id, a_id, _, _, gh, ga = match_row
-    if gh is None or ga is None:
-        return None
-    L_A, L_B, rho = await _lambdas_pour_match(
-        conn, ligue, saison, date_utc, h_id, a_id,
-        params['n_prior'], params['xg_half_life_days'], params['dc_half_life_days'],
-        params['rho'], caches,
-    )
-    mat = generer_matrice(L_A, L_B, rho)
-    gi = min(int(gh), mat.shape[0] - 1)
-    ga_i = min(int(ga), mat.shape[1] - 1)
-    return float(np.log(max(float(mat[gi, ga_i]), 1e-12)))
+def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
+                          markets=('spreads', 'totals'), poids_dyn=None):
+    """
+    Candidats EV/Kelly pour un match — logique alignée simuler_paris() / bot live.
+    Retourne [(ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag), ...]
+    """
+    if poids_dyn is None:
+        poids_dyn = calculer_poids_dyn(H_ODDS_BACKTEST)
+
+    spreads_partner: dict = {}
+    totals_partner: dict = {}
+    for mk, out, hv, c in odds_h24:
+        if mk == 'spreads':
+            spreads_partner[(mk, hv)] = c
+        elif mk == 'totals':
+            totals_partner[(hv, out.lower())] = c
+
+    candidats = []
+    for market, outcome, h_val, cote_h24 in odds_h24:
+        if market not in markets:
+            continue
+        if cote_h24 < MIN_COTE:
+            continue
+
+        if market == 'spreads':
+            is_home = (outcome == home_name_odds) or (
+                process.extractOne(outcome, [home_name_odds])[1] > 85
+            )
+            ev_modele = ev_ah(mat, h_val, is_home, cote_h24)
+            k = kelly_ah(mat, h_val, is_home, cote_h24)
+            cote_partner = spreads_partner.get((market, -h_val))
+            if cote_partner and cote_partner > 1.0:
+                cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
+                ev_pinnacle = ev_ah(mat, h_val, is_home, cote_novig)
+            else:
+                ev_pinnacle = ev_modele
+            side_flag = is_home
+        else:
+            is_over = outcome.lower() == 'over'
+            ev_modele = ev_total(mat, h_val, is_over, cote_h24)
+            k = kelly_total(mat, h_val, is_over, cote_h24)
+            partner_side = 'under' if is_over else 'over'
+            cote_partner = totals_partner.get((h_val, partner_side))
+            if cote_partner and cote_partner > 1.0:
+                cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
+                ev_pinnacle = ev_total(mat, h_val, is_over, cote_novig)
+            else:
+                ev_pinnacle = ev_modele
+            side_flag = is_over
+
+        ev_final = ev_modele * poids_dyn + ev_pinnacle * (1.0 - poids_dyn)
+        if not (ev_min_l <= ev_final <= ev_max_l):
+            continue
+        mise = min(round(k * 100 * KELLY_FRAC, 2), 5.0)
+        if mise < 0.1:
+            continue
+        candidats.append((ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag))
+    return candidats
+
+
+async def _preload_odds_tune(conn, ligue_id):
+    """Pré-charge cotes H-24 et clôture pour le tuning CLV (1 requête/ligue)."""
+    odds_by_fid: dict = defaultdict(list)
+    async with conn.execute(
+        "SELECT o.fixture_id, o.market, o.outcome, o.h_val, o.cote "
+        "FROM bt_odds_h24 o JOIN bt_fixtures f ON f.id=o.fixture_id "
+        "WHERE f.ligue_id=?",
+        (ligue_id,),
+    ) as cur:
+        for fid, mk, out, hv, c in await cur.fetchall():
+            odds_by_fid[fid].append((mk, out, hv, c))
+
+    close_by_key: dict = {}
+    async with conn.execute(
+        "SELECT o.fixture_id, o.market, o.outcome, o.h_val, o.cote "
+        "FROM bt_odds_cloture o JOIN bt_fixtures f ON f.id=o.fixture_id "
+        "WHERE f.ligue_id=?",
+        (ligue_id,),
+    ) as cur:
+        for fid, mk, out, hv, c in await cur.fetchall():
+            close_by_key[(fid, mk, out, hv)] = c
+    return odds_by_fid, close_by_key
+
+
+def _composite_tune_score(mean_clv: float, mean_ll: float, clv_weight: float) -> float:
+    """Combine CLV (basis points) et log P(score) pour --tune-metric blend."""
+    clv_scaled = mean_clv * 10000.0
+    ll_scaled = mean_ll * 10.0
+    return clv_weight * clv_scaled + (1.0 - clv_weight) * ll_scaled
+
+
+async def _eval_params_tune(
+    conn, ligue, fixtures, params, start_idx,
+    metric='loglik', clv_weight=0.5,
+    odds_by_fid=None, close_by_key=None, clv_markets=('spreads',),
+):
+    """
+    Évalue un jeu d'hyperparamètres en walk-forward.
+    metric : loglik | clv | blend
+    clv : CLV moyen AH (spreads) sur les signaux simulés (H-24 vs clôture Pinnacle).
+    """
+    use_ll = metric in ('loglik', 'blend')
+    use_clv = metric in ('clv', 'blend')
+    caches = {'xg': {}, 'venue': {}, 'sos': {}, 'mot_luck': {}, 'dc': {}}
+    ll_total, ll_n = 0.0, 0
+    clv_sum, clv_n, sig_n = 0.0, 0, 0
+    ev_min_l = ligue.get('ev_min', 0.05)
+    ev_max_l = ligue.get('ev_max', 0.15)
+
+    for row in fixtures[start_idx:]:
+        fid, saison, date_utc, h_id, a_id, h_name, a_name, gh, ga = row
+        if gh is None or ga is None:
+            continue
+
+        L_A, L_B, rho = await _lambdas_pour_match(
+            conn, ligue, saison, date_utc, h_id, a_id,
+            params['n_prior'], params['xg_half_life_days'], params['dc_half_life_days'],
+            params['rho'], caches,
+        )
+        mat = generer_matrice(L_A, L_B, rho)
+
+        if use_ll:
+            gi = min(int(gh), mat.shape[0] - 1)
+            ga_i = min(int(ga), mat.shape[1] - 1)
+            ll_total += float(np.log(max(float(mat[gi, ga_i]), 1e-12)))
+            ll_n += 1
+
+        if use_clv and odds_by_fid is not None and close_by_key is not None:
+            odds_h24 = odds_by_fid.get(fid)
+            if not odds_h24:
+                continue
+            home_name_odds = NAME_MAPPING.get(h_name, h_name)
+            candidats = _candidats_pour_match(
+                mat, odds_h24, home_name_odds, ev_min_l, ev_max_l, markets=clv_markets,
+            )
+            if not candidats:
+                continue
+            candidats.sort(key=lambda x: x[0], reverse=True)
+            _, market, outcome, h_val, cote_h24, _, _, _ = candidats[0]
+            sig_n += 1
+            cote_cloture = close_by_key.get((fid, market, outcome, h_val))
+            if cote_cloture and cote_cloture > 1.0:
+                clv_sum += (cote_h24 / cote_cloture) - 1.0
+                clv_n += 1
+
+    mean_ll = ll_total / ll_n if ll_n else float('-inf')
+    mean_clv = clv_sum / clv_n if clv_n >= TUNE_MIN_CLV_SIGNALS else float('-inf')
+    stats = {
+        'mean_log_score': round(mean_ll, 5) if ll_n else None,
+        'mean_clv': round(mean_clv, 6) if clv_n >= TUNE_MIN_CLV_SIGNALS else None,
+        'n_clv': clv_n,
+        'n_signals': sig_n,
+    }
+
+    if metric == 'loglik':
+        return mean_ll, stats
+    if metric == 'clv':
+        return mean_clv, stats
+    if mean_ll == float('-inf') or mean_clv == float('-inf'):
+        return float('-inf'), stats
+    return _composite_tune_score(mean_clv, mean_ll, clv_weight), stats
 
 
 async def _eval_params_walkforward(conn, ligue, fixtures, params, start_idx=0):
-    caches = {'xg': {}, 'venue': {}, 'sos': {}, 'mot_luck': {}, 'dc': {}}
-    total, n = 0.0, 0
-    for row in fixtures[start_idx:]:
-        ll = await _log_prob_score(conn, ligue, row, params, caches)
-        if ll is not None:
-            total += ll
-            n += 1
-    return total / n if n else float('-inf')
+    score, _ = await _eval_params_tune(
+        conn, ligue, fixtures, params, start_idx, metric='loglik',
+    )
+    return score
 
 
-async def tune_ligue_walkforward(conn, ligue, fixtures):
+def _format_tune_score(metric, score, stats):
+    if metric == 'loglik':
+        return f"log P={score:.4f}"
+    if metric == 'clv':
+        return f"CLV={score:+.4f} (n={stats.get('n_clv', 0)})"
+    ll = stats.get('mean_log_score')
+    clv = stats.get('mean_clv')
+    ll_s = f"{ll:.4f}" if ll is not None else "N/A"
+    clv_s = f"{clv:+.4f}" if clv is not None else "N/A"
+    return f"blend={score:.4f} (CLV={clv_s}, logP={ll_s})"
+
+
+async def tune_ligue_walkforward(conn, ligue, fixtures, metric='loglik', clv_weight=0.5):
     if len(fixtures) < TUNE_MIN_MATCHS:
         print(f"  ⚠️ {ligue['nom']} : {len(fixtures)} matchs (< {TUNE_MIN_MATCHS}) — ignorée", flush=True)
         return None
 
+    odds_by_fid, close_by_key = None, None
+    if metric in ('clv', 'blend'):
+        odds_by_fid, close_by_key = await _preload_odds_tune(conn, ligue['id'])
+        if not odds_by_fid:
+            print(f"  ⚠️ {ligue['nom']} : pas de cotes H-24 — tuning CLV impossible", flush=True)
+            return None
+
     n_eval = len(TUNE_GRID_N_PRIOR) * len(TUNE_GRID_XG_HL) + len(TUNE_GRID_RHO) * len(TUNE_GRID_DC_HL)
     start = max(TUNE_MIN_MATCHS // 2, len(fixtures) // 4)
     n_scored = len(fixtures) - start
+    metric_label = {'loglik': 'log P(score)', 'clv': 'CLV AH moyen', 'blend': f'blend CLV/logP ({clv_weight:.0%} CLV)'}
     print(
         f"  ▶ {ligue['nom']} : {len(fixtures)} matchs, {n_scored} scorés (burn-in {start}), "
-        f"{n_eval} combinaisons…",
+        f"{n_eval} combinaisons, métrique={metric_label.get(metric, metric)}…",
         flush=True,
     )
 
@@ -1406,51 +1578,63 @@ async def tune_ligue_walkforward(conn, ligue, fixtures):
         'xg_half_life_days': get_xg_half_life_days(ligue['id']),
         'dc_half_life_days': get_dc_half_life_days(ligue['id']),
     }
-    best_ll = float('-inf')
+    best_score = float('-inf')
+    best_stats: dict = {}
     step = 0
+
+    async def _try_params(p, label):
+        nonlocal best_score, best, best_stats
+        score, stats = await _eval_params_tune(
+            conn, ligue, fixtures, p, start,
+            metric=metric, clv_weight=clv_weight,
+            odds_by_fid=odds_by_fid, close_by_key=close_by_key,
+        )
+        print(f"     {label} → {_format_tune_score(metric, score, stats)}", flush=True)
+        if score > best_score:
+            best_score, best, best_stats = score, dict(p), dict(stats)
 
     for np_ in TUNE_GRID_N_PRIOR:
         for xg_hl in TUNE_GRID_XG_HL:
             step += 1
             p = {**best, 'n_prior': np_, 'xg_half_life_days': xg_hl}
-            ll = await _eval_params_walkforward(conn, ligue, fixtures, p, start)
-            print(
-                f"     [{step}/{n_eval}] n_prior={np_} xg_hl={xg_hl}j → log P={ll:.4f}",
-                flush=True,
-            )
-            if ll > best_ll:
-                best_ll, best = ll, p
+            await _try_params(p, f"[{step}/{n_eval}] n_prior={np_} xg_hl={xg_hl}j")
 
     for rho in TUNE_GRID_RHO:
         for dc_hl in TUNE_GRID_DC_HL:
             step += 1
             p = {**best, 'rho': rho, 'dc_half_life_days': dc_hl}
-            ll = await _eval_params_walkforward(conn, ligue, fixtures, p, start)
-            print(
-                f"     [{step}/{n_eval}] rho={rho:.2f} dc_hl={dc_hl}j → log P={ll:.4f}",
-                flush=True,
-            )
-            if ll > best_ll:
-                best_ll, best = ll, p
+            await _try_params(p, f"[{step}/{n_eval}] rho={rho:.2f} dc_hl={dc_hl}j")
 
-    best['mean_log_score'] = round(best_ll, 5)
+    if best_stats.get('mean_log_score') is not None:
+        best['mean_log_score'] = best_stats['mean_log_score']
+    if best_stats.get('mean_clv') is not None:
+        best['mean_clv'] = best_stats['mean_clv']
+    if best_stats.get('n_clv') is not None:
+        best['n_clv'] = best_stats['n_clv']
+
     print(
         f"  ✅ {ligue['nom']} : n_prior={best['n_prior']} rho={best['rho']:.2f} "
         f"xg_hl={best['xg_half_life_days']:.0f}j dc_hl={best['dc_half_life_days']:.0f}j "
-        f"(log P score={best_ll:.4f})",
+        f"({_format_tune_score(metric, best_score, best_stats)})",
         flush=True,
     )
     return best
 
 
-async def tune_hyperparams_walkforward(conn, ligues=None):
+async def tune_hyperparams_walkforward(conn, ligues=None, metric='loglik', clv_weight=0.5):
     print("\n" + "=" * 60)
     print("🔧  CALIBRATION WALK-FORWARD (n_prior / rho / demi-vies)")
     print("=" * 60)
-    print("  Métrique : log P(score réel | modèle) — pas de lookahead, pas de ROI", flush=True)
+    if metric == 'loglik':
+        print("  Metrique : log P(score reel | modele) — pas de lookahead, pas de ROI", flush=True)
+    elif metric == 'clv':
+        print("  Metrique : CLV AH moyen (H-24 vs cloture Pinnacle) sur signaux simules", flush=True)
+        print(f"  Min signaux CLV : {TUNE_MIN_CLV_SIGNALS} par combinaison", flush=True)
+    else:
+        print(f"  Metrique : blend {clv_weight:.0%} CLV + {1-clv_weight:.0%} log P(score)", flush=True)
     print(f"  Grilles : n_prior{TUNE_GRID_N_PRIOR}, rho{TUNE_GRID_RHO}, "
           f"xg_hl{TUNE_GRID_XG_HL}, dc_hl{TUNE_GRID_DC_HL}", flush=True)
-    print("  (1ère combinaison lente : DC MLE + xG par match — ~5–15 min/ligue)", flush=True)
+    print("  (1ere combinaison lente : DC MLE + xG par match — ~5–15 min/ligue)", flush=True)
 
     ligues = ligues or CHAMPIONNATS
     results = {}
@@ -1461,7 +1645,9 @@ async def tune_hyperparams_walkforward(conn, ligues=None):
             (ligue['id'],),
         ) as cur:
             fixtures = await cur.fetchall()
-        tuned = await tune_ligue_walkforward(conn, ligue, fixtures)
+        tuned = await tune_ligue_walkforward(
+            conn, ligue, fixtures, metric=metric, clv_weight=clv_weight,
+        )
         if tuned:
             results[ligue['id']] = tuned
 
@@ -1469,7 +1655,12 @@ async def tune_hyperparams_walkforward(conn, ligues=None):
         print("\n❌ Aucune ligue calibrée (données insuffisantes).")
         return
 
-    path = save_tuned_params(results)
+    meta_metric = {
+        'loglik': 'mean_log_score_prob',
+        'clv': 'mean_clv_ah_spreads',
+        'blend': f'blend_clv_{int(clv_weight * 100)}_loglik',
+    }.get(metric, metric)
+    path = save_tuned_params(results, metric=meta_metric)
     print(f"\n✅ Paramètres enregistrés → {path}")
     print("   Bot live + backtest : rechargement auto via foot_params.py")
 
@@ -1599,70 +1790,12 @@ async def simuler_paris(conn, ligues=None):
 
             mat = generer_matrice(L_A, L_B, rho)
 
-            # Parcourir les marchés — collecter tous les signaux valides pour ce fixture
             home_name_odds = NAME_MAPPING.get(h_name, h_name)
-            candidats = []  # (ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag)
-
             ev_min_l = ligue.get('ev_min', 0.05)
             ev_max_l = ligue.get('ev_max', 0.15)
-
-            # Index cotes partenaires pour no-vig (Shin) — aligné sniper_bot_foot.py
-            # spreads : partenaire à handicap opposé (-h)
-            # totals  : partenaire à même ligne (Over ↔ Under)
-            spreads_partner: dict = {}
-            totals_partner: dict = {}
-            for mk, out, hv, c in odds_h24:
-                if mk == 'spreads':
-                    spreads_partner[(mk, hv)] = c
-                elif mk == 'totals':
-                    totals_partner[(hv, out.lower())] = c
-
-            # Blend EV dynamique — à H-24 : poids_dyn ≈ 23.2% (formule bot recalibrée)
-            poids_dyn = calculer_poids_dyn(H_ODDS_BACKTEST)
-
-            for market, outcome, h_val, cote_h24 in odds_h24:
-                if market not in ('spreads', 'totals'):
-                    continue
-
-                if cote_h24 < MIN_COTE:
-                    continue
-
-                if market == 'spreads':
-                    is_home = (outcome == home_name_odds) or (
-                        process.extractOne(outcome, [home_name_odds])[1] > 85
-                    )
-                    ev_modele = ev_ah(mat, h_val, is_home, cote_h24)
-                    k = kelly_ah(mat, h_val, is_home, cote_h24)
-                    cote_partner = spreads_partner.get((market, -h_val))
-                    if cote_partner and cote_partner > 1.0:
-                        cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
-                        ev_pinnacle = ev_ah(mat, h_val, is_home, cote_novig)
-                    else:
-                        ev_pinnacle = ev_modele
-                    side_flag = is_home
-                else:
-                    is_over = outcome.lower() == 'over'
-                    ev_modele = ev_total(mat, h_val, is_over, cote_h24)
-                    k = kelly_total(mat, h_val, is_over, cote_h24)
-                    partner_side = 'under' if is_over else 'over'
-                    cote_partner = totals_partner.get((h_val, partner_side))
-                    if cote_partner and cote_partner > 1.0:
-                        cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
-                        ev_pinnacle = ev_total(mat, h_val, is_over, cote_novig)
-                    else:
-                        ev_pinnacle = ev_modele
-                    side_flag = is_over
-
-                ev_final = ev_modele * poids_dyn + ev_pinnacle * (1.0 - poids_dyn)
-
-                if not (ev_min_l <= ev_final <= ev_max_l):
-                    continue
-
-                mise = min(round(k * 100 * KELLY_FRAC, 2), 5.0)
-                if mise < 0.1:
-                    continue
-
-                candidats.append((ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag))
+            candidats = _candidats_pour_match(
+                mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
+            )
 
             if not candidats:
                 continue
@@ -1929,12 +2062,24 @@ async def main():
     parser.add_argument('--reset-full', action='store_true',
                         help='Supprime backtest_data.db + CSV (recollecte API requise)')
     parser.add_argument('--tune',       action='store_true',
-                        help='Calibration walk-forward n_prior / rho / demi-vies → foot_params_tuned.json')
+                        help='Calibration walk-forward n_prior / rho / demi-vies -> foot_params_tuned.json')
+    parser.add_argument('--tune-metric', type=str, default='loglik',
+                        choices=TUNE_METRICS,
+                        help='Metrique de tuning : loglik (defaut), clv (CLV AH), blend (mixte)')
+    parser.add_argument('--tune-clv-weight', type=float, default=0.5,
+                        help='Poids CLV dans --tune-metric blend (0.0-1.0, defaut 0.5)')
     parser.add_argument('--ligue',      type=str, default=None,
                         help='Filtrer une ligue (nom partiel, ex: Championship, "Ligue 1")')
     parser.add_argument('--odds-only',  action='store_true',
                         help='Avec --collect : recollecte uniquement les cotes (fixtures/xG déjà en base)')
     args = parser.parse_args()
+
+    if args.tune_metric not in TUNE_METRICS:
+        print(f"\n❌ --tune-metric invalide : {args.tune_metric}")
+        return
+    if not 0.0 <= args.tune_clv_weight <= 1.0:
+        print(f"\n❌ --tune-clv-weight doit etre entre 0 et 1")
+        return
 
     if args.odds_only and not args.collect:
         print("\n❌ --odds-only requiert --collect")
@@ -1970,7 +2115,10 @@ async def main():
                     odds_only=args.odds_only,
                 )
             if args.tune:
-                await tune_hyperparams_walkforward(conn, ligues=ligues_filtrees)
+                await tune_hyperparams_walkforward(
+                    conn, ligues=ligues_filtrees,
+                    metric=args.tune_metric, clv_weight=args.tune_clv_weight,
+                )
             if args.simulate or all_phases:
                 async with aiosqlite.connect(
                     f"file:{DB_PATH}?mode=ro", uri=True, timeout=120.0
