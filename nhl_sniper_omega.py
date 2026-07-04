@@ -84,6 +84,7 @@ NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
 HIA_REF_CALIBRATION = 0.05  # HIA utilisé lors du calcul des lambdas historiques du journal
 NHL_MARCHES_ACTIFS = {m.strip().upper() for m in os.environ.get("NHL_MARCHES_ACTIFS", "ML,PL,OU").split(",") if m.strip()}
 RHO_META_FILE = "rho_calibrage_meta.json"
+REFEREE_META_FILE = "referee_calibrage_meta.json"
 # Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
 XG_FOR_COLONNES = (
     "flurryScoreVenueAdjustedxGoalsFor",
@@ -103,6 +104,7 @@ _gsax_recent_logue = False
 _team_recent_logue = False
 _travel_fatigue_logue = False
 _faceoff_adj_logue = False
+_ref_adj_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -119,6 +121,11 @@ NHL_TRAVEL_SOLO_DEF_PCT = float(os.environ.get("NHL_TRAVEL_SOLO_DEF_PCT", "0.02"
 NHL_TRAVEL_LONG_MILES = float(os.environ.get("NHL_TRAVEL_LONG_MILES", "1000"))
 NHL_FACEOFF_ADJ_ACTIF = _env_bool("NHL_FACEOFF_ADJ_ACTIF", True)
 NHL_FACEOFF_SENSIBILITE = float(os.environ.get("NHL_FACEOFF_SENSIBILITE", "0.25"))
+NHL_REF_ADJ_ACTIF = _env_bool("NHL_REF_ADJ_ACTIF", True)
+NHL_REF_SENSIBILITE = float(os.environ.get("NHL_REF_SENSIBILITE", "0.20"))
+NHL_REF_LOOKBACK_JOURS = int(os.environ.get("NHL_REF_LOOKBACK_JOURS", "30"))
+NHL_REF_SCAN_JOURS = int(os.environ.get("NHL_REF_SCAN_JOURS", "3"))
+NHL_REF_MIN_MATCHS = int(os.environ.get("NHL_REF_MIN_MATCHS", "12"))
 
 ETATS_MATCH_EXCLUS = {"FINAL", "OFF", "OFFICIAL", "POSTPONED", "PPD", "LIVE", "CRIT"}
 ETATS_MATCH_PRIORITAIRES = {"FUT", "PRE"}
@@ -803,6 +810,198 @@ def get_travel_miles_for_team(team_abbr, game_home_team, last_venues):
         return 0.0
     return round(_distance_entre_arènes(last_venue, game_home_team), 1)
 
+
+def _normaliser_nom_arbitre(nom):
+    return str(nom).strip().lower()
+
+
+def _extraire_nom_officiel(entry):
+    if not entry:
+        return None
+    if isinstance(entry, dict):
+        return entry.get("default")
+    return str(entry)
+
+
+def lire_referee_meta():
+    default = {
+        "referees": {},
+        "league_penalties_pg": 10.0,
+        "total_games": 0,
+        "league_penalties_total": 0,
+        "scanned_game_ids": [],
+    }
+    if not os.path.exists(REFEREE_META_FILE):
+        return default
+    try:
+        with open(REFEREE_META_FILE, "r", encoding="utf-8") as f:
+            return {**default, **json.load(f)}
+    except Exception:
+        return default
+
+
+def get_game_referees(game_id):
+    """Arbitres assignés au match (NHL right-rail → gameInfo.referees)."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(
+            f"https://api-web.nhle.com/v1/gamecenter/{game_id}/right-rail",
+            headers=headers,
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return []
+        data = response.json()
+        raw = data.get("gameInfo", {}).get("referees", [])
+        return [n for n in (_extraire_nom_officiel(r) for r in raw) if n]
+    except Exception:
+        return []
+
+
+def compter_penalites_match(game_id):
+    """Nombre total de pénalités sifflées (landing summary)."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(
+            f"https://api-web.nhle.com/v1/gamecenter/{game_id}/landing",
+            headers=headers,
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return None
+        blocs = response.json().get("summary", {}).get("penalties", [])
+        total = 0
+        for bloc in blocs:
+            plist = bloc.get("penalties", [])
+            if isinstance(plist, list):
+                total += len(plist)
+        return total
+    except Exception:
+        return None
+
+
+def actualiser_stats_arbitres():
+    """
+    Scan incrémental des matchs terminés : pénalités/match par arbitre.
+    Alimente referee_calibrage_meta.json pour l'ajustement PP/PK live.
+    """
+    if not NHL_REF_ADJ_ACTIF:
+        return
+
+    meta = lire_referee_meta()
+    refs_db = meta.setdefault("referees", {})
+    scanned = set(meta.get("scanned_game_ids", []))
+    league_total_pens = int(meta.get("league_penalties_total", 0))
+    league_total_games = int(meta.get("total_games", 0))
+    etats_finaux = {"FINAL", "OFF", "OFFICIAL"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    lookback = NHL_REF_LOOKBACK_JOURS if league_total_games >= 50 else NHL_REF_LOOKBACK_JOURS
+    scan_jours = NHL_REF_SCAN_JOURS if league_total_games >= 50 else lookback
+    nouveaux = 0
+
+    for offset in range(1, scan_jours + 1):
+        date_str = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+        try:
+            response = requests.get(
+                f"https://api-web.nhle.com/v1/score/{date_str}",
+                headers=headers,
+                timeout=10,
+            )
+            if response.status_code != 200:
+                continue
+            for game in response.json().get("games", []):
+                if game.get("gameState") not in etats_finaux:
+                    continue
+                gid = str(game["id"])
+                if gid in scanned:
+                    continue
+                ref_names = get_game_referees(game["id"])
+                if not ref_names:
+                    continue
+                pen_count = compter_penalites_match(game["id"])
+                if pen_count is None:
+                    continue
+                for name in ref_names:
+                    key = _normaliser_nom_arbitre(name)
+                    if key not in refs_db:
+                        refs_db[key] = {"name": name, "games": 0, "penalties": 0}
+                    refs_db[key]["games"] += 1
+                    refs_db[key]["penalties"] += pen_count
+                league_total_pens += pen_count
+                league_total_games += 1
+                scanned.add(gid)
+                nouveaux += 1
+        except Exception:
+            continue
+
+    if nouveaux <= 0:
+        return
+
+    scanned_list = list(scanned)[-800:]
+    league_ppg = league_total_pens / league_total_games if league_total_games else 10.0
+    meta.update({
+        "referees": refs_db,
+        "total_games": league_total_games,
+        "league_penalties_total": league_total_pens,
+        "league_penalties_pg": round(league_ppg, 2),
+        "scanned_game_ids": scanned_list,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    })
+    with open(REFEREE_META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    log_nhl(
+        f"👨‍⚖️ Stats arbitres mises à jour — +{nouveaux} match(s), "
+        f"ligue ≈{league_ppg:.1f} pén./match, {len(refs_db)} arbitres indexés"
+    )
+
+
+def compute_referee_pp_multiplier(referee_names):
+    """
+    Multiplicateur PP/PK selon la tendance pénalités du crew vs moyenne ligue.
+    Retourne (mult, info_dict ou None).
+    """
+    global _ref_adj_logue
+    if not NHL_REF_ADJ_ACTIF or not referee_names:
+        return 1.0, None
+
+    meta = lire_referee_meta()
+    league_ppg = float(meta.get("league_penalties_pg", 10.0))
+    if league_ppg <= 0:
+        return 1.0, None
+
+    ppg_samples = []
+    known_refs = []
+    for name in referee_names:
+        key = _normaliser_nom_arbitre(name)
+        ref_data = meta.get("referees", {}).get(key)
+        if not ref_data or ref_data.get("games", 0) < NHL_REF_MIN_MATCHS:
+            continue
+        ppg_samples.append(ref_data["penalties"] / ref_data["games"])
+        known_refs.append(ref_data.get("name", name))
+
+    if not ppg_samples:
+        return 1.0, None
+
+    crew_ppg = sum(ppg_samples) / len(ppg_samples)
+    rel = (crew_ppg - league_ppg) / league_ppg
+    rel = max(min(rel, 0.25), -0.25)
+    mult = round(max(min(1.0 + NHL_REF_SENSIBILITE * rel, 1.12), 0.88), 3)
+
+    if not _ref_adj_logue:
+        _ref_adj_logue = True
+        log_nhl(
+            f"👨‍⚖️ Ajustement arbitral actif — sensibilité {NHL_REF_SENSIBILITE:.2f}, "
+            f"min {NHL_REF_MIN_MATCHS} matchs/arbitre, ligue ≈{league_ppg:.1f} pén./match"
+        )
+
+    return mult, {
+        "crew_ppg": round(crew_ppg, 2),
+        "league_ppg": round(league_ppg, 2),
+        "refs": known_refs,
+        "mult": mult,
+    }
+
 # ==========================================
 # 3. UTILITAIRES D'IDENTIFICATION
 # ==========================================
@@ -1065,6 +1264,7 @@ def calculate_master_odds_v4(
     teams_data, home_team, away_team, home_gsax, away_gsax,
     home_is_b2b=False, away_is_b2b=False,
     home_travel_miles=0.0, away_travel_miles=0.0,
+    referee_pp_mult=1.0,
     rho=-0.12, hia=None, prob_tie=None, prob_en=None,
 ):
     if hia is None:
@@ -1121,6 +1321,11 @@ def calculate_master_odds_v4(
     away_xga *= away_fatigue_def
     away_pp_att *= away_fatigue_atk
     away_pk_def *= away_fatigue_def
+
+    # Crew arbitral : plus de sifflets → plus d'occasions PP des deux côtés
+    if referee_pp_mult != 1.0:
+        home_pp_att = round(home_pp_att * referee_pp_mult, 3)
+        away_pp_att = round(away_pp_att * referee_pp_mult, 3)
 
     lam_home_5v5 = (home_xgf / league_avg_5v5) * (away_xga / league_avg_5v5) * league_avg_5v5
     lam_away_5v5 = (away_xgf / league_avg_5v5) * (home_xga / league_avg_5v5) * league_avg_5v5
@@ -1975,12 +2180,18 @@ def run_sniper():
         )
     if NHL_FACEOFF_ADJ_ACTIF:
         log_nhl(f"🏒 Ajustement faceoffs actif — sensibilité {NHL_FACEOFF_SENSIBILITE:.2f}")
+    if NHL_REF_ADJ_ACTIF:
+        log_nhl(
+            f"👨‍⚖️ Ajustement arbitral actif — sensibilité {NHL_REF_SENSIBILITE:.2f}, "
+            f"scan {NHL_REF_SCAN_JOURS}j/cycle, min {NHL_REF_MIN_MATCHS} matchs/arbitre"
+        )
     migrer_journal_si_besoin()
 
     while True:
         try:
             lancer_la_balayeuse()
             entrainer_ia_dixon_coles()
+            actualiser_stats_arbitres()
 
             nb_attente = compter_paris_en_attente()
             log_nhl(f"🕵️ Tracking CLV ({nb_attente} pari(s) en attente)...")
@@ -2083,10 +2294,25 @@ def run_sniper():
                 away_base['xGF_per_game'], away_base['xGA_per_game'] = adj_xgf_ext, adj_xga_ext
                 home_base['xGF_per_game'], home_base['xGA_per_game'] = adj_xgf_dom, adj_xga_dom
 
+                referee_names = get_game_referees(m["game_id"])
+                ref_pp_mult, ref_info = compute_referee_pp_multiplier(referee_names)
+                if ref_info and ref_pp_mult != 1.0:
+                    log_nhl(
+                        f"👨‍⚖️ Crew {', '.join(ref_info['refs'])} — "
+                        f"{ref_info['crew_ppg']:.1f} vs ligue {ref_info['league_ppg']:.1f} pén./match "
+                        f"→ PP x{ref_pp_mult:.2f} ({m['away_team']} @ {m['home_team']})"
+                    )
+                elif referee_names and not ref_info:
+                    log_nhl(
+                        f"ℹ️ Arbitres {', '.join(referee_names)} — historique insuffisant "
+                        f"(<{NHL_REF_MIN_MATCHS} matchs), pas d'ajustement"
+                    )
+
                 cotes_vraies = calculate_master_odds_v4(
                     teams_match, m['home_team'], m['away_team'], gsax_dom, gsax_ext,
                     home_is_b2b=home_b2b, away_is_b2b=away_b2b,
                     home_travel_miles=home_travel, away_travel_miles=away_travel,
+                    referee_pp_mult=ref_pp_mult,
                     rho=rho_actuel, hia=hia_actuel,
                     prob_tie=prob_tie_actuel, prob_en=prob_en_actuel,
                 )
