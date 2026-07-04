@@ -1,3 +1,4 @@
+import ftplib
 import requests, json, os, time, logging, csv, signal, shutil
 import numpy as np
 from scipy.stats import poisson
@@ -1163,38 +1164,76 @@ async def envoyer_telegram_async(session, msg):
             if response.status == 200: log_info("📱 Signal Telegram envoyé.")
     except Exception as e: log_info(f"⚠️ Erreur Telegram : {e}")
 
+HISTORIQUE_CSV_LOCAL = "historique_sniper.csv"
+PA_DATA_DIR = "/home/chienblanc/data"
+HISTORIQUE_CSV_PA = f"{PA_DATA_DIR}/{HISTORIQUE_CSV_LOCAL}"
+
+_PARIS_LOG_EXPORT_SQL = """
+    SELECT
+        id_match          AS ID_Match,
+        equipe            AS Equipe,
+        handicap          AS Handicap,
+        cote_prise        AS Cote_Prise,
+        mise              AS Mise,
+        cote_cloture      AS Cote_Cloture,
+        edge_detecte      AS Edge,
+        p_modele          AS Prob_Modele,
+        clv               AS CLV,
+        statut            AS Statut,
+        resultat          AS Profit_Unites,
+        ligue             AS Ligue,
+        is_lineup_official AS Compo_Officielle,
+        equipe_dom        AS Equipe_Dom,
+        equipe_ext        AS Equipe_Ext,
+        kickoff           AS Kickoff,
+        timestamp         AS Date
+    FROM paris_log
+    ORDER BY timestamp DESC
+"""
+
+
+def _chemin_historique_csv() -> str:
+    """PythonAnywhere → /home/chienblanc/data/, sinon répertoire courant."""
+    return HISTORIQUE_CSV_PA if os.path.isdir(PA_DATA_DIR) else HISTORIQUE_CSV_LOCAL
+
+
+def publier_historique_dashboard(csv_path: str | None = None):
+    """Upload FTP optionnel si le bot tourne en local (dashboard lit chienblanc.pythonanywhere.com/data/)."""
+    csv_path = csv_path or _chemin_historique_csv()
+    if os.path.isdir(PA_DATA_DIR) and csv_path.startswith(PA_DATA_DIR):
+        return
+    if not os.path.isfile(csv_path):
+        return
+    ftp_user = os.environ.get("PA_FTP_USER", "")
+    ftp_pass = os.environ.get("PA_FTP_PASSWORD", "")
+    if not ftp_user or not ftp_pass:
+        return
+    ftp_host = os.environ.get("PA_FTP_HOST", "ftp.pythonanywhere.com")
+    remote_dir = os.environ.get("PA_FTP_REMOTE_DIR", PA_DATA_DIR)
+    remote_name = os.path.basename(csv_path)
+    try:
+        with ftplib.FTP(ftp_host, timeout=30) as ftp:
+            ftp.login(ftp_user, ftp_pass)
+            ftp.cwd(remote_dir)
+            with open(csv_path, "rb") as f:
+                ftp.storbinary(f"STOR {remote_name}", f)
+        log_info(f"📤 historique_sniper.csv uploadé → {ftp_host}{remote_dir}/{remote_name}")
+    except Exception as e:
+        log_info(f"⚠️ Upload FTP historique foot échoué : {e}")
+
+
 async def exporter_historique_csv():
     """
     Exporte paris_log vers le CSV lu par le dashboard Streamlit.
-    Colonnes alignées exactement sur ce qu'attend dashboard_foot.py.
-    Chemin : /home/chienblanc/data/ sur PythonAnywhere, sinon répertoire courant.
+    Colonnes alignées sur dashboard_foot.py (+ Equipe_Dom/Ext pour les totaux).
     """
     async with db_lock:
-        async with db_conn.execute("""
-            SELECT
-                id_match          AS ID_Match,
-                equipe            AS Equipe,
-                handicap          AS Handicap,
-                cote_prise        AS Cote_Prise,
-                mise              AS Mise,
-                cote_cloture      AS Cote_Cloture,
-                edge_detecte      AS Edge,
-                p_modele          AS Prob_Modele,
-                clv               AS CLV,
-                statut            AS Statut,
-                resultat          AS Profit_Unites,
-                ligue             AS Ligue,
-                is_lineup_official AS Compo_Officielle,
-                timestamp         AS Date
-            FROM paris_log
-            ORDER BY timestamp DESC
-        """) as cursor:
+        async with db_conn.execute(_PARIS_LOG_EXPORT_SQL) as cursor:
             rows = await cursor.fetchall()
             colonnes = [desc[0] for desc in cursor.description]
 
-    # Chemin adaptatif : PythonAnywhere → /home/chienblanc/data/, sinon répertoire courant
-    pa_path = "/home/chienblanc/data/historique_sniper.csv"
-    csv_path = pa_path if os.path.isdir("/home/chienblanc/data") else "historique_sniper.csv"
+    csv_path = _chemin_historique_csv()
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True) if os.path.dirname(csv_path) else None
 
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -1202,6 +1241,7 @@ async def exporter_historique_csv():
         writer.writerows(rows)
 
     log_info(f"📄 CSV exporté ({len(rows)} paris) → {csv_path}")
+    publier_historique_dashboard(csv_path)
 
 async def actualiser_kelly_adaptatif():
     """
@@ -1908,6 +1948,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
              int(lineup_ok), datetime.now().isoformat(),
              home_team_odds, away_team_odds, m['fixture']['date']))
         await db_conn.commit()
+    await exporter_historique_csv()
 
 # ==========================================
 # 🚀 5. FONCTIONS MATHS & xG

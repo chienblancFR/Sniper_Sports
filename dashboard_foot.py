@@ -1,9 +1,12 @@
 import os
+import sqlite3
+from datetime import datetime
+from io import StringIO
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-
 from utils import (
     afficher_alertes_chargement,
     appliquer_theme_dark,
@@ -48,26 +51,87 @@ LIGUE_NOMS = {
 
 
 def _charger_csv(url: str, fichier_local: str):
-    """Tente l'URL distante, puis le fichier local."""
-    try:
-        df = pd.read_csv(url)
-        if not df.empty:
-            return df, "ok", f"PA · {fichier_local}"
-    except Exception:
-        pass
-
+    """Local (si présent) → URL PA (HTTP 200) → SQLite sniper_data.db."""
+    erreurs = []
     local_path = os.path.join(os.getcwd(), fichier_local)
+
     if os.path.exists(local_path):
         try:
             df = pd.read_csv(local_path)
             if not df.empty:
-                return df, "ok", f"local · {fichier_local}"
+                mtime = datetime.fromtimestamp(os.path.getmtime(local_path))
+                return df, "ok", f"local · {fichier_local} ({mtime:%d/%m %H:%M})"
             return df, "empty", f"local · {fichier_local} (vide)"
-        except Exception:
-            return pd.DataFrame(), "error", f"local · {fichier_local}"
+        except Exception as e:
+            erreurs.append(f"local: {e}")
 
-    return pd.DataFrame(), "missing", "introuvable"
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code == 200:
+            df = pd.read_csv(StringIO(r.text))
+            if not df.empty:
+                return df, "ok", f"PA · {fichier_local}"
+            return df, "empty", f"PA · {fichier_local} (vide)"
+        erreurs.append(f"URL HTTP {r.status_code}")
+    except Exception as e:
+        erreurs.append(f"URL: {e}")
 
+    return pd.DataFrame(), "missing", " | ".join(erreurs) if erreurs else "introuvable"
+
+
+def _charger_foot_depuis_db(db_path: str = "sniper_data.db"):
+    """Fallback : lit paris_log directement (même requête que l'export bot)."""
+    if not os.path.isfile(db_path):
+        return pd.DataFrame(), "missing", db_path
+    sql = """
+        SELECT
+            id_match AS ID_Match, equipe AS Equipe, handicap AS Handicap,
+            cote_prise AS Cote_Prise, mise AS Mise, cote_cloture AS Cote_Cloture,
+            edge_detecte AS Edge, p_modele AS Prob_Modele, clv AS CLV,
+            statut AS Statut, resultat AS Profit_Unites, ligue AS Ligue,
+            is_lineup_official AS Compo_Officielle,
+            equipe_dom AS Equipe_Dom, equipe_ext AS Equipe_Ext, kickoff AS Kickoff,
+            timestamp AS Date
+        FROM paris_log ORDER BY timestamp DESC
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query(sql, conn)
+        conn.close()
+        if df.empty:
+            return df, "empty", f"SQLite · {db_path} (vide)"
+        return df, "ok", f"SQLite · {db_path}"
+    except Exception as e:
+        return pd.DataFrame(), "error", f"SQLite · {db_path} ({e})"
+
+
+def _enrichir_df_live(df: pd.DataFrame) -> pd.DataFrame:
+    colonnes_numeriques = ["Cote_Prise", "Mise", "Cote_Cloture", "Edge", "Prob_Modele", "CLV", "Profit_Unites"]
+    df = nettoyer_colonnes_numeriques(df, colonnes_numeriques)
+    df = convertir_dates(df)
+    df['Type_Marche'] = df['Ligue'].apply(
+        lambda x: "Totals (Buts)" if "[totals]" in str(x).lower() else "Handicap Asiatique"
+    )
+    df['Nom_Ligue'] = df['Ligue'].apply(lambda x: str(x).split(" [")[0].strip())
+
+    def _libelle_match(row):
+        dom, ext = row.get('Equipe_Dom'), row.get('Equipe_Ext')
+        if pd.notna(dom) and pd.notna(ext) and str(dom).strip() and str(ext).strip():
+            base = f"{dom} - {ext}"
+            sel = str(row.get('Equipe', ''))
+            h = row.get('Handicap')
+            if '[totals]' in str(row.get('Ligue', '')).lower() and sel and pd.notna(h):
+                return f"{base} | {sel} {h:g}"
+            if sel and pd.notna(h):
+                return f"{base} | {sel} ({h:+g})"
+            return base
+        return row.get('Equipe', '')
+
+    if 'Equipe_Dom' in df.columns:
+        df['Match'] = df.apply(_libelle_match, axis=1)
+    else:
+        df['Match'] = df['Equipe']
+    return df
 
 # ==========================================
 # 📥 CHARGEMENT DES DONNÉES
@@ -76,16 +140,14 @@ def _charger_csv(url: str, fichier_local: str):
 def load_football_data():
     df, statut, source = _charger_csv(URL_FOOT, "historique_sniper.csv")
     if statut != "ok":
+        df_db, statut_db, source_db = _charger_foot_depuis_db()
+        if statut_db == "ok":
+            df, statut, source = df_db, statut_db, source_db
+        elif statut != "ok":
+            source = f"{source} · fallback DB: {source_db}"
+    if statut != "ok":
         return df, statut, source
-    colonnes_numeriques = ["Cote_Prise", "Mise", "Cote_Cloture", "Edge", "Prob_Modele", "CLV", "Profit_Unites"]
-    df = nettoyer_colonnes_numeriques(df, colonnes_numeriques)
-    df = convertir_dates(df)
-    df['Type_Marche'] = df['Ligue'].apply(
-        lambda x: "Totals (Buts)" if "[totals]" in str(x) else "Handicap Asiatique"
-    )
-    df['Nom_Ligue'] = df['Ligue'].apply(lambda x: str(x).split(" [")[0])
-    return df, "ok", source
-
+    return _enrichir_df_live(df), "ok", source
 
 @st.cache_data(ttl=300)
 def load_backtest_data():
@@ -134,6 +196,15 @@ st.caption(
 # TAB 1 — LIVE PERFORMANCE
 # ══════════════════════════════════════════
 if section == "📡 Live Performance":
+    if statut_chargement == "missing":
+        st.warning(
+            "⚠️ Journal live introuvable.\n\n"
+            f"**Détail :** {src_live}\n\n"
+            "Le dashboard lit `historique_sniper.csv` (local, URL PA, ou `sniper_data.db`). "
+            "Sur PythonAnywhere : vérifiez que le bot foot tourne et que "
+            "`/data/` pointe vers `/home/chienblanc/data/`."
+        )
+        st.stop()
     afficher_alertes_chargement(
         statut_chargement, df,
         msg_succes="⚽ Le radar Football V25 est armé. En attente des premières transactions..."
@@ -237,7 +308,7 @@ if section == "📡 Live Performance":
     st.subheader("📡 Radar Football : Signaux Actifs / En attente de dénouement")
     if not df_attente.empty:
         df_att_display = df_attente.copy()
-        colonnes_attente = ["Date", "Nom_Ligue", "Equipe", "Handicap", "Cote_Prise", "Mise", "Edge"]
+        colonnes_attente = ["Date", "Nom_Ligue", "Match", "Cote_Prise", "Mise", "Edge"]
         if "CLV" in df_att_display.columns:
             colonnes_attente.append("CLV")
             df_att_display["CLV"] = (df_att_display["CLV"] * 100).round(2)
@@ -268,7 +339,7 @@ if section == "📡 Live Performance":
     st.subheader("📰 Journal de bord : 10 dernières rencontres clôturées")
     if not df_termines.empty:
         df_derniers = df_termines.sort_values("Date", ascending=False).head(10)
-        colonnes_hist = ["Date", "Nom_Ligue", "Equipe", "Handicap", "Cote_Prise", "Mise", "Statut", "Profit_Unites"]
+        colonnes_hist = ["Date", "Nom_Ligue", "Match", "Cote_Prise", "Mise", "Statut", "Profit_Unites"]
 
         def style_statut(val):
             if val in ['WON', 'HALF-WON']:   return 'color: #00FF00; font-weight: bold'
