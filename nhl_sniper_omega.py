@@ -61,6 +61,11 @@ NHL_KELLY_BRIER_FENETRE = int(os.environ.get("NHL_KELLY_BRIER_FENETRE", "40"))
 NHL_KELLY_BRIER_MIN_PARIS = int(os.environ.get("NHL_KELLY_BRIER_MIN_PARIS", "20"))
 NHL_KELLY_BSS_SENSIBILITE = float(os.environ.get("NHL_KELLY_BSS_SENSIBILITE", "0.30"))
 NHL_KELLY_MULT_MIN = float(os.environ.get("NHL_KELLY_MULT_MIN", "0.4"))
+NHL_KELLY_CLV_ACTIF = _env_bool("NHL_KELLY_CLV_ACTIF", True)
+NHL_KELLY_CLV_FENETRE = int(os.environ.get("NHL_KELLY_CLV_FENETRE", "40"))
+NHL_KELLY_CLV_MIN_PARIS = int(os.environ.get("NHL_KELLY_CLV_MIN_PARIS", "15"))
+NHL_KELLY_CLV_SENSIBILITE = float(os.environ.get("NHL_KELLY_CLV_SENSIBILITE", "0.04"))
+NHL_KELLY_CLV_MULT_MIN = float(os.environ.get("NHL_KELLY_CLV_MULT_MIN", "0.5"))
 NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
 NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
 NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
@@ -1833,13 +1838,52 @@ def _lire_brier_recent(fenetre=None):
         return None, None, 0
 
 
-def _multiplicateur_kelly_dynamique():
+def _calculer_clv_ligne(cote_prise, cote_cloture):
+    """CLV = (cote prise / cote clôture) - 1 — aligné dashboard_nhl / foot."""
+    try:
+        prise = float(cote_prise)
+        cloture = float(cote_cloture)
+    except (TypeError, ValueError):
+        return None
+    if prise <= 1.0 or cloture <= 1.0:
+        return None
+    return (prise / cloture) - 1.0
+
+
+def _lire_clv_recent(fenetre=None):
     """
-    Réduit la fraction Kelly si le Brier Skill Score récent (BSS = 1 - Brier/Brier_baseline,
-    baseline = variance Bernoulli théorique p*(1-p) aux niveaux de probabilité pariés) est
-    négatif : le modèle fait pire que ce que sa propre confiance affichée justifierait -> derisk.
-    BSS >= 0 (modèle au moins aussi bon que sa confiance théorique) -> mult=1.0 (jamais de bonus).
+    CLV moyen sur les N derniers paris clôturés avec tracking effectif
+    (Cote_CLV ≠ Cote_Prise). Signal complémentaire au Brier : bat-on la ligne Pinnacle ?
     """
+    fenetre = fenetre or NHL_KELLY_CLV_FENETRE
+    if not os.path.exists(FICHIER_JOURNAL):
+        return None, 0
+    try:
+        with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+            rows = [r for r in csv.DictReader(f) if r.get("Statut") in ("GAGNÉ", "PERDU")]
+        if not rows:
+            return None, 0
+        clv_vals = []
+        for row in rows[-fenetre:]:
+            prise = row.get("Cote_Prise")
+            cloture = row.get("Cote_CLV")
+            if not prise or not cloture:
+                continue
+            if _float_proche(prise, cloture):
+                continue
+            clv = _calculer_clv_ligne(prise, cloture)
+            if clv is not None:
+                clv_vals.append(clv)
+        if not clv_vals:
+            return None, 0
+        return sum(clv_vals) / len(clv_vals), len(clv_vals)
+    except Exception as e:
+        log_nhl(f"⚠️ Erreur lecture CLV récent (Kelly dynamique) : {e}", level="warning")
+        return None, 0
+
+
+def _multiplicateur_kelly_brier():
+    """Réduction Kelly si BSS récent négatif (calibration probabilités)."""
     if not NHL_KELLY_DYNAMIQUE_ACTIF:
         return 1.0
     brier, brier_baseline, n = _lire_brier_recent()
@@ -1848,12 +1892,47 @@ def _multiplicateur_kelly_dynamique():
     bss = 1.0 - (brier / brier_baseline)
     if bss >= 0:
         return 1.0
-    mult = round(min(max(1.0 + bss / NHL_KELLY_BSS_SENSIBILITE, NHL_KELLY_MULT_MIN), 1.0), 3)
-    if mult < 1.0:
-        log_nhl(
-            f"⚠️ Kelly dynamique : BSS récent {bss:+.2f} sur {n} paris "
-            f"(Brier {brier:.3f} vs baseline {brier_baseline:.3f}) -> mises réduites x{mult:.2f}"
-        )
+    return round(min(max(1.0 + bss / NHL_KELLY_BSS_SENSIBILITE, NHL_KELLY_MULT_MIN), 1.0), 3)
+
+
+def _multiplicateur_kelly_clv():
+    """
+    Réduction Kelly si CLV moyen récent négatif : on prend systématiquement
+    une cote pire que la clôture Pinnacle → edge réel probablement surestimé.
+    CLV ≥ 0 → mult=1.0 (pas de bonus, même logique que BSS).
+    """
+    if not NHL_KELLY_CLV_ACTIF:
+        return 1.0
+    clv_moy, n = _lire_clv_recent()
+    if clv_moy is None or n < NHL_KELLY_CLV_MIN_PARIS or NHL_KELLY_CLV_SENSIBILITE <= 0:
+        return 1.0
+    if clv_moy >= 0:
+        return 1.0
+    return round(min(max(1.0 + clv_moy / NHL_KELLY_CLV_SENSIBILITE, NHL_KELLY_CLV_MULT_MIN), 1.0), 3)
+
+
+def _multiplicateur_kelly_dynamique():
+    """
+    Kelly dynamique combiné : BSS (calibration) × CLV (qualité vs marché).
+    Chaque signal ne réduit jamais au-dessus de 1.0 — pas de sur-mise sur hot streak.
+    """
+    mult_brier = _multiplicateur_kelly_brier()
+    mult_clv = _multiplicateur_kelly_clv()
+    mult = round(mult_brier * mult_clv, 3)
+    if mult >= 1.0:
+        return 1.0
+
+    parts = []
+    if mult_brier < 1.0:
+        brier, brier_baseline, n_b = _lire_brier_recent()
+        bss = 1.0 - (brier / brier_baseline) if brier and brier_baseline else 0.0
+        parts.append(f"BSS {bss:+.2f} (n={n_b})→x{mult_brier:.2f}")
+    if mult_clv < 1.0:
+        clv_moy, n_c = _lire_clv_recent()
+        parts.append(f"CLV {clv_moy:+.1%} (n={n_c})→x{mult_clv:.2f}")
+    log_nhl(
+        f"⚠️ Kelly dynamique : {' | '.join(parts)} → mises réduites x{mult:.2f}"
+    )
     return mult
 
 
@@ -2170,8 +2249,13 @@ def run_sniper():
         )
     if NHL_KELLY_DYNAMIQUE_ACTIF:
         log_nhl(
-            f"🎚️ Kelly dynamique actif — fenêtre {NHL_KELLY_BRIER_FENETRE} paris (min {NHL_KELLY_BRIER_MIN_PARIS}), "
-            f"BSS vs baseline théorique, mult. plancher x{NHL_KELLY_MULT_MIN:.2f}"
+            f"🎚️ Kelly dynamique actif — BSS fenêtre {NHL_KELLY_BRIER_FENETRE} paris (min {NHL_KELLY_BRIER_MIN_PARIS}), "
+            f"mult. plancher x{NHL_KELLY_MULT_MIN:.2f}"
+        )
+    if NHL_KELLY_CLV_ACTIF:
+        log_nhl(
+            f"📊 Kelly CLV actif — fenêtre {NHL_KELLY_CLV_FENETRE} paris (min {NHL_KELLY_CLV_MIN_PARIS}), "
+            f"sensibilité {NHL_KELLY_CLV_SENSIBILITE:.0%}, mult. plancher x{NHL_KELLY_CLV_MULT_MIN:.2f}"
         )
     if NHL_TRAVEL_FATIGUE_ACTIF:
         log_nhl(
