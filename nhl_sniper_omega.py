@@ -66,6 +66,12 @@ NHL_KELLY_CLV_FENETRE = int(os.environ.get("NHL_KELLY_CLV_FENETRE", "40"))
 NHL_KELLY_CLV_MIN_PARIS = int(os.environ.get("NHL_KELLY_CLV_MIN_PARIS", "15"))
 NHL_KELLY_CLV_SENSIBILITE = float(os.environ.get("NHL_KELLY_CLV_SENSIBILITE", "0.04"))
 NHL_KELLY_CLV_MULT_MIN = float(os.environ.get("NHL_KELLY_CLV_MULT_MIN", "0.5"))
+NHL_LINE_MOVE_ACTIF = _env_bool("NHL_LINE_MOVE_ACTIF", True)
+NHL_LINE_MIN_AGE_MIN = int(os.environ.get("NHL_LINE_MIN_AGE_MIN", "45"))
+NHL_LINE_MAX_SNAPSHOTS = int(os.environ.get("NHL_LINE_MAX_SNAPSHOTS", "48"))
+NHL_LINE_STEAM_WARN_PCT = float(os.environ.get("NHL_LINE_STEAM_WARN_PCT", "0.025"))
+NHL_LINE_STEAM_BLOCK_PCT = float(os.environ.get("NHL_LINE_STEAM_BLOCK_PCT", "0.05"))
+NHL_LINE_STEAM_EDGE_EXTRA = float(os.environ.get("NHL_LINE_STEAM_EDGE_EXTRA", "0.015"))
 NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
 NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
 NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
@@ -90,6 +96,7 @@ HIA_REF_CALIBRATION = 0.05  # HIA utilisé lors du calcul des lambdas historique
 NHL_MARCHES_ACTIFS = {m.strip().upper() for m in os.environ.get("NHL_MARCHES_ACTIFS", "ML,PL,OU").split(",") if m.strip()}
 RHO_META_FILE = "rho_calibrage_meta.json"
 REFEREE_META_FILE = "referee_calibrage_meta.json"
+ODDS_HISTORY_FILE = "nhl_odds_history.json"
 # Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
 XG_FOR_COLONNES = (
     "flurryScoreVenueAdjustedxGoalsFor",
@@ -110,6 +117,7 @@ _team_recent_logue = False
 _travel_fatigue_logue = False
 _faceoff_adj_logue = False
 _ref_adj_logue = False
+_line_move_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -1661,6 +1669,238 @@ def _traiter_quota_odds_api(response):
     )
 
 
+def _lire_odds_history():
+    default = {"games": {}}
+    if not os.path.exists(ODDS_HISTORY_FILE):
+        return default
+    try:
+        with open(ODDS_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {**default, **data}
+    except Exception:
+        return default
+
+
+def _sauver_odds_history(data):
+    with open(ODDS_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _snapshot_from_cotes(cotes_book, cotes_pl):
+    """Extrait les cotes Pinnacle clés pour historique line movement."""
+    snap = {"ts": datetime.now(timezone.utc).isoformat()}
+    if cotes_book:
+        for key_src, key_dst in (("cote_1", "ml_home"), ("cote_2", "ml_away")):
+            if key_src in cotes_book:
+                snap[key_dst] = round(float(cotes_book[key_src]), 3)
+        if "totals" in cotes_book:
+            snap["totals"] = {}
+            for cut, sides in cotes_book["totals"].items():
+                cut_key = str(_arrondir_cut(cut))
+                snap["totals"][cut_key] = {
+                    side: round(float(price), 3) for side, price in sides.items()
+                }
+    if cotes_pl:
+        for key_src, key_dst in (("cote_pl_home", "pl_home"), ("cote_pl_away", "pl_away")):
+            if key_src in cotes_pl:
+                snap[key_dst] = round(float(cotes_pl[key_src]), 3)
+    return snap
+
+
+def _snapshots_equivalents(a, b):
+    """True si les cotes clés du snapshot n'ont pas bougé (évite doublons)."""
+    for key in ("ml_home", "ml_away", "pl_home", "pl_away"):
+        if key in a or key in b:
+            if not _float_proche(a.get(key, 0), b.get(key, 0), tol=0.005):
+                return False
+    return True
+
+
+def enregistrer_snapshots_cotes(matchs, odds_cache):
+    """Historise les cotes Pinnacle par match (1 entrée/cycle si mouvement)."""
+    if not NHL_LINE_MOVE_ACTIF or not matchs or not odds_cache:
+        return
+
+    data = _lire_odds_history()
+    games = data.setdefault("games", {})
+    now = datetime.now(timezone.utc)
+    actifs = set()
+
+    for m in matchs:
+        gid = str(m["game_id"])
+        actifs.add(gid)
+        cotes = get_odds_for_match(m["home_team"], m["away_team"], odds_cache)
+        if not cotes:
+            continue
+        cotes_pl = get_real_live_odds_puckline(m["home_team"], m["away_team"], odds_cache)
+        snap = _snapshot_from_cotes(cotes, cotes_pl)
+
+        entry = games.setdefault(gid, {
+            "home": m["home_team"],
+            "away": m["away_team"],
+            "snapshots": [],
+        })
+        entry["home"] = m["home_team"]
+        entry["away"] = m["away_team"]
+        snaps = entry.setdefault("snapshots", [])
+        if snaps and _snapshots_equivalents(snaps[-1], snap):
+            continue
+        snaps.append(snap)
+        if NHL_LINE_MAX_SNAPSHOTS > 0 and len(snaps) > NHL_LINE_MAX_SNAPSHOTS:
+            entry["snapshots"] = snaps[-NHL_LINE_MAX_SNAPSHOTS:]
+
+    # Purge matchs terminés / hors fenêtre (> 36 h sans mise à jour)
+    for gid in list(games.keys()):
+        if gid in actifs:
+            continue
+        snaps = games[gid].get("snapshots", [])
+        if not snaps:
+            del games[gid]
+            continue
+        try:
+            last_ts = datetime.fromisoformat(snaps[-1]["ts"].replace("Z", "+00:00"))
+            if (now - last_ts).total_seconds() > 36 * 3600:
+                del games[gid]
+        except Exception:
+            del games[gid]
+
+    _sauver_odds_history(data)
+
+
+def _cote_reference_pour_candidat(snapshot, candidat, m):
+    """Retourne la cote historique correspondant au candidat."""
+    marche = candidat.get("marche", "")
+    type_pari = candidat.get("type", "")
+    if marche == "ML":
+        if m["home_team"] in type_pari:
+            return snapshot.get("ml_home")
+        if m["away_team"] in type_pari:
+            return snapshot.get("ml_away")
+    elif marche == "PL":
+        if m["home_team"] in type_pari:
+            return snapshot.get("pl_home")
+        if m["away_team"] in type_pari:
+            return snapshot.get("pl_away")
+    elif marche == "OU" and "totals" in snapshot:
+        parts = type_pari.split(" ")
+        if len(parts) < 2:
+            return None
+        side = parts[0].capitalize()
+        cut_key = str(_arrondir_cut(parts[1]))
+        ligne = snapshot["totals"].get(cut_key)
+        if ligne and side in ligne:
+            return ligne[side]
+    return None
+
+
+def evaluer_steam_movement(game_id, candidat, m):
+    """
+    Mesure le drift Pinnacle sur notre sélection depuis le snapshot le plus ancien
+    (≥ NHL_LINE_MIN_AGE_MIN). move_pct > 0 = cote allongée = steam contre nous.
+    """
+    if not NHL_LINE_MOVE_ACTIF:
+        return {"contre_nous": False, "move_pct": 0.0, "reference": None, "age_min": 0}
+
+    entry = _lire_odds_history().get("games", {}).get(str(game_id), {})
+    snaps = entry.get("snapshots", [])
+    if len(snaps) < 2:
+        return {"contre_nous": False, "move_pct": 0.0, "reference": None, "age_min": 0}
+
+    now = datetime.now(timezone.utc)
+    ref_snap = None
+    age_min = 0
+    for snap in snaps:
+        try:
+            ts = datetime.fromisoformat(snap["ts"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        delta_min = (now - ts).total_seconds() / 60.0
+        if delta_min >= NHL_LINE_MIN_AGE_MIN:
+            ref_snap = snap
+            age_min = int(delta_min)
+            break
+
+    if ref_snap is None:
+        return {"contre_nous": False, "move_pct": 0.0, "reference": None, "age_min": 0}
+
+    ref_cote = _cote_reference_pour_candidat(ref_snap, candidat, m)
+    try:
+        cote_actuelle = float(candidat.get("cote_book"))
+        ref_cote = float(ref_cote)
+    except (TypeError, ValueError):
+        return {"contre_nous": False, "move_pct": 0.0, "reference": None, "age_min": age_min}
+
+    if ref_cote <= 1.0 or cote_actuelle <= 1.0:
+        return {"contre_nous": False, "move_pct": 0.0, "reference": ref_cote, "age_min": age_min}
+
+    move_pct = (cote_actuelle - ref_cote) / ref_cote
+    return {
+        "contre_nous": move_pct >= NHL_LINE_STEAM_WARN_PCT,
+        "avec_nous": move_pct <= -NHL_LINE_STEAM_WARN_PCT,
+        "move_pct": round(move_pct, 4),
+        "reference": round(ref_cote, 3),
+        "actuelle": round(cote_actuelle, 3),
+        "age_min": age_min,
+    }
+
+
+def filtrer_candidats_line_movement(game_id, candidats, m, gardiens_confirmes=True):
+    """
+    Retire les paris pris contre un steam move Pinnacle (sharp money adverse).
+    Zone intermédiaire : edge minimum majoré de NHL_LINE_STEAM_EDGE_EXTRA.
+    """
+    global _line_move_logue
+    if not NHL_LINE_MOVE_ACTIF or not candidats:
+        return candidats
+
+    if not _line_move_logue:
+        _line_move_logue = True
+        log_nhl(
+            f"📉 Line movement actif — ref ≥{NHL_LINE_MIN_AGE_MIN} min, "
+            f"block ≥{NHL_LINE_STEAM_BLOCK_PCT:.1%} contre, "
+            f"+{NHL_LINE_STEAM_EDGE_EXTRA:.1%} edge si ≥{NHL_LINE_STEAM_WARN_PCT:.1%} contre"
+        )
+
+    edge_min_pct = (EDGE_MINIMUM if gardiens_confirmes else NHL_EDGE_MIN_PROBABLE) * 100
+    edge_min_steam_pct = edge_min_pct + NHL_LINE_STEAM_EDGE_EXTRA * 100
+    filtres = []
+
+    for cand in candidats:
+        steam = evaluer_steam_movement(game_id, cand, m)
+        cand["steam"] = steam
+        move = steam["move_pct"]
+
+        if steam.get("avec_nous") and abs(move) >= NHL_LINE_STEAM_WARN_PCT:
+            log_nhl(
+                f"📈 Steam avec nous — {cand['type']} {move:+.1%} "
+                f"({steam['reference']}→{steam['actuelle']}, {steam['age_min']} min)"
+            )
+
+        if move >= NHL_LINE_STEAM_BLOCK_PCT:
+            log_nhl(
+                f"🚫 Steam block — {cand['type']} {move:+.1%} contre nous "
+                f"({steam['reference']}→{steam['actuelle']}, seuil {NHL_LINE_STEAM_BLOCK_PCT:.1%})"
+            )
+            continue
+
+        if steam["contre_nous"] and cand["inv"]["edge"] < edge_min_steam_pct:
+            log_nhl(
+                f"🚫 Steam edge insuffisant — {cand['type']} {move:+.1%} contre "
+                f"(edge {cand['inv']['edge']:.1f}% < {edge_min_steam_pct:.1f}% requis)"
+            )
+            continue
+
+        if steam["contre_nous"]:
+            log_nhl(
+                f"⚠️ Steam contre mais edge OK — {cand['type']} {move:+.1%} "
+                f"(edge {cand['inv']['edge']:.1f}% ≥ {edge_min_steam_pct:.1f}%)"
+            )
+
+        filtres.append(cand)
+
+    return filtres
+
+
 def get_odds_for_match(home_team_abbrev, away_team_abbrev, odds_cache=None, log_si_absent=False):
     """Retourne les cotes Pinnacle pour un match (depuis le cache ou une requête dédiée)."""
     noms_home = _noms_odds_pour_equipe(home_team_abbrev)
@@ -2257,6 +2497,11 @@ def run_sniper():
             f"📊 Kelly CLV actif — fenêtre {NHL_KELLY_CLV_FENETRE} paris (min {NHL_KELLY_CLV_MIN_PARIS}), "
             f"sensibilité {NHL_KELLY_CLV_SENSIBILITE:.0%}, mult. plancher x{NHL_KELLY_CLV_MULT_MIN:.2f}"
         )
+    if NHL_LINE_MOVE_ACTIF:
+        log_nhl(
+            f"📉 Line movement / steam — snapshots max {NHL_LINE_MAX_SNAPSHOTS}, "
+            f"ref ≥{NHL_LINE_MIN_AGE_MIN} min, block ≥{NHL_LINE_STEAM_BLOCK_PCT:.1%}"
+        )
     if NHL_TRAVEL_FATIGUE_ACTIF:
         log_nhl(
             f"✈️ Fatigue voyage : lookback {NHL_TRAVEL_LOOKBACK_JOURS}j, ref {NHL_TRAVEL_MILES_REF:.0f} mi "
@@ -2314,6 +2559,8 @@ def run_sniper():
                 log_nhl("🏒 Aucun match NHL éligible dans la fenêtre de scan — veille active.")
             else:
                 log_nhl(f"🏒 {len(matchs)} match(s) dans la fenêtre de scan.")
+                if NHL_LINE_MOVE_ACTIF:
+                    enregistrer_snapshots_cotes(matchs, odds_cache)
             for m in matchs:
                 id_match = f"{m['game_id']}_notified"
                 if match_deja_notifie(id_match):
@@ -2419,6 +2666,9 @@ def run_sniper():
                     candidats = _construire_candidats_pari(
                         m, cotes_vraies, cotes_bookmaker, cotes_puckline,
                         bankroll_actuelle, gardiens_verrouilles, kelly_mult=kelly_mult_actuel,
+                    )
+                    candidats = filtrer_candidats_line_movement(
+                        m["game_id"], candidats, m, gardiens_verrouilles,
                     )
                     best_pari = _choisir_meilleur_pari(candidats)
 
