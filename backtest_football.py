@@ -490,8 +490,14 @@ def saison_pour_ligue(ligue_id, annee):
 # 📐  MODÈLE MATHÉMATIQUE (copie des fonctions du bot principal)
 # ─────────────────────────────────────────────────────────────
 def generer_matrice(l_dom, l_ext, rho=-0.12):
-    p_d = [poisson.pmf(i, l_dom) for i in range(10)]
-    p_e = [poisson.pmf(i, l_ext) for i in range(10)]
+    """
+    Matrice Dixon-Coles — taille dynamique alignée sur generer_matrice_dixon() du bot live.
+    Couvre 99.8% de la masse Poisson (min 10, max 15) pour éviter la troncature
+    sur les ligues à fort volume de buts (λ ≥ 3.5).
+    """
+    max_goals = max(10, min(int(np.ceil(poisson.ppf(0.998, max(l_dom, l_ext)))) + 1, 15))
+    p_d = [poisson.pmf(i, l_dom) for i in range(max_goals)]
+    p_e = [poisson.pmf(i, l_ext) for i in range(max_goals)]
     m = np.outer(p_d, p_e).astype(float)
     m[0, 0] *= max(0, 1 - l_dom * l_ext * rho)
     m[1, 0] *= max(0, 1 + l_ext * rho)
@@ -529,48 +535,64 @@ def _x_kelly_total(res_net, cote):
 def ev_ah(mat, h, is_home, cote):
     """EV Asian Handicap — signe et 5 issues identiques au bot principal."""
     esp = 0.0
-    for i in range(10):
-        for j in range(10):
+    n = mat.shape[0]
+    for i in range(n):
+        for j in range(n):
+            prob = mat[i, j]
+            if prob < 0.0001:
+                continue
             diff = (i - j) if is_home else (j - i)
             res_net = diff + h          # ← signe correct (même convention que le bot)
-            esp += mat[i, j] * _payout_ah(res_net, cote)
+            esp += prob * _payout_ah(res_net, cote)
     return esp - 1.0
 
 
 def ev_total(mat, h, is_over, cote):
     """EV Total Asiatique — 5 issues."""
     esp = 0.0
-    for i in range(10):
-        for j in range(10):
+    n = mat.shape[0]
+    for i in range(n):
+        for j in range(n):
+            prob = mat[i, j]
+            if prob < 0.0001:
+                continue
             tot = i + j
             res_net = (tot - h) if is_over else (h - tot)
-            esp += mat[i, j] * _payout_total(res_net, cote)
+            esp += prob * _payout_total(res_net, cote)
     return esp - 1.0
 
 
 def kelly_ah(mat, h, is_home, cote):
     """Kelly mean-variance AH — 5 issues, signe correct."""
     e1, e2 = 0.0, 0.0
-    for i in range(10):
-        for j in range(10):
+    n = mat.shape[0]
+    for i in range(n):
+        for j in range(n):
+            prob = mat[i, j]
+            if prob < 0.0001:
+                continue
             diff = (i - j) if is_home else (j - i)
             res_net = diff + h
             x = _x_kelly_ah(res_net, cote)
-            e1 += mat[i, j] * x
-            e2 += mat[i, j] * x * x
+            e1 += prob * x
+            e2 += prob * x * x
     return (e1 / e2) if e2 > 1e-9 else 0.0
 
 
 def kelly_total(mat, h, is_over, cote):
     """Kelly mean-variance Total — 5 issues."""
     e1, e2 = 0.0, 0.0
-    for i in range(10):
-        for j in range(10):
+    n = mat.shape[0]
+    for i in range(n):
+        for j in range(n):
+            prob = mat[i, j]
+            if prob < 0.0001:
+                continue
             tot = i + j
             res_net = (tot - h) if is_over else (h - tot)
             x = _x_kelly_total(res_net, cote)
-            e1 += mat[i, j] * x
-            e2 += mat[i, j] * x * x
+            e1 += prob * x
+            e2 += prob * x * x
     return (e1 / e2) if e2 > 1e-9 else 0.0
 
 
