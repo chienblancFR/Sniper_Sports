@@ -101,12 +101,24 @@ _xg_colonnes_actives = {"for": None, "against": None}
 _pp_pk_shrink_logue = False
 _gsax_recent_logue = False
 _team_recent_logue = False
+_travel_fatigue_logue = False
+_faceoff_adj_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
 NHL_SCAN_HEURES_AVANCE = float(os.environ.get("NHL_SCAN_HEURES_AVANCE", "18"))
 # Minutes avant le puck drop où l'on arrête de chercher de nouveaux paris
 NHL_MINUTES_AVANT_PUCK = float(os.environ.get("NHL_MINUTES_AVANT_PUCK", "5"))
+NHL_TRAVEL_FATIGUE_ACTIF = _env_bool("NHL_TRAVEL_FATIGUE_ACTIF", True)
+NHL_TRAVEL_LOOKBACK_JOURS = int(os.environ.get("NHL_TRAVEL_LOOKBACK_JOURS", "5"))
+NHL_TRAVEL_MILES_REF = float(os.environ.get("NHL_TRAVEL_MILES_REF", "1500"))
+NHL_TRAVEL_B2B_ATK_PCT = float(os.environ.get("NHL_TRAVEL_B2B_ATK_PCT", "0.04"))
+NHL_TRAVEL_B2B_DEF_PCT = float(os.environ.get("NHL_TRAVEL_B2B_DEF_PCT", "0.06"))
+NHL_TRAVEL_SOLO_ATK_PCT = float(os.environ.get("NHL_TRAVEL_SOLO_ATK_PCT", "0.015"))
+NHL_TRAVEL_SOLO_DEF_PCT = float(os.environ.get("NHL_TRAVEL_SOLO_DEF_PCT", "0.02"))
+NHL_TRAVEL_LONG_MILES = float(os.environ.get("NHL_TRAVEL_LONG_MILES", "1000"))
+NHL_FACEOFF_ADJ_ACTIF = _env_bool("NHL_FACEOFF_ADJ_ACTIF", True)
+NHL_FACEOFF_SENSIBILITE = float(os.environ.get("NHL_FACEOFF_SENSIBILITE", "0.25"))
 
 ETATS_MATCH_EXCLUS = {"FINAL", "OFF", "OFFICIAL", "POSTPONED", "PPD", "LIVE", "CRIT"}
 ETATS_MATCH_PRIORITAIRES = {"FUT", "PRE"}
@@ -144,6 +156,21 @@ NHL_TIMEZONES = {
     "CHI": 1, "DAL": 1, "MIN": 1, "NSH": 1, "STL": 1, "WPG": 1,
     "COL": 2, "UTA": 2, "CGY": 2, "EDM": 2,
     "ANA": 3, "LAK": 3, "SJS": 3, "SEA": 3, "VAN": 3, "VGK": 3
+}
+
+# Coordonnées arènes domicile (lat, lon) — distance réelle vs simple décalage fuseau
+NHL_ARENA_COORDS = {
+    "ANA": (33.8078, -117.8765), "BOS": (42.3662, -71.0621), "BUF": (42.8750, -78.8764),
+    "CGY": (51.0374, -114.0517), "CAR": (35.8033, -78.7219), "CHI": (41.8807, -87.6742),
+    "COL": (39.7487, -105.0077), "CBJ": (39.9692, -83.0061), "DAL": (32.7905, -96.8103),
+    "DET": (42.3411, -83.0553), "EDM": (53.5469, -113.4978), "FLA": (26.1584, -80.3257),
+    "LAK": (34.0430, -118.2673), "MIN": (44.9448, -93.1010), "MTL": (45.4961, -73.5693),
+    "NSH": (36.1592, -86.7785), "NJD": (40.7335, -74.1711), "NYI": (40.7229, -73.5904),
+    "NYR": (40.7505, -73.9934), "OTT": (45.2969, -75.9271), "PHI": (39.9012, -75.1720),
+    "PIT": (40.4394, -79.9892), "SJS": (37.3327, -121.9010), "SEA": (47.6220, -122.3540),
+    "STL": (38.6268, -90.2027), "TBL": (27.9428, -82.4519), "TOR": (43.6435, -79.3791),
+    "UTA": (40.7683, -111.9011), "VAN": (49.2778, -123.1089), "VGK": (36.1029, -115.1784),
+    "WSH": (38.8981, -77.0209), "WPG": (49.8928, -97.1436),
 }
 
 JOURNAL_COLONNES = [
@@ -226,12 +253,18 @@ def _parser_team_stats_csv(texte):
             teams_dict[team] = {
                 "team": team, "xGF_per_game": 0.0, "xGA_per_game": 0.0,
                 "xGF_PP": 0.0, "xGA_PK": 0.0, "games_played": 0,
+                "fo_pct": 0.5,
             }
         gp = max(float(row.get("games_played", 1)), 1)
         if sit == "5on5":
             teams_dict[team]["xGF_per_game"] = round(float(row.get(col_for, 0) or 0) / gp, 3)
             teams_dict[team]["xGA_per_game"] = round(float(row.get(col_against, 0) or 0) / gp, 3)
             teams_dict[team]["games_played"] = int(gp)
+            fo_won = float(row.get("faceOffsWonFor", 0) or 0)
+            fo_lost = float(row.get("faceOffsWonAgainst", 0) or 0)
+            fo_total = fo_won + fo_lost
+            if fo_total > 0:
+                teams_dict[team]["fo_pct"] = round(fo_won / fo_total, 4)
         elif sit == "5on4":
             teams_dict[team]["xGF_PP"] = round(float(row.get(col_for, 0) or 0) / gp, 3)
         elif sit == "4on5":
@@ -282,10 +315,11 @@ def _blend_team_stats(teams_courant, teams_precedent, poids_courant):
             blended.append(team)
             continue
         merged = {"team": team["team"], "games_played": team.get("games_played", 0)}
-        for key in ("xGF_per_game", "xGA_per_game", "xGF_PP", "xGA_PK"):
+        for key in ("xGF_per_game", "xGA_per_game", "xGF_PP", "xGA_PK", "fo_pct"):
             v_n = team.get(key, 0.0)
             v_n1 = prev.get(key, v_n)
-            merged[key] = round(poids_courant * v_n + (1 - poids_courant) * v_n1, 3)
+            prec = 4 if key == "fo_pct" else 3
+            merged[key] = round(poids_courant * v_n + (1 - poids_courant) * v_n1, prec)
         blended.append(merged)
     return blended
 
@@ -308,10 +342,10 @@ def _blend_team_recent_form(teams, teams_recent):
         if not recent or gp_fenetre <= 0:
             continue
         w = min(1.0, gp_fenetre / NHL_TEAM_RECENT_GP_PLEIN) if NHL_TEAM_RECENT_GP_PLEIN > 0 else 1.0
-        for key in ("xGF_per_game", "xGA_per_game", "xGF_PP", "xGA_PK"):
+        for key in ("xGF_per_game", "xGA_per_game", "xGF_PP", "xGA_PK", "fo_pct"):
             base_val = team.get(key, 0.0)
             recent_val = recent.get(key, base_val)
-            team[key] = round(w * recent_val + (1.0 - w) * base_val, 3)
+            team[key] = round(w * recent_val + (1.0 - w) * base_val, 3 if key != "fo_pct" else 4)
         if w < 1.0:
             nb_blend += 1
 
@@ -704,6 +738,71 @@ def get_teams_played_yesterday():
     except:
         return teams_played
 
+
+def _haversine_miles(lat1, lon1, lat2, lon2):
+    """Distance à vol d'oiseau entre deux arènes (miles)."""
+    r_miles = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return r_miles * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _distance_entre_arènes(venue_a, venue_b):
+    """Miles entre deux abréviations d'équipe (arène domicile)."""
+    if venue_a == venue_b:
+        return 0.0
+    coords_a = NHL_ARENA_COORDS.get(venue_a)
+    coords_b = NHL_ARENA_COORDS.get(venue_b)
+    if not coords_a or not coords_b:
+        return 0.0
+    return _haversine_miles(coords_a[0], coords_a[1], coords_b[0], coords_b[1])
+
+
+def get_team_last_game_venues(days_back=None):
+    """
+    Lieu du dernier match terminé par équipe : abréviation de l'équipe à domicile
+    ce jour-là (= ville/arène où le match s'est joué).
+    """
+    if days_back is None:
+        days_back = NHL_TRAVEL_LOOKBACK_JOURS
+    headers = {"User-Agent": "Mozilla/5.0"}
+    etats_finaux = {"FINAL", "OFF", "OFFICIAL"}
+    venues = {}
+
+    for offset in range(1, days_back + 1):
+        date_str = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+        try:
+            response = requests.get(
+                f"https://api-web.nhle.com/v1/score/{date_str}",
+                headers=headers,
+                timeout=10,
+            )
+            if response.status_code != 200:
+                continue
+            for game in response.json().get("games", []):
+                if game.get("gameState") not in etats_finaux:
+                    continue
+                home = game["homeTeam"]["abbrev"]
+                away = game["awayTeam"]["abbrev"]
+                for team in (home, away):
+                    if team not in venues:
+                        venues[team] = home
+        except Exception:
+            continue
+    return venues
+
+
+def get_travel_miles_for_team(team_abbr, game_home_team, last_venues):
+    """Miles parcourus depuis le dernier match jusqu'à l'arène du match du jour."""
+    if not NHL_TRAVEL_FATIGUE_ACTIF or not last_venues:
+        return 0.0
+    last_venue = last_venues.get(team_abbr)
+    if not last_venue:
+        return 0.0
+    return round(_distance_entre_arènes(last_venue, game_home_team), 1)
+
 # ==========================================
 # 3. UTILITAIRES D'IDENTIFICATION
 # ==========================================
@@ -762,40 +861,82 @@ def apply_star_absence_penalty(team_name, base_xgf, base_xga, missing_players_li
 
 def calculate_circadian_fatigue(team_abbrev, opponent_abbrev, is_b2b, is_home):
     """
-    Calcule le modificateur de fatigue basé sur le décalage horaire et le B2B.
+    Modificateur fatigue fuseau horaire + B2B (sans distance).
     Retourne (modificateur_attaque, modificateur_defense).
-    1.0 = Forme normale. < 1.0 = Baisse d'attaque. > 1.0 = Hausse des erreurs défensives.
     """
-    # Pénalité de base pour un Back-to-Back classique (ce qu'on avait avant)
     mod_atk, mod_def = (0.95, 1.10) if is_b2b else (1.0, 1.0)
 
-    # Si l'équipe joue à domicile, on considère qu'elle est "acclimatée" à son fuseau
     if is_home:
         return mod_atk, mod_def
 
     tz_team = NHL_TIMEZONES.get(team_abbrev, 0)
     tz_opp = NHL_TIMEZONES.get(opponent_abbrev, 0)
-
-    # Calcul du décalage horaire absolu traversé
     decalage = abs(tz_team - tz_opp)
 
     if decalage >= 2:
-        # Jet Lag modéré à sévère (ex: Est vers Montagne ou Pacifique)
         if is_b2b:
-            # Le pire scénario possible : B2B + Jet Lag (Schedule Loss)
-            mod_atk *= 0.93  # L'attaque s'effondre
-            mod_def *= 1.15  # La défense craque complètement (+15% de xGA)
+            mod_atk *= 0.93
+            mod_def *= 1.15
         else:
-            # Juste le Jet Lag sans B2B
             mod_atk *= 0.98
             mod_def *= 1.04
-
     elif decalage == 1 and is_b2b:
-        # Petit décalage mais en B2B (ex: Chicago joue à New York le lendemain)
         mod_atk *= 0.97
         mod_def *= 1.05
 
     return round(mod_atk, 3), round(mod_def, 3)
+
+
+def calculate_schedule_fatigue(team_abbrev, opponent_abbrev, is_b2b, is_home, travel_miles=0.0):
+    """
+    Fatigue calendrier : B2B + fuseau horaire + miles parcourus depuis le dernier match.
+    """
+    global _travel_fatigue_logue
+    mod_atk, mod_def = calculate_circadian_fatigue(team_abbrev, opponent_abbrev, is_b2b, is_home)
+
+    if NHL_TRAVEL_FATIGUE_ACTIF and travel_miles > 0 and NHL_TRAVEL_MILES_REF > 0:
+        scale = min(travel_miles / NHL_TRAVEL_MILES_REF, 2.0)
+        if is_b2b:
+            mod_atk *= max(1.0 - NHL_TRAVEL_B2B_ATK_PCT * scale, 0.88)
+            mod_def *= min(1.0 + NHL_TRAVEL_B2B_DEF_PCT * scale, 1.20)
+        elif travel_miles >= NHL_TRAVEL_LONG_MILES:
+            mod_atk *= max(1.0 - NHL_TRAVEL_SOLO_ATK_PCT * scale, 0.95)
+            mod_def *= min(1.0 + NHL_TRAVEL_SOLO_DEF_PCT * scale, 1.10)
+
+    mod_atk = round(mod_atk, 3)
+    mod_def = round(mod_def, 3)
+
+    if not _travel_fatigue_logue and NHL_TRAVEL_FATIGUE_ACTIF:
+        _travel_fatigue_logue = True
+        log_nhl(
+            f"✈️ Fatigue voyage actif — lookback {NHL_TRAVEL_LOOKBACK_JOURS}j, "
+            f"ref {NHL_TRAVEL_MILES_REF:.0f} mi (B2B atk-{NHL_TRAVEL_B2B_ATK_PCT:.0%}/def+{NHL_TRAVEL_B2B_DEF_PCT:.0%} par ref)"
+        )
+    return mod_atk, mod_def
+
+
+def _apply_faceoff_possession_adj(xgf, xga, fo_pct, league_fo_pct):
+    """
+    Ajuste légèrement xGF/xGA selon l'écart de % faceoffs vs moyenne ligue
+    (proxy possession 5v5, complémentaire au xG MoneyPuck).
+    """
+    global _faceoff_adj_logue
+    if not NHL_FACEOFF_ADJ_ACTIF or league_fo_pct <= 0:
+        return xgf, xga
+
+    delta = (fo_pct - league_fo_pct) / max(league_fo_pct, 0.01)
+    delta = max(min(delta, 0.15), -0.15)
+    sens = NHL_FACEOFF_SENSIBILITE
+    atk_mult = 1.0 + sens * delta
+    def_mult = 1.0 - sens * delta * 0.5
+
+    if not _faceoff_adj_logue:
+        _faceoff_adj_logue = True
+        log_nhl(
+            f"🏒 Ajustement faceoffs actif — sensibilité {sens:.2f} "
+            f"(ligue FO≈{league_fo_pct:.1%})"
+        )
+    return round(xgf * atk_mult, 3), round(xga * def_mult, 3)
 
 # ==========================================
 # 4. MOTEUR MATHÉMATIQUE & INTELLIGENCE
@@ -923,6 +1064,7 @@ def optimiser_empty_net_ot(historique_matchs, rho, hia):
 def calculate_master_odds_v4(
     teams_data, home_team, away_team, home_gsax, away_gsax,
     home_is_b2b=False, away_is_b2b=False,
+    home_travel_miles=0.0, away_travel_miles=0.0,
     rho=-0.12, hia=None, prob_tie=None, prob_en=None,
 ):
     if hia is None:
@@ -937,6 +1079,8 @@ def calculate_master_odds_v4(
     league_avg_5v5 = sum(t['xGF_per_game'] for t in teams_data) / len(teams_data)
     league_avg_pp = sum(t['xGF_PP'] for t in teams_data) / len(teams_data)
     safe_league_pp = max(league_avg_pp, 0.01)
+    fo_vals = [t.get("fo_pct", 0.5) for t in teams_data if t.get("fo_pct", 0) > 0]
+    league_fo_pct = sum(fo_vals) / len(fo_vals) if fo_vals else 0.5
 
     home = next((t for t in teams_data if t['team'] == home_team), None)
     away = next((t for t in teams_data if t['team'] == away_team), None)
@@ -948,14 +1092,25 @@ def calculate_master_odds_v4(
     away_xgf = away['xGF_per_game']
     away_xga = away['xGA_per_game']
 
+    home_xgf, home_xga = _apply_faceoff_possession_adj(
+        home_xgf, home_xga, home.get("fo_pct", league_fo_pct), league_fo_pct,
+    )
+    away_xgf, away_xga = _apply_faceoff_possession_adj(
+        away_xgf, away_xga, away.get("fo_pct", league_fo_pct), league_fo_pct,
+    )
+
     home_pp_att = home['xGF_PP']
     home_pk_def = home['xGA_PK']
     away_pp_att = away['xGF_PP']
     away_pk_def = away['xGA_PK']
 
-    # Matrice de Fatigue Circadienne et Kilométrique
-    home_fatigue_atk, home_fatigue_def = calculate_circadian_fatigue(home_team, away_team, home_is_b2b, is_home=True)
-    away_fatigue_atk, away_fatigue_def = calculate_circadian_fatigue(away_team, home_team, away_is_b2b, is_home=False)
+    # Fatigue calendrier : B2B + fuseau + miles parcourus
+    home_fatigue_atk, home_fatigue_def = calculate_schedule_fatigue(
+        home_team, away_team, home_is_b2b, is_home=True, travel_miles=home_travel_miles,
+    )
+    away_fatigue_atk, away_fatigue_def = calculate_schedule_fatigue(
+        away_team, home_team, away_is_b2b, is_home=False, travel_miles=away_travel_miles,
+    )
 
     home_xgf *= home_fatigue_atk
     home_xga *= home_fatigue_def
@@ -1323,9 +1478,11 @@ def get_odds_for_match(home_team_abbrev, away_team_abbrev, odds_cache=None, log_
     return get_odds_for_match(home_team_abbrev, away_team_abbrev, single, log_si_absent)
 
 
-def get_real_live_odds(home_team_abbrev, away_team_abbrev, odds_cache=None):
+def get_real_live_odds(home_team_abbrev, away_team_abbrev, odds_cache=None, log_si_absent=False):
     """Aspire Moneyline et tous les Cuts Over/Under."""
-    cotes = get_odds_for_match(home_team_abbrev, away_team_abbrev, odds_cache)
+    cotes = get_odds_for_match(
+        home_team_abbrev, away_team_abbrev, odds_cache, log_si_absent=log_si_absent,
+    )
     if not cotes:
         return None
     return {k: v for k, v in cotes.items() if k not in ("home_full", "away_full")}
@@ -1811,6 +1968,13 @@ def run_sniper():
             f"🎚️ Kelly dynamique actif — fenêtre {NHL_KELLY_BRIER_FENETRE} paris (min {NHL_KELLY_BRIER_MIN_PARIS}), "
             f"BSS vs baseline théorique, mult. plancher x{NHL_KELLY_MULT_MIN:.2f}"
         )
+    if NHL_TRAVEL_FATIGUE_ACTIF:
+        log_nhl(
+            f"✈️ Fatigue voyage : lookback {NHL_TRAVEL_LOOKBACK_JOURS}j, ref {NHL_TRAVEL_MILES_REF:.0f} mi "
+            f"+ fuseau/B2B (long solo ≥ {NHL_TRAVEL_LONG_MILES:.0f} mi)"
+        )
+    if NHL_FACEOFF_ADJ_ACTIF:
+        log_nhl(f"🏒 Ajustement faceoffs actif — sensibilité {NHL_FACEOFF_SENSIBILITE:.2f}")
     migrer_journal_si_besoin()
 
     while True:
@@ -1839,6 +2003,7 @@ def run_sniper():
             log_nhl("📡 Synchronisation bases de données...")
             teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
             equipes_en_b2b_hier = get_teams_played_yesterday()
+            derniers_lieux = get_team_last_game_venues()
             odds_cache = fetch_all_pinnacle_odds()
 
             if not teams or not goalies:
@@ -1888,6 +2053,14 @@ def run_sniper():
                 if away_b2b:
                     log_nhl(f"🔄 {m['away_team']} détecté en Back-to-Back !")
 
+                home_travel = get_travel_miles_for_team(m['home_team'], m['home_team'], derniers_lieux)
+                away_travel = get_travel_miles_for_team(m['away_team'], m['home_team'], derniers_lieux)
+                if NHL_TRAVEL_FATIGUE_ACTIF and (home_travel >= NHL_TRAVEL_LONG_MILES or away_travel >= NHL_TRAVEL_LONG_MILES):
+                    log_nhl(
+                        f"✈️ Voyage {m['away_team']} @ {m['home_team']} — "
+                        f"dom {home_travel:.0f} mi, vis {away_travel:.0f} mi depuis dernier match"
+                    )
+
                 gsax_ext, gsax_dom = trouver_gsax(g_ext, goalies), trouver_gsax(g_dom, goalies)
                 absents_ext = detecter_stars_absentes(m['away_team'], skaters_ext, stars_vip)
                 absents_dom = detecter_stars_absentes(m['home_team'], skaters_dom, stars_vip)
@@ -1913,6 +2086,7 @@ def run_sniper():
                 cotes_vraies = calculate_master_odds_v4(
                     teams_match, m['home_team'], m['away_team'], gsax_dom, gsax_ext,
                     home_is_b2b=home_b2b, away_is_b2b=away_b2b,
+                    home_travel_miles=home_travel, away_travel_miles=away_travel,
                     rho=rho_actuel, hia=hia_actuel,
                     prob_tie=prob_tie_actuel, prob_en=prob_en_actuel,
                 )
