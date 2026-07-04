@@ -886,6 +886,50 @@ async def calculer_moyennes_venue(conn, ligue_id, saison, avant_date):
     return 1.4, 1.1
 
 
+async def calculer_sos_maps(conn, ligue_id, saison, avant_date):
+    """
+    Force défensive/offensive adverse par équipe — aligné actualiser_stats_ligue().
+    sos_map[tid]        = buts concédés / match (normalise notre attaque)
+    sos_attack_map[tid] = buts marqués / match (normalise notre défense)
+    """
+    async with conn.execute("""
+        SELECT home_id, away_id, gh, ga
+        FROM bt_fixtures
+        WHERE ligue_id=? AND saison=? AND date_utc < ?
+          AND gh IS NOT NULL AND ga IS NOT NULL
+    """, (ligue_id, saison, avant_date)) as cur:
+        rows = await cur.fetchall()
+
+    if not rows:
+        return {}, {}
+
+    teams: dict[int, dict] = {}
+    for home_id, away_id, gh, ga in rows:
+        for tid, gf, ga_team in ((home_id, gh, ga), (away_id, ga, gh)):
+            if tid not in teams:
+                teams[tid] = {'gf': 0, 'ga': 0, 'played': 0}
+            teams[tid]['gf'] += gf
+            teams[tid]['ga'] += ga_team
+            teams[tid]['played'] += 1
+
+    sos, sos_attack = {}, {}
+    for tid, stats in teams.items():
+        j = stats['played'] or 1
+        sos[tid] = stats['ga'] / j
+        sos_attack[tid] = stats['gf'] / j
+    return sos, sos_attack
+
+
+def _xg_shrinkage_targets(venue, m_dom_l, m_ext_l):
+    """Cibles shrinkage off/def selon venue — aligné obtenir_xg_moyenne_async()."""
+    ligue_avg_all = (m_dom_l + m_ext_l) / 2
+    if venue == 'home':
+        return m_dom_l, m_ext_l
+    if venue == 'away':
+        return m_ext_l, m_dom_l
+    return ligue_avg_all, ligue_avg_all
+
+
 async def calculer_mot_luck_bt(conn, ligue_cfg, saison, avant_date):
     """
     Reconstruit mot_map et luck_map à partir des matchs joués AVANT avant_date.
@@ -1142,16 +1186,24 @@ def calculer_lambda_blend(dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e
 
 
 async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, venue='all',
-                                 ligue_avg=1.3, n_prior=None, xg_half_life_days=None):
+                                 ligue_avg=1.3, ligue_avg_def=None, n_prior=None,
+                                 xg_half_life_days=None, sos_map=None, sos_attack_map=None):
     """
     Calcule le xG moyen de l'équipe en utilisant UNIQUEMENT les matchs
     joués AVANT avant_date. Réplique la logique du bot principal :
     - split home/away (venue='home'|'away'|'all')
+    - normalisation SOS (force adverse)
     - decay exponentiel (demi-vie configurable, défaut foot_params)
-    - shrinkage bayésien adaptatif (n_prior)
-    - fallback saison précédente si < 10 matchs
+    - shrinkage bayésien adaptatif (n_prior, cibles off/def séparées)
+    - fallback promu si < 5 matchs (0.85× / 1.25× moyenne ligue)
     Retourne (xg_off, xg_def, n_matchs).
     """
+    if ligue_avg_def is None:
+        ligue_avg_def = ligue_avg
+    if sos_map is None:
+        sos_map = {}
+    if sos_attack_map is None:
+        sos_attack_map = sos_map
     if n_prior is None:
         n_prior = get_n_prior(ligue_id)
     decay = np.log(2) / max(float(xg_half_life_days or get_xg_half_life_days(ligue_id)), 1.0)
@@ -1181,13 +1233,16 @@ async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, ve
 
     # Fallback sur toutes les venues si < 5 matchs dans le venue demandé
     if len(rows) < 5 and venue != 'all':
+        la_all = (ligue_avg + ligue_avg_def) / 2
         return await reconstruire_xg_equipe(
             conn, team_id, ligue_id, avant_date, saison, venue='all',
-            ligue_avg=ligue_avg, n_prior=n_prior, xg_half_life_days=xg_half_life_days,
+            ligue_avg=la_all, ligue_avg_def=la_all, n_prior=n_prior,
+            xg_half_life_days=xg_half_life_days, sos_map=sos_map,
+            sos_attack_map=sos_attack_map,
         )
 
     if len(rows) < 5:
-        return 1.3, 1.1, len(rows)  # Promu / données insuffisantes
+        return ligue_avg * 0.85, (ligue_avg_def or ligue_avg) * 1.25, len(rows)
 
     now = datetime.fromisoformat(avant_date.replace('Z', '+00:00'))
     tp = tc = tw = 0.0
@@ -1200,8 +1255,11 @@ async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, ve
         w = np.exp(-decay * jours)
         if saison_m < saison:
             w *= 0.80
-        tp += xg_p * w
-        tc += xg_c * w
+        opp_id = away_id if home_id == team_id else home_id
+        ratio_def = max(0.6, min(1.6, sos_map.get(opp_id, ligue_avg) / (ligue_avg or 1)))
+        ratio_att = max(0.6, min(1.6, sos_attack_map.get(opp_id, ligue_avg) / (ligue_avg or 1)))
+        tp += (xg_p / ratio_def) * w
+        tc += (xg_c / ratio_att) * w
         tw += w
 
     xg_off_brut = tp / tw
@@ -1210,8 +1268,38 @@ async def reconstruire_xg_equipe(conn, team_id, ligue_id, avant_date, saison, ve
     n = len(rows)
     w_eq = n / (n + n_prior)
     xg_off = w_eq * xg_off_brut + (1 - w_eq) * ligue_avg
-    xg_def = w_eq * xg_def_brut + (1 - w_eq) * ligue_avg
+    xg_def = w_eq * xg_def_brut + (1 - w_eq) * ligue_avg_def
     return xg_off, xg_def, n
+
+
+async def _blend_xg_equipe(conn, team_id, ligue_id, saison, date_utc, side,
+                           m_dom_l, m_ext_l, n_prior, xg_hl, sos_map, sos_attack_map, cache):
+    """
+    Blend venue-spécifique + global — aligné analyser_un_match().
+    side: 'home' | 'away' (venue de l'équipe dans le match simulé).
+    """
+    venue_sp = 'home' if side == 'home' else 'away'
+    la_sp, lad_sp = _xg_shrinkage_targets(venue_sp, m_dom_l, m_ext_l)
+    la_all, lad_all = _xg_shrinkage_targets('all', m_dom_l, m_ext_l)
+
+    async def _fetch(venue, la, lad):
+        key = (team_id, ligue_id, date_utc, saison, venue, n_prior, xg_hl, round(la, 4), round(lad, 4))
+        if key not in cache:
+            cache[key] = await reconstruire_xg_equipe(
+                conn, team_id, ligue_id, date_utc, saison, venue=venue,
+                ligue_avg=la, ligue_avg_def=lad, n_prior=n_prior,
+                xg_half_life_days=xg_hl, sos_map=sos_map, sos_attack_map=sos_attack_map,
+            )
+        return cache[key]
+
+    xg_off_sp, xg_def_sp, n = await _fetch(venue_sp, la_sp, lad_sp)
+    xg_off_gl, xg_def_gl, _ = await _fetch('all', la_all, lad_all)
+    w = min(0.80, (n / 10.0) * 0.80)
+    return (
+        xg_off_sp * w + xg_off_gl * (1 - w),
+        xg_def_sp * w + xg_def_gl * (1 - w),
+        n,
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1230,38 +1318,28 @@ async def _lambdas_pour_match(conn, ligue, saison, date_utc, h_id, a_id,
     ligue_id = ligue['id']
     jour = _jour_cache(date_utc)
 
-    avg_key = (ligue_id, saison, jour, n_prior, xg_half_life)
-    if avg_key not in caches['avg']:
-        caches['avg'][avg_key] = await calculer_ligue_avg(conn, ligue_id, saison, date_utc)
-    avg_ligue = caches['avg'][avg_key]
-
-    async def xg(team, venue):
-        k = (team, ligue_id, date_utc, saison, venue, n_prior, xg_half_life)
-        if k not in caches['xg']:
-            caches['xg'][k] = await reconstruire_xg_equipe(
-                conn, team, ligue_id, date_utc, saison, venue=venue,
-                ligue_avg=avg_ligue, n_prior=n_prior, xg_half_life_days=xg_half_life,
-            )
-        return caches['xg'][k]
-
-    xg_off_d_sp, xg_def_d_sp, n_d = await xg(h_id, 'home')
-    xg_off_e_sp, xg_def_e_sp, n_e = await xg(a_id, 'away')
-    xg_off_d_gl, xg_def_d_gl, _ = await xg(h_id, 'all')
-    xg_off_e_gl, xg_def_e_gl, _ = await xg(a_id, 'all')
-
-    def w_venue(n_spec, max_w=0.80):
-        return min(max_w, (n_spec / 10.0) * max_w)
-
-    wd, we = w_venue(n_d), w_venue(n_e)
-    xg_off_d = xg_off_d_sp * wd + xg_off_d_gl * (1 - wd)
-    xg_def_d = xg_def_d_sp * wd + xg_def_d_gl * (1 - wd)
-    xg_off_e = xg_off_e_sp * we + xg_off_e_gl * (1 - we)
-    xg_def_e = xg_def_e_sp * we + xg_def_e_gl * (1 - we)
-
     venue_key = (ligue_id, saison, jour)
     if venue_key not in caches['venue']:
         caches['venue'][venue_key] = await calculer_moyennes_venue(conn, ligue_id, saison, date_utc)
     m_dom_l, m_ext_l = caches['venue'][venue_key]
+
+    if 'sos' not in caches:
+        caches['sos'] = {}
+    sos_key = (ligue_id, saison, jour)
+    if sos_key not in caches['sos']:
+        caches['sos'][sos_key] = await calculer_sos_maps(conn, ligue_id, saison, date_utc)
+    sos_map, sos_attack_map = caches['sos'][sos_key]
+
+    if 'xg' not in caches:
+        caches['xg'] = {}
+    xg_off_d, xg_def_d, _ = await _blend_xg_equipe(
+        conn, h_id, ligue_id, saison, date_utc, 'home', m_dom_l, m_ext_l,
+        n_prior, xg_half_life, sos_map, sos_attack_map, caches['xg'],
+    )
+    xg_off_e, xg_def_e, _ = await _blend_xg_equipe(
+        conn, a_id, ligue_id, saison, date_utc, 'away', m_dom_l, m_ext_l,
+        n_prior, xg_half_life, sos_map, sos_attack_map, caches['xg'],
+    )
 
     mot_luck_key = (ligue_id, saison, jour)
     if mot_luck_key not in caches['mot_luck']:
@@ -1298,7 +1376,7 @@ async def _log_prob_score(conn, ligue, match_row, params, caches):
 
 
 async def _eval_params_walkforward(conn, ligue, fixtures, params, start_idx=0):
-    caches = {'avg': {}, 'xg': {}, 'venue': {}, 'mot_luck': {}, 'dc': {}}
+    caches = {'xg': {}, 'venue': {}, 'sos': {}, 'mot_luck': {}, 'dc': {}}
     total, n = 0.0, 0
     for row in fixtures[start_idx:]:
         ll = await _log_prob_score(conn, ligue, row, params, caches)
@@ -1452,8 +1530,9 @@ async def simuler_paris(conn, ligues=None):
         signaux = 0
         pending = []
         dc_cache = {}
-        avg_cache = {}
         venue_cache = {}
+        sos_cache = {}
+        xg_cache = {}
         mot_luck_cache = {}
 
         for idx, (fid, saison, date_utc, h_id, a_id, h_name, a_name, gh, ga) in enumerate(fixtures, 1):
@@ -1468,58 +1547,34 @@ async def simuler_paris(conn, ligues=None):
                 continue
 
             jour = _jour_cache(date_utc)
-            avg_key = (ligue['id'], saison, jour)
-            if avg_key not in avg_cache:
-                avg_cache[avg_key] = await calculer_ligue_avg(
-                    conn, ligue['id'], saison, date_utc
-                )
-            avg_ligue = avg_cache[avg_key]
-            n_prior_l = get_n_prior(ligue['id'])
-            xg_hl = get_xg_half_life_days(ligue['id'])
-            dc_hl = get_dc_half_life_days(ligue['id'])
 
-            # Reconstituer xG AVANT ce match — split home/away + global comme le bot principal
-            xg_off_d_sp, xg_def_d_sp, n_d = await reconstruire_xg_equipe(
-                conn, h_id, ligue['id'], date_utc, saison, venue='home',
-                ligue_avg=avg_ligue, n_prior=n_prior_l, xg_half_life_days=xg_hl,
-            )
-            xg_off_e_sp, xg_def_e_sp, n_e = await reconstruire_xg_equipe(
-                conn, a_id, ligue['id'], date_utc, saison, venue='away',
-                ligue_avg=avg_ligue, n_prior=n_prior_l, xg_half_life_days=xg_hl,
-            )
-
-            # Filtre : ignorer si l'une des équipes manque d'historique suffisant
-            if n_d < 8 or n_e < 8:
-                continue
-
-            # Venue blending adaptatif : réplique w_venue() du bot
-            # Moins de matchs venue-spécifiques → on se fie davantage aux stats globales
-            xg_off_d_gl, xg_def_d_gl, _ = await reconstruire_xg_equipe(
-                conn, h_id, ligue['id'], date_utc, saison, venue='all',
-                ligue_avg=avg_ligue, n_prior=n_prior_l, xg_half_life_days=xg_hl,
-            )
-            xg_off_e_gl, xg_def_e_gl, _ = await reconstruire_xg_equipe(
-                conn, a_id, ligue['id'], date_utc, saison, venue='all',
-                ligue_avg=avg_ligue, n_prior=n_prior_l, xg_half_life_days=xg_hl,
-            )
-
-            def w_venue(n_spec, max_w=0.80):
-                return min(max_w, (n_spec / 10.0) * max_w)
-
-            wd = w_venue(n_d)
-            we = w_venue(n_e)
-            xg_off_d = xg_off_d_sp * wd + xg_off_d_gl * (1.0 - wd)
-            xg_def_d = xg_def_d_sp * wd + xg_def_d_gl * (1.0 - wd)
-            xg_off_e = xg_off_e_sp * we + xg_off_e_gl * (1.0 - we)
-            xg_def_e = xg_def_e_sp * we + xg_def_e_gl * (1.0 - we)
-
-            # Moyennes venue ligue + estimation DC (cache hebdomadaire, cron ~bot live)
             venue_key = (ligue['id'], saison, jour)
             if venue_key not in venue_cache:
                 venue_cache[venue_key] = await calculer_moyennes_venue(
                     conn, ligue['id'], saison, date_utc
                 )
             m_dom_l, m_ext_l = venue_cache[venue_key]
+
+            sos_key = (ligue['id'], saison, jour)
+            if sos_key not in sos_cache:
+                sos_cache[sos_key] = await calculer_sos_maps(
+                    conn, ligue['id'], saison, date_utc
+                )
+            sos_map, sos_attack_map = sos_cache[sos_key]
+
+            n_prior_l = get_n_prior(ligue['id'])
+            xg_hl = get_xg_half_life_days(ligue['id'])
+            dc_hl = get_dc_half_life_days(ligue['id'])
+
+            # Reconstituer xG AVANT ce match — SOS + shrinkage off/def + blend venue (bot live)
+            xg_off_d, xg_def_d, _ = await _blend_xg_equipe(
+                conn, h_id, ligue['id'], saison, date_utc, 'home', m_dom_l, m_ext_l,
+                n_prior_l, xg_hl, sos_map, sos_attack_map, xg_cache,
+            )
+            xg_off_e, xg_def_e, _ = await _blend_xg_equipe(
+                conn, a_id, ligue['id'], saison, date_utc, 'away', m_dom_l, m_ext_l,
+                n_prior_l, xg_hl, sos_map, sos_attack_map, xg_cache,
+            )
 
             mot_luck_key = (ligue['id'], saison, jour)
             if mot_luck_key not in mot_luck_cache:
