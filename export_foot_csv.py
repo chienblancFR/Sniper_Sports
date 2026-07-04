@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import shutil
 import sqlite3
 import sys
 
 PA_DATA_DIR = "/home/chienblanc/data"
+PA_CSV_LEGACY = os.path.join(os.path.expanduser("~"), "historique_sniper.csv")
 DEFAULT_DB = "sniper_data.db"
 DEFAULT_CSV = (
     f"{PA_DATA_DIR}/historique_sniper.csv"
@@ -48,6 +50,27 @@ _EXTRA_COLS = [
 def _colonnes_disponibles(conn: sqlite3.Connection) -> set[str]:
     cur = conn.execute("PRAGMA table_info(paris_log)")
     return {row[1] for row in cur.fetchall()}
+
+
+def _miroir_csv_legacy(csv_path: str) -> list[str]:
+    """
+    Sur PA, le static /data/ pointe parfois sur ~/ et non ~/data/.
+    Copie le CSV canonique vers ~/historique_sniper.csv pour l'URL publique.
+    """
+    legacy = os.environ.get("FOOT_CSV_LEGACY", PA_CSV_LEGACY)
+    copies = []
+    if not os.path.isdir(PA_DATA_DIR):
+        return copies
+    if not csv_path.startswith(PA_DATA_DIR):
+        return copies
+    if os.path.abspath(csv_path) == os.path.abspath(legacy):
+        return copies
+    try:
+        shutil.copy2(csv_path, legacy)
+        copies.append(legacy)
+    except OSError as e:
+        print(f"⚠️ Copie legacy impossible ({legacy}) : {e}", file=sys.stderr)
+    return copies
 
 
 def export_csv(db_path: str, csv_path: str) -> int:
@@ -96,6 +119,8 @@ def export_csv(db_path: str, csv_path: str) -> int:
         if idx_statut >= 0 and r[idx_statut] == "PENDING"
     )
     print(f"✅ {len(rows)} paris exportés ({pending} PENDING) → {csv_path}")
+    for mirror in _miroir_csv_legacy(csv_path):
+        print(f"   ↳ copie static legacy → {mirror}")
     return 0
 
 

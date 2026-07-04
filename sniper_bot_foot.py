@@ -1167,6 +1167,7 @@ async def envoyer_telegram_async(session, msg):
 HISTORIQUE_CSV_LOCAL = "historique_sniper.csv"
 PA_DATA_DIR = "/home/chienblanc/data"
 HISTORIQUE_CSV_PA = f"{PA_DATA_DIR}/{HISTORIQUE_CSV_LOCAL}"
+PA_CSV_LEGACY = os.path.join(os.path.expanduser("~"), HISTORIQUE_CSV_LOCAL)
 
 _PARIS_LOG_EXPORT_SQL = """
     SELECT
@@ -1222,6 +1223,20 @@ def publier_historique_dashboard(csv_path: str | None = None):
         log_info(f"⚠️ Upload FTP historique foot échoué : {e}")
 
 
+def _miroir_csv_legacy(csv_path: str) -> None:
+    """Copie vers ~/historique_sniper.csv si le static PA sert ~/ et non ~/data/."""
+    legacy = os.environ.get("FOOT_CSV_LEGACY", PA_CSV_LEGACY)
+    if not os.path.isdir(PA_DATA_DIR) or not csv_path.startswith(PA_DATA_DIR):
+        return
+    if os.path.abspath(csv_path) == os.path.abspath(legacy):
+        return
+    try:
+        shutil.copy2(csv_path, legacy)
+        log_info(f"📄 CSV copié (static legacy) → {legacy}")
+    except OSError as e:
+        log_info(f"⚠️ Copie CSV legacy échouée : {e}")
+
+
 async def exporter_historique_csv():
     """
     Exporte paris_log vers le CSV lu par le dashboard Streamlit.
@@ -1241,6 +1256,7 @@ async def exporter_historique_csv():
         writer.writerows(rows)
 
     log_info(f"📄 CSV exporté ({len(rows)} paris) → {csv_path}")
+    _miroir_csv_legacy(csv_path)
     publier_historique_dashboard(csv_path)
 
 async def actualiser_kelly_adaptatif():

@@ -40,6 +40,7 @@ URL_FOOT      = "https://chienblanc.pythonanywhere.com/data/historique_sniper.cs
 URL_BACKTEST  = "https://chienblanc.pythonanywhere.com/data/backtest_results.csv"
 CAPITAL_INITIAL = 100.0
 PA_DATA_DIR = "/home/chienblanc/data"
+PA_CSV_LEGACY = os.path.join(os.path.expanduser("~"), "historique_sniper.csv")
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 LIGUE_NOMS = {
@@ -60,6 +61,8 @@ def _candidats_fichiers(nom: str) -> list[str]:
         paths.append(os.environ[env_key])
     if os.path.isdir(PA_DATA_DIR):
         paths.append(os.path.join(PA_DATA_DIR, nom))
+        if nom == "historique_sniper.csv":
+            paths.append(PA_CSV_LEGACY)
     paths.extend([
         os.path.join(_SCRIPT_DIR, nom),
         os.path.join(os.getcwd(), nom),
