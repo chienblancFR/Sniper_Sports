@@ -1524,43 +1524,57 @@ async def simuler_paris(conn, ligues=None):
 
             # Parcourir les marchés — collecter tous les signaux valides pour ce fixture
             home_name_odds = NAME_MAPPING.get(h_name, h_name)
-            candidats = []  # (ev_final, market, outcome, h_val, cote_h24, k, mise, is_home)
+            candidats = []  # (ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag)
 
             ev_min_l = ligue.get('ev_min', 0.05)
             ev_max_l = ligue.get('ev_max', 0.15)
 
-            # Index (market, h_val) → cotes des deux côtés pour calcul no-vig
-            # Le partenaire d'un outcome (spreads, h) est l'outcome (spreads, -h)
-            partner_cote: dict = {}
+            # Index cotes partenaires pour no-vig (Shin) — aligné sniper_bot_foot.py
+            # spreads : partenaire à handicap opposé (-h)
+            # totals  : partenaire à même ligne (Over ↔ Under)
+            spreads_partner: dict = {}
+            totals_partner: dict = {}
             for mk, out, hv, c in odds_h24:
                 if mk == 'spreads':
-                    partner_cote[(mk, hv)] = c
+                    spreads_partner[(mk, hv)] = c
+                elif mk == 'totals':
+                    totals_partner[(hv, out.lower())] = c
 
             # Blend EV dynamique — à H-24 : poids_dyn ≈ 23.2% (formule bot recalibrée)
             poids_dyn = calculer_poids_dyn(H_ODDS_BACKTEST)
 
             for market, outcome, h_val, cote_h24 in odds_h24:
-                # Handicap Asiatique uniquement — les Totaux n'ont pas d'edge démontré
-                if market != 'spreads':
+                if market not in ('spreads', 'totals'):
                     continue
 
                 if cote_h24 < MIN_COTE:
                     continue
 
-                is_home = (outcome == home_name_odds) or (
-                    process.extractOne(outcome, [home_name_odds])[1] > 85
-                )
-
-                ev_modele = ev_ah(mat, h_val, is_home, cote_h24)
-                k = kelly_ah(mat, h_val, is_home, cote_h24)
-
-                # EV Pinnacle no-vig (Shin) — aligné sur sniper_bot_foot.py
-                cote_partner = partner_cote.get((market, -h_val))
-                if cote_partner and cote_partner > 1.0:
-                    cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
-                    ev_pinnacle = ev_ah(mat, h_val, is_home, cote_novig)
+                if market == 'spreads':
+                    is_home = (outcome == home_name_odds) or (
+                        process.extractOne(outcome, [home_name_odds])[1] > 85
+                    )
+                    ev_modele = ev_ah(mat, h_val, is_home, cote_h24)
+                    k = kelly_ah(mat, h_val, is_home, cote_h24)
+                    cote_partner = spreads_partner.get((market, -h_val))
+                    if cote_partner and cote_partner > 1.0:
+                        cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
+                        ev_pinnacle = ev_ah(mat, h_val, is_home, cote_novig)
+                    else:
+                        ev_pinnacle = ev_modele
+                    side_flag = is_home
                 else:
-                    ev_pinnacle = ev_modele  # fallback si partenaire absent
+                    is_over = outcome.lower() == 'over'
+                    ev_modele = ev_total(mat, h_val, is_over, cote_h24)
+                    k = kelly_total(mat, h_val, is_over, cote_h24)
+                    partner_side = 'under' if is_over else 'over'
+                    cote_partner = totals_partner.get((h_val, partner_side))
+                    if cote_partner and cote_partner > 1.0:
+                        cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
+                        ev_pinnacle = ev_total(mat, h_val, is_over, cote_novig)
+                    else:
+                        ev_pinnacle = ev_modele
+                    side_flag = is_over
 
                 ev_final = ev_modele * poids_dyn + ev_pinnacle * (1.0 - poids_dyn)
 
@@ -1571,7 +1585,7 @@ async def simuler_paris(conn, ligues=None):
                 if mise < 0.1:
                     continue
 
-                candidats.append((ev_final, market, outcome, h_val, cote_h24, k, mise, is_home))
+                candidats.append((ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag))
 
             if not candidats:
                 continue
