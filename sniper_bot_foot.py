@@ -737,6 +737,8 @@ NAME_MAPPING = {
     "IFK Norrköping":           "IFK Norrkoping",
     "Mjällby AIF":              "Mjallby",
     "Halmstads BK":             "Halmstad",
+    "Västerås SK":              "Vasteras SK FK",
+    "Vasteras SK FK":           "Västerås SK",
     "IK Sirius FK":             "Sirius",
     "Varbergs BoIS FC":         "Varbergs BoIS",
     "GIF Sundsvall":            "Sundsvall",
@@ -2425,6 +2427,74 @@ async def traiter_une_ligue(session, ligue) -> int:
 
     return n_matchs
 
+
+def _handicap_clv_proche(h_pari: float, h_api: float) -> bool:
+    """PK (0 / -0) et lignes asiatiques : tolérance 0.01."""
+    a, b = float(h_pari), float(h_api)
+    if abs(a) < 0.01 and abs(b) < 0.01:
+        return True
+    return abs(a - b) < 0.01
+
+
+def _trouver_outcome_clv(market, equipe, handicap, market_key, eq_dom="", eq_ext=""):
+    """Match outcome Pinnacle — fuzzy sur les noms d'équipe (spreads)."""
+    if market_key == 'totals':
+        return next(
+            (o for o in market['outcomes']
+             if o['name'] == equipe and _handicap_clv_proche(handicap, float(o.get('point', 0)))),
+            None,
+        )
+    best, best_score = None, 0
+    for o in market['outcomes']:
+        if o['name'].lower() in ('over', 'under'):
+            continue
+        if not _handicap_clv_proche(handicap, float(o.get('point', 0))):
+            continue
+        score = process.extractOne(equipe, [o['name']])[1]
+        if score > best_score:
+            best_score, best = score, o
+    if best_score >= 80:
+        return best
+    # Fallback : nom stocké = home/away odds au moment du pari
+    for o in market['outcomes']:
+        if o['name'].lower() in ('over', 'under'):
+            continue
+        if not _handicap_clv_proche(handicap, float(o.get('point', 0))):
+            continue
+        if o['name'] in (eq_dom, eq_ext):
+            return o
+    return None
+
+
+def _cfg_ligue_depuis_tag(ligue_tag: str):
+    ligue_nom = ligue_tag.split(' [')[0].strip()
+    cfg = next((l for l in CHAMPIONNATS if l['nom'] == ligue_nom), None)
+    if cfg:
+        return cfg
+    return next((l for l in CHAMPIONNATS if l['nom'].replace('🇸🇪 ', '').replace('🇫🇷 ', '') in ligue_nom
+                 or ligue_nom.endswith(l['nom'].split()[-1])), None)
+
+
+async def _mins_prochain_kickoff_pending() -> float | None:
+    """Minutes avant le prochain KO d'un pari PENDING (pour accélérer le scan)."""
+    async with db_lock:
+        async with db_conn.execute(
+            "SELECT kickoff FROM paris_log WHERE statut='PENDING' AND kickoff IS NOT NULL"
+        ) as cursor:
+            rows = await cursor.fetchall()
+    now = datetime.now(timezone.utc)
+    prochains = []
+    for (kickoff,) in rows:
+        try:
+            ko_dt = datetime.fromisoformat(kickoff.replace('Z', '+00:00'))
+            mins = (ko_dt - now).total_seconds() / 60
+            if mins > 0:
+                prochains.append(mins)
+        except Exception:
+            pass
+    return min(prochains) if prochains else None
+
+
 async def tracker_clv_async(session):
     """
     Tracker CLV dédié — tourne à chaque cycle du scan.
@@ -2436,8 +2506,11 @@ async def tracker_clv_async(session):
          (clv_notifie passe de 0 à 1 pour éviter le spam)
 
     CLV = (cote_prise / cote_clôture) - 1
-      > 0 : on a pris des cotes meilleures que le marché final → edge confirmé
-      < 0 : le marché a remonté → signal d'erreur de modèle
+
+    Alertes Telegram (fenêtres élargies vs scan 5–15 min) :
+      • clv_notifie=0 : pré-clôture H-90 → H-15
+      • clv_notifie=1 : closing H-20 → H-0
+      • rattrapage    : clv_notifie=0 et H-12 → H-0 (si fenêtre H-60 ratée)
     """
     async with db_lock:
         async with db_conn.execute(
@@ -2469,9 +2542,9 @@ async def tracker_clv_async(session):
                 pass
 
         market_key = 'spreads' if '[spreads]' in ligue_tag else 'totals'
-        ligue_nom = ligue_tag.split(' [')[0]
-        ligue_cfg = next((l for l in CHAMPIONNATS if l['nom'] == ligue_nom), None)
+        ligue_cfg = _cfg_ligue_depuis_tag(ligue_tag)
         if not ligue_cfg:
+            log_info(f"[CLV] Ligue inconnue dans tag : {ligue_tag}")
             continue
 
         cle = (ligue_cfg['key'], market_key)
@@ -2500,32 +2573,29 @@ async def tracker_clv_async(session):
                 None
             )
             if not event:
+                log_info(f"[CLV] Event introuvable : {eq_dom} vs {eq_ext} ({sport_key})")
                 continue
 
             pinnacle = next((b for b in event.get('bookmakers', []) if b['key'] == 'pinnacle'), None)
             if not pinnacle:
+                log_info(f"[CLV] Pinnacle absent : {eq_dom} vs {eq_ext}")
                 continue
 
             market = next((mkt for mkt in pinnacle['markets'] if mkt['key'] == market_key), None)
             if not market:
                 continue
 
-            # Outcome exact : même nom (équipe ou Over/Under) et même handicap
-            outcome = next(
-                (o for o in market['outcomes']
-                 if o['name'] == equipe and abs(float(o.get('point', 0)) - handicap) < 0.01),
-                None
+            outcome = _trouver_outcome_clv(
+                market, equipe, handicap, market_key, eq_dom, eq_ext
             )
             if not outcome:
+                log_info(f"[CLV] Outcome introuvable : {equipe} ({handicap:+.2g}) — {eq_dom} vs {eq_ext}")
                 continue
 
             cote_actuelle = float(outcome['price'])
             clv_val = round((cote_prise / cote_actuelle) - 1, 4)
 
-            # Déterminer si une alerte CLV doit être envoyée
-            # Deux fenêtres :
-            #   • H-60 : pré-clôture (XI officiel connu, Pinnacle commence à serrer)
-            #   • H-5  : vraie closing line de référence (marché au plus sharp)
+            # Fenêtres élargies (scan toutes les 5–15 min)
             envoyer_alerte = False
             label_alerte = ""
             mins_avant = None
@@ -2535,13 +2605,15 @@ async def tracker_clv_async(session):
                     ko_dt = datetime.fromisoformat(kickoff.replace('Z', '+00:00'))
                     mins_avant = (ko_dt - now).total_seconds() / 60
 
-                    if clv_notifie == 0 and 55 <= mins_avant <= 65:
+                    if clv_notifie == 0 and 15 <= mins_avant <= 90:
                         envoyer_alerte = True
-                        label_alerte = "⏱️ Pré-clôture H-60 (XI confirmé)"
-                    elif clv_notifie == 1 and 3 <= mins_avant <= 8:
-                        # Deuxième alerte : vraie closing line
+                        label_alerte = "⏱️ Pré-clôture H-60 (fenêtre élargie)"
+                    elif clv_notifie == 0 and 0 < mins_avant < 15:
                         envoyer_alerte = True
-                        label_alerte = "🔒 Closing line H-5 (référence sharp)"
+                        label_alerte = "⏰ CLV avant coup d'envoi (rattrapage)"
+                    elif clv_notifie == 1 and 0 <= mins_avant <= 20:
+                        envoyer_alerte = True
+                        label_alerte = "🔒 Closing line pré-KO"
                 except Exception:
                     pass
 
@@ -2596,32 +2668,39 @@ async def lancer_scan_global_async() -> int:
     return matchs_detectes
 
 
-def calculer_pause(matchs_detectes: int) -> int:
+def calculer_pause(matchs_detectes: int, mins_pending_ko: float | None = None) -> int:
     """
     Durée de pause adaptative selon l'activité détectée.
 
     Logique :
-      • Matchs dans les 2h     →  5 min  (mode actif, suivi rapproché)
-      • Matchs dans 2-24h      → 15 min  (mode veille, scan toutes les 15 min)
-      • Aucun match aujourd'hui → 60 min  (mode économie, limite API préservée)
+      • Pari PENDING dans < 2h   →  5 min  (suivi CLV rapproché)
+      • Matchs dans les 2h       →  5 min  (mode actif)
+      • Pari PENDING dans < 6h   → 10 min
+      • Matchs dans 2-24h        → 15 min  (mode veille)
+      • Aucun match aujourd'hui  → 60 min  (mode économie)
     """
     now_utc = datetime.now(timezone.utc)
     prochains = []
     for dt in cache_heures_matchs.values():
-        # Normaliser en UTC-aware pour la comparaison
         dt_aware = dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
         if dt_aware > now_utc:
             prochains.append(dt_aware)
 
+    if mins_pending_ko is not None:
+        if mins_pending_ko <= 120:
+            return 300
+        if mins_pending_ko <= 360:
+            return 600
+
     if prochains:
         mins_prochain = (min(prochains) - now_utc).total_seconds() / 60
         if mins_prochain <= 120:
-            return 300      # 5 min
+            return 300
         if mins_prochain <= 1440:
-            return 900      # 15 min
+            return 900
     if matchs_detectes > 0:
-        return 900          # 15 min
-    return 3600             # 60 min
+        return 900
+    return 3600
 
 
 async def main_loop():
@@ -2704,7 +2783,8 @@ async def main_loop():
                 log_info("🧮 Paramètres DC complets recalculés pour toutes les ligues.")
 
             matchs = await lancer_scan_global_async()
-            pause = calculer_pause(matchs)
+            mins_ko = await _mins_prochain_kickoff_pending()
+            pause = calculer_pause(matchs, mins_pending_ko=mins_ko)
             pause_label = f"{pause//60} min" if pause >= 60 else f"{pause}s"
             log_info(f"😴 Pause adaptative : {pause_label} "
                      f"({'mode actif' if pause == 300 else 'mode veille' if pause == 900 else 'mode économie'}).")
