@@ -99,6 +99,8 @@ NHL_LIGUE_CALIB_MAX_GAMES = int(os.environ.get("NHL_LIGUE_CALIB_MAX_GAMES", "140
 # Pondération temporelle MLE : les matchs récents comptent plus (demi-vie en jours)
 NHL_MLE_RECENCY_ACTIF = _env_bool("NHL_MLE_RECENCY_ACTIF", True)
 NHL_MLE_RECENCY_HALFLIFE_JOURS = float(os.environ.get("NHL_MLE_RECENCY_HALFLIFE_JOURS", "28"))
+NHL_MARCHE_COHERENCE_ACTIF = _env_bool("NHL_MARCHE_COHERENCE_ACTIF", True)
+NHL_REF_SHRINK_ACTIF = _env_bool("NHL_REF_SHRINK_ACTIF", True)
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
 HIA_REF_CALIBRATION = 0.05  # HIA utilisé lors du calcul des lambdas historiques du journal
@@ -128,6 +130,8 @@ _travel_fatigue_logue = False
 _faceoff_adj_logue = False
 _ref_adj_logue = False
 _line_move_logue = False
+_marche_coherence_logue = False
+_ref_shrink_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -984,7 +988,7 @@ def compute_referee_pp_multiplier(referee_names):
     Multiplicateur PP/PK selon la tendance pénalités du crew vs moyenne ligue.
     Retourne (mult, info_dict ou None).
     """
-    global _ref_adj_logue
+    global _ref_adj_logue, _ref_shrink_logue
     if not NHL_REF_ADJ_ACTIF or not referee_names:
         return 1.0, None
 
@@ -994,19 +998,42 @@ def compute_referee_pp_multiplier(referee_names):
         return 1.0, None
 
     ppg_samples = []
+    poids_samples = []
     known_refs = []
     for name in referee_names:
         key = _normaliser_nom_arbitre(name)
         ref_data = meta.get("referees", {}).get(key)
-        if not ref_data or ref_data.get("games", 0) < NHL_REF_MIN_MATCHS:
+        if not ref_data or ref_data.get("games", 0) < 1:
             continue
-        ppg_samples.append(ref_data["penalties"] / ref_data["games"])
+        games = ref_data["games"]
+        if NHL_REF_SHRINK_ACTIF:
+            if games < NHL_REF_MIN_MATCHS:
+                poids = min(1.0, games / NHL_REF_MIN_MATCHS)
+            else:
+                poids = 1.0
+        else:
+            if games < NHL_REF_MIN_MATCHS:
+                continue
+            poids = 1.0
+        ppg_samples.append(ref_data["penalties"] / games)
+        poids_samples.append(poids)
         known_refs.append(ref_data.get("name", name))
 
     if not ppg_samples:
         return 1.0, None
 
-    crew_ppg = sum(ppg_samples) / len(ppg_samples)
+    if NHL_REF_SHRINK_ACTIF:
+        poids_total = sum(poids_samples)
+        if poids_total < 0.15:
+            return 1.0, None
+        crew_ppg = sum(p * w for p, w in zip(ppg_samples, poids_samples)) / poids_total
+        if not _ref_shrink_logue:
+            _ref_shrink_logue = True
+            log_nhl(
+                f"👨‍⚖️ Shrinkage arbitral progressif — confiance pleine à {NHL_REF_MIN_MATCHS} matchs/arbitre"
+            )
+    else:
+        crew_ppg = sum(ppg_samples) / len(ppg_samples)
     rel = (crew_ppg - league_ppg) / league_ppg
     rel = max(min(rel, 0.25), -0.25)
     mult = round(max(min(1.0 + NHL_REF_SENSIBILITE * rel, 1.12), 0.88), 3)
@@ -1516,6 +1543,63 @@ def _blend_proba_marche(prob_modele_a, prob_modele_b, cote_marche_a, cote_marche
     return blend_a / total, blend_b / total
 
 
+def _appliquer_coherence_marches(cotes):
+    """
+    Garde-fous après shrinkage marché indépendant par marché :
+    - Puck line ≤ moneyline (gagner par 2+ ne peut pas être plus probable que gagner)
+    - Over décroissant / Under croissant entre les cuts (4.5 → 7.5)
+    - Renormalisation Over+Under = 1 par cut
+    """
+    global _marche_coherence_logue
+    if not NHL_MARCHE_COHERENCE_ACTIF or not cotes:
+        return cotes, []
+
+    resultat = dict(cotes)
+    corrections = []
+
+    if "prob_1" in resultat and "prob_pl_home" in resultat:
+        if resultat["prob_pl_home"] > resultat["prob_1"] + FLOAT_TOL:
+            resultat["prob_pl_home"] = resultat["prob_1"]
+            resultat["cote_pl_home"] = round(1 / max(resultat["prob_pl_home"], 0.001), 2)
+            corrections.append("PL dom ≤ ML")
+    if "prob_2" in resultat and "prob_pl_away" in resultat:
+        if resultat["prob_pl_away"] > resultat["prob_2"] + FLOAT_TOL:
+            resultat["prob_pl_away"] = resultat["prob_2"]
+            resultat["cote_pl_away"] = round(1 / max(resultat["prob_pl_away"], 0.001), 2)
+            corrections.append("PL vis ≤ ML")
+
+    prob_over = dict(resultat.get("prob_over_cuts", {}))
+    prob_under = dict(resultat.get("prob_under_cuts", {}))
+    if prob_over and prob_under:
+        cuts = sorted(prob_over.keys(), key=lambda k: float(k))
+        ou_corrige = False
+        for i in range(1, len(cuts)):
+            c_prev, c_cur = cuts[i - 1], cuts[i]
+            if prob_over[c_cur] > prob_over[c_prev] + FLOAT_TOL:
+                prob_over[c_cur] = prob_over[c_prev]
+                ou_corrige = True
+            if prob_under[c_cur] < prob_under[c_prev] - FLOAT_TOL:
+                prob_under[c_cur] = prob_under[c_prev]
+                ou_corrige = True
+        for cut in cuts:
+            if cut not in prob_under:
+                continue
+            total_ou = prob_over[cut] + prob_under[cut]
+            if total_ou > 0:
+                prob_over[cut] = prob_over[cut] / total_ou
+                prob_under[cut] = prob_under[cut] / total_ou
+        if ou_corrige:
+            corrections.append("O/U monotones")
+        resultat["prob_over_cuts"] = prob_over
+        resultat["prob_under_cuts"] = prob_under
+
+    if corrections and not _marche_coherence_logue:
+        _marche_coherence_logue = True
+        log_nhl("🔗 Cohérence inter-marchés active — PL ≤ ML, totaux O/U monotones")
+
+    return resultat, corrections
+
+
 def shrink_cotes_vers_marche(cotes_vraies, cotes_bookmaker, cotes_puckline, gp_moyen_match):
     """
     Réduit la sur-confiance du modèle en le mélangeant avec la probabilité
@@ -1523,7 +1607,7 @@ def shrink_cotes_vers_marche(cotes_vraies, cotes_bookmaker, cotes_puckline, gp_m
     Les lambdas (lam_home/lam_away) restent purs modèle pour la calibration MLE.
     """
     if not NHL_MARCHE_SHRINK_ACTIF or not cotes_vraies:
-        return cotes_vraies
+        return _appliquer_coherence_marches(cotes_vraies)
     w = _poids_confiance_modele(gp_moyen_match)
     resultat = dict(cotes_vraies)
 
@@ -1564,7 +1648,7 @@ def shrink_cotes_vers_marche(cotes_vraies, cotes_bookmaker, cotes_puckline, gp_m
         resultat["prob_over_cuts"] = prob_over
         resultat["prob_under_cuts"] = prob_under
 
-    return resultat
+    return _appliquer_coherence_marches(resultat)
 
 # ==========================================
 # 5. INTEGRATION THE-ODDS-API & FINANCIAL
@@ -2531,6 +2615,8 @@ def run_sniper():
             f"⚖️ Shrinkage marché actif — confiance modèle {NHL_MODEL_TRUST_MIN:.0%} à 0 GP → "
             f"{NHL_MODEL_TRUST_MAX:.0%} à {NHL_MODEL_TRUST_GP_PLEIN:.0f}+ GP (reste : no-vig Pinnacle)"
         )
+    if NHL_MARCHE_COHERENCE_ACTIF:
+        log_nhl("🔗 Cohérence inter-marchés active — PL ≤ ML, totaux O/U monotones après shrinkage")
     if NHL_KELLY_DYNAMIQUE_ACTIF:
         log_nhl(
             f"🎚️ Kelly dynamique actif — BSS fenêtre {NHL_KELLY_BRIER_FENETRE} paris (min {NHL_KELLY_BRIER_MIN_PARIS}), "
@@ -2717,9 +2803,14 @@ def run_sniper():
                 gp_moyen_match = (
                     (home_base.get('games_played', 0) + away_base.get('games_played', 0)) / 2.0
                 )
-                cotes_vraies = shrink_cotes_vers_marche(
+                cotes_vraies, corr_marches = shrink_cotes_vers_marche(
                     cotes_vraies, cotes_bookmaker, cotes_puckline, gp_moyen_match,
                 )
+                if corr_marches:
+                    log_nhl(
+                        f"🔗 Cohérence marchés corrigée ({', '.join(corr_marches)}) — "
+                        f"{m['away_team']} @ {m['home_team']}"
+                    )
 
                 if cotes_vraies and cotes_bookmaker:
                     candidats = _construire_candidats_pari(
