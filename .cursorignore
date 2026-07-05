@@ -1,0 +1,27 @@
+﻿# Secrets et credentials (ne pas indexer dans le contexte Agent)
+env/*.env
+.env
+identifiants_différent_api.env
+*.pem
+*.key
+
+# Bases de données locales / backtests
+*.db
+*.db-shm
+*.db-wal
+*.db.corrupt
+backtest_results.csv
+
+# Logs runtime
+*.log
+nhl_sniper.log
+sniper_activity.log
+
+# Paramètres tunés locaux (non versionnés)
+foot_params_tuned.json
+foot_params_tuned.backup.json
+
+# Fichiers volumineux ou binaires inutiles au contexte
+__pycache__/
+*.pyc
+*.pyo

@@ -1,0 +1,30 @@
+---
+description: Scope NHL par défaut — ne pas toucher au foot sauf demande explicite
+alwaysApply: true
+---
+
+# Scope NHL (chat sniper hockey)
+
+Sauf **demande explicite** de l'utilisateur pour un autre sport, limiter les modifications aux fichiers NHL :
+
+## Fichiers autorisés
+
+- `nhl_sniper_omega.py`
+- `dashboard_nhl.py`
+- `env/nhl.env` et `env/nhl.env.example`
+- `env/common.env` et `env/common.env.example` (secrets partagés Odds API, Telegram, PA)
+- `utils.py` uniquement si le changement est requis pour NHL (calibration, CLV, etc.)
+
+## Ne pas modifier sans demande explicite
+
+- `sniper_bot_foot.py`, `backtest_football.py`, `dashboard_foot.py`, `env/foot.env*`
+- `sniper_mlb*.py`, `env/mlb.env*`
+- Tout fichier foot/mlb listé dans le git status non lié à la tâche NHL
+
+## Sync env obligatoire
+
+Toute nouvelle clé `NHL_*` ou `os.environ.get` ajoutée dans le code NHL → mettre à jour `env/nhl.env` **et** `env/nhl.env.example` (sans secrets dans l'example).
+
+## Parité
+
+Logique métier ajoutée au bot NHL : documenter ou répliquer dans le backtest NHL s'il existe ; ne pas supposer la parité foot.
