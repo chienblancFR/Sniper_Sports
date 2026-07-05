@@ -74,7 +74,6 @@ NHL_LINE_STEAM_BLOCK_PCT = float(os.environ.get("NHL_LINE_STEAM_BLOCK_PCT", "0.0
 NHL_LINE_STEAM_EDGE_EXTRA = float(os.environ.get("NHL_LINE_STEAM_EDGE_EXTRA", "0.015"))
 NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
 NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
-NHL_PARIS_JOUR_MAX = int(os.environ.get("NHL_PARIS_JOUR_MAX", "0"))
 NHL_ODDS_QUOTA_ALERT = int(os.environ.get("NHL_ODDS_QUOTA_ALERT", "100"))
 NHL_BLEND_GP_PLEIN = float(os.environ.get("NHL_BLEND_GP_PLEIN", "20"))
 NHL_PP_PK_SHRINK_GP = float(os.environ.get("NHL_PP_PK_SHRINK_GP", "20"))
@@ -2516,13 +2515,6 @@ def _executer_opportunite(opp):
         f"mise {best_pari['inv']['mise']} €"
     )
 
-    if limite_paris_jour_atteinte():
-        log_nhl(
-            f"🛑 Limite paris/jour atteinte ({NHL_PARIS_JOUR_MAX}) — signal ignoré.",
-            level="warning",
-        )
-        return
-
     if NHL_DRY_RUN:
         envoyer_alerte(
             m["away_team"], g_ext, m["home_team"], g_dom,
@@ -2549,21 +2541,6 @@ def _executer_opportunite(opp):
 # ==========================================
 # 6. JOURNAL DE TRADING & NOTIFICATIONS
 # ==========================================
-def compter_paris_du_jour():
-    if not os.path.exists(FICHIER_JOURNAL):
-        return 0
-    today = datetime.now().strftime("%Y-%m-%d")
-    try:
-        with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
-            return sum(1 for row in csv.DictReader(f) if row.get("Date", "").startswith(today))
-    except Exception:
-        return 0
-
-
-def limite_paris_jour_atteinte():
-    return NHL_PARIS_JOUR_MAX > 0 and compter_paris_du_jour() >= NHL_PARIS_JOUR_MAX
-
-
 def migrer_journal_si_besoin():
     """Ajoute les colonnes P4 aux anciens journaux sans les perdre."""
     if not os.path.exists(FICHIER_JOURNAL):
@@ -2787,8 +2764,6 @@ def run_sniper():
     log_nhl(f"🤖 Lancement Sniper NHL — mode {mode}")
     if NHL_DRY_RUN:
         log_nhl("🧪 NHL_DRY_RUN actif : signaux Telegram sans écriture journal.")
-    if NHL_PARIS_JOUR_MAX > 0:
-        log_nhl(f"📊 Limite paris/jour : {NHL_PARIS_JOUR_MAX}")
     cap_label = f"{NHL_MISE_MAX_PCT}% bankroll" if NHL_MISE_MAX_PCT > 0 else "Kelly pur (pas de cap %)"
     log_nhl(f"💶 Cap mise : {cap_label} | journal → {FICHIER_JOURNAL}")
     log_nhl(f"📊 Alerte quota Odds API si ≤ {NHL_ODDS_QUOTA_ALERT} requêtes restantes")
