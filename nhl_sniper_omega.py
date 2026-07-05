@@ -103,12 +103,16 @@ NHL_MARCHE_COHERENCE_ACTIF = _env_bool("NHL_MARCHE_COHERENCE_ACTIF", True)
 NHL_REF_SHRINK_ACTIF = _env_bool("NHL_REF_SHRINK_ACTIF", True)
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
+NHL_HIA_PAR_EQUIPE_ACTIF = _env_bool("NHL_HIA_PAR_EQUIPE_ACTIF", True)
+NHL_HIA_TEAM_GP_PLEIN = float(os.environ.get("NHL_HIA_TEAM_GP_PLEIN", "15"))
+NHL_HIA_TEAM_MIN_GAMES = int(os.environ.get("NHL_HIA_TEAM_MIN_GAMES", "3"))
 HIA_REF_CALIBRATION = 0.05  # HIA utilisé lors du calcul des lambdas historiques du journal
 NHL_MARCHES_ACTIFS = {m.strip().upper() for m in os.environ.get("NHL_MARCHES_ACTIFS", "ML,PL,OU").split(",") if m.strip()}
 RHO_META_FILE = "rho_calibrage_meta.json"
 REFEREE_META_FILE = "referee_calibrage_meta.json"
 ODDS_HISTORY_FILE = "nhl_odds_history.json"
 LEAGUE_CALIB_FILE = "nhl_league_calib.json"
+HIA_TEAM_META_FILE = "hia_equipes_meta.json"
 # Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
 XG_FOR_COLONNES = (
     "flurryScoreVenueAdjustedxGoalsFor",
@@ -132,6 +136,7 @@ _ref_adj_logue = False
 _line_move_logue = False
 _marche_coherence_logue = False
 _ref_shrink_logue = False
+_hia_equipe_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -1352,8 +1357,8 @@ def calculate_master_odds_v4(
     rho=-0.12, hia=None, prob_tie=None, prob_en=None,
 ):
     if hia is None:
-        hia = lire_hia_dynamique()
-    hia = min(max(float(hia), 0.0), 0.10)
+        hia = lire_hia_equipe(home_team)
+    hia = min(max(float(hia), 0.0), 0.12)
     if prob_tie is None:
         prob_tie = lire_prob_tie_dynamique()
     if prob_en is None:
@@ -2655,6 +2660,11 @@ def run_sniper():
             f"⏳ MLE recency actif — demi-vie {NHL_MLE_RECENCY_HALFLIFE_JOURS:.0f}j "
             f"(match récent poids ≈1, à {NHL_MLE_RECENCY_HALFLIFE_JOURS:.0f}j poids ≈0.5)"
         )
+    if NHL_HIA_PAR_EQUIPE_ACTIF:
+        log_nhl(
+            f"🏠 HIA par équipe actif — shrinkage vers global MLE, confiance pleine à "
+            f"{NHL_HIA_TEAM_GP_PLEIN:.0f} matchs domicile (min {NHL_HIA_TEAM_MIN_GAMES})"
+        )
     migrer_journal_si_besoin()
 
     while True:
@@ -2675,6 +2685,7 @@ def run_sniper():
             if NHL_LIGUE_CALIB_ACTIF:
                 actualiser_historique_ligue(teams)
             entrainer_ia_dixon_coles()
+            actualiser_hia_equipes()
             actualiser_stats_arbitres()
 
             nb_attente = compter_paris_en_attente()
@@ -2784,12 +2795,19 @@ def run_sniper():
                         f"(<{NHL_REF_MIN_MATCHS} matchs), pas d'ajustement"
                     )
 
+                hia_match = lire_hia_equipe(m['home_team'])
+                if NHL_HIA_PAR_EQUIPE_ACTIF and abs(hia_match - hia_actuel) > 0.005:
+                    log_nhl(
+                        f"🏠 HIA {m['home_team']} : {hia_match:.1%} "
+                        f"(global {hia_actuel:.1%}) — {m['away_team']} @ {m['home_team']}"
+                    )
+
                 cotes_vraies = calculate_master_odds_v4(
                     teams_match, m['home_team'], m['away_team'], gsax_dom, gsax_ext,
                     home_is_b2b=home_b2b, away_is_b2b=away_b2b,
                     home_travel_miles=home_travel, away_travel_miles=away_travel,
                     referee_pp_mult=ref_pp_mult,
-                    rho=rho_actuel, hia=hia_actuel,
+                    rho=rho_actuel, hia=hia_match,
                     prob_tie=prob_tie_actuel, prob_en=prob_en_actuel,
                 )
                 cotes_bookmaker = get_real_live_odds(
@@ -2851,7 +2869,7 @@ def run_sniper():
                                 best_pari['cote_vraie'], cotes_vraies, best_pari['inv'], best_pari['cote_book'],
                                 gardien_ext=g_ext, gardien_dom=g_dom,
                                 gardiens_confirmes=gardiens_verrouilles,
-                                b2b_home=home_b2b, b2b_away=away_b2b, rho=rho_actuel, hia=hia_actuel,
+                                b2b_home=home_b2b, b2b_away=away_b2b, rho=rho_actuel, hia=hia_match,
                             )
                             enregistrer_notification(id_match)
                     else:
@@ -2956,6 +2974,115 @@ def lire_prob_tie_dynamique():
 
 def lire_prob_en_dynamique():
     return float(lire_rho_meta().get("prob_en", 0.22))
+
+
+def lire_hia_equipes_meta():
+    default = {"hia_global": NHL_HIA_DEFAULT, "teams": {}}
+    if os.path.exists(HIA_TEAM_META_FILE):
+        try:
+            with open(HIA_TEAM_META_FILE, "r", encoding="utf-8") as f:
+                return {**default, **json.load(f)}
+        except Exception:
+            pass
+    return default
+
+
+def _estimer_hia_brut_match(lam_h, lam_a, home_goals, away_goals):
+    """
+    HIA implicite d'un match à domicile : écart de score réel vs attendu (lambdas),
+    normalisé pour rester dans l'échelle du paramètre HIA (+/- quelques %).
+    """
+    denom = max(float(lam_h) + float(lam_a), 2.0)
+    expected_diff = float(lam_h) - float(lam_a)
+    actual_diff = int(home_goals) - int(away_goals)
+    residual = actual_diff - expected_diff
+    return max(min(residual / denom, 0.15), -0.05)
+
+
+def actualiser_hia_equipes():
+    """
+    Estime un HIA spécifique par équipe (matchs à domicile) depuis l'historique
+    ligue, avec shrinkage empirique vers le HIA global MLE (James-Stein simplifié).
+    """
+    global _hia_equipe_logue
+    if not NHL_HIA_PAR_EQUIPE_ACTIF:
+        return
+
+    games = lire_league_calib_meta().get("games", {})
+    if not games:
+        return
+
+    hia_global = lire_hia_dynamique()
+    accum = {}
+
+    for data in games.values():
+        home = data.get("home")
+        if not home:
+            continue
+        try:
+            lam_h = float(data["lambda_domicile_calcule"])
+            lam_a = float(data["lambda_exterieur_calcule"])
+            h_goals = int(data["vrai_score_domicile"])
+            a_goals = int(data["vrai_score_exterieur"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        brut = _estimer_hia_brut_match(lam_h, lam_a, h_goals, a_goals)
+        w = _poids_recency_mle({"date": data.get("date")})
+
+        bucket = accum.setdefault(home, {"sum_w": 0.0, "sum_whia": 0.0, "n": 0})
+        bucket["sum_w"] += w
+        bucket["sum_whia"] += w * brut
+        bucket["n"] += 1
+
+    teams_hia = {}
+    for team, stats in accum.items():
+        n = stats["n"]
+        if n < NHL_HIA_TEAM_MIN_GAMES:
+            continue
+        hia_raw = stats["sum_whia"] / stats["sum_w"] if stats["sum_w"] > 0 else hia_global
+        w_shrink = min(1.0, n / NHL_HIA_TEAM_GP_PLEIN) if NHL_HIA_TEAM_GP_PLEIN > 0 else 1.0
+        hia_shrunk = (1.0 - w_shrink) * hia_global + w_shrink * hia_raw
+        hia_shrunk = round(min(max(hia_shrunk, 0.0), 0.12), 4)
+        teams_hia[team] = {
+            "hia": hia_shrunk,
+            "hia_raw": round(hia_raw, 4),
+            "home_games": n,
+            "shrink_weight": round(w_shrink, 3),
+        }
+
+    meta = {
+        "hia_global": round(hia_global, 4),
+        "teams": teams_hia,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    with open(HIA_TEAM_META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    if not _hia_equipe_logue:
+        _hia_equipe_logue = True
+        log_nhl(
+            f"🏠 HIA par équipe actif — shrinkage vers global {hia_global:.1%}, "
+            f"confiance pleine à {NHL_HIA_TEAM_GP_PLEIN:.0f} matchs domicile "
+            f"(min {NHL_HIA_TEAM_MIN_GAMES})"
+        )
+    if teams_hia:
+        extremes = sorted(teams_hia.items(), key=lambda kv: kv[1]["hia"])
+        bas, haut = extremes[0], extremes[-1]
+        log_nhl(
+            f"🏠 HIA équipes mis à jour — {len(teams_hia)} indexées "
+            f"(min {bas[0]} {bas[1]['hia']:.1%}, max {haut[0]} {haut[1]['hia']:.1%})"
+        )
+
+
+def lire_hia_equipe(home_team):
+    """HIA effectif pour une équipe à domicile (shrinkage vers moyenne ligue MLE)."""
+    if not NHL_HIA_PAR_EQUIPE_ACTIF:
+        return lire_hia_dynamique()
+    team_data = lire_hia_equipes_meta().get("teams", {}).get(home_team)
+    if not team_data:
+        return lire_hia_dynamique()
+    return float(team_data["hia"])
 
 
 def lire_league_calib_meta():
