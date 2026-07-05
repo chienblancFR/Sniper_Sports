@@ -96,6 +96,9 @@ NHL_LIGUE_CALIB_SCAN_JOURS = int(os.environ.get("NHL_LIGUE_CALIB_SCAN_JOURS", "3
 NHL_LIGUE_CALIB_LOOKBACK_JOURS = int(os.environ.get("NHL_LIGUE_CALIB_LOOKBACK_JOURS", "30"))
 NHL_LIGUE_CALIB_MIN_MATCHS = int(os.environ.get("NHL_LIGUE_CALIB_MIN_MATCHS", "200"))
 NHL_LIGUE_CALIB_MAX_GAMES = int(os.environ.get("NHL_LIGUE_CALIB_MAX_GAMES", "1400"))
+# Pondération temporelle MLE : les matchs récents comptent plus (demi-vie en jours)
+NHL_MLE_RECENCY_ACTIF = _env_bool("NHL_MLE_RECENCY_ACTIF", True)
+NHL_MLE_RECENCY_HALFLIFE_JOURS = float(os.environ.get("NHL_MLE_RECENCY_HALFLIFE_JOURS", "28"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
 HIA_REF_CALIBRATION = 0.05  # HIA utilisé lors du calcul des lambdas historiques du journal
@@ -1182,6 +1185,30 @@ def _ajuster_lambdas_pour_hia(lam_h, lam_a, hia, hia_ref=HIA_REF_CALIBRATION):
     return max(lam_h_adj, 0.1), max(lam_a_adj, 0.1)
 
 
+def _parse_date_match(date_str):
+    """Parse une date de match (YYYY-MM-DD ou YYYY-MM-DD HH:MM) → date ou None."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(str(date_str).strip()[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _poids_recency_mle(match):
+    """
+    Poids exponentiel selon l'ancienneté du match : w = 0.5^(age_jours / demi_vie).
+    Match d'hier ≈ 1.0 ; à 28 j (demi-vie par défaut) ≈ 0.5 ; à 56 j ≈ 0.25.
+    """
+    if not NHL_MLE_RECENCY_ACTIF or NHL_MLE_RECENCY_HALFLIFE_JOURS <= 0:
+        return 1.0
+    match_date = _parse_date_match(match.get("date"))
+    if match_date is None:
+        return 1.0
+    age_jours = max((datetime.now().date() - match_date).days, 0)
+    return 0.5 ** (age_jours / NHL_MLE_RECENCY_HALFLIFE_JOURS)
+
+
 def log_likelihood_rho_hia(params, historique_matchs):
     rho, hia = params[0], params[1]
     ll = 0.0
@@ -1194,7 +1221,7 @@ def log_likelihood_rho_hia(params, historique_matchs):
         p_h = (math.exp(-lam_h) * (lam_h ** h_goals)) / math.factorial(h_goals)
         p_a = (math.exp(-lam_a) * (lam_a ** a_goals)) / math.factorial(a_goals)
         tau = tau_dixon_coles(lam_h, lam_a, h_goals, a_goals, rho)
-        ll += math.log(max(p_h * p_a * tau, 1e-10))
+        ll += _poids_recency_mle(match) * math.log(max(p_h * p_a * tau, 1e-10))
     return -ll
 
 
@@ -1202,7 +1229,12 @@ def optimiser_rho_et_hia_saison(historique_matchs):
     """Calibre rho et HIA conjointement par MLE sur l'historique du journal."""
     meta = lire_rho_meta()
     x0 = [float(meta.get("rho", -0.12)), float(meta.get("hia", NHL_HIA_DEFAULT))]
-    log_nhl(f"🔬 Calibrage MLE rho+HIA sur {len(historique_matchs)} matchs (init {x0})...")
+    recency_label = (
+        f", recency demi-vie {NHL_MLE_RECENCY_HALFLIFE_JOURS:.0f}j"
+        if NHL_MLE_RECENCY_ACTIF and NHL_MLE_RECENCY_HALFLIFE_JOURS > 0
+        else ""
+    )
+    log_nhl(f"🔬 Calibrage MLE rho+HIA sur {len(historique_matchs)} matchs (init {x0}{recency_label})...")
     resultat = minimize(
         log_likelihood_rho_hia,
         x0,
@@ -1259,7 +1291,7 @@ def log_likelihood_empty_net(params, historique_matchs, rho, hia):
         hia_ref = match.get("hia_ref", HIA_REF_CALIBRATION)
         lam_h, lam_a = _ajuster_lambdas_pour_hia(lam_h, lam_a, hia, hia_ref)
         p = _prob_score_avec_correction(lam_h, lam_a, h_obs, a_obs, rho, prob_tie, prob_en)
-        ll += math.log(max(p, 1e-10))
+        ll += _poids_recency_mle(match) * math.log(max(p, 1e-10))
     return -ll
 
 
@@ -1267,7 +1299,12 @@ def optimiser_empty_net_ot(historique_matchs, rho, hia):
     """Calibre prob_tie (retour à égalité) et prob_en (but cage vide) par MLE, rho/HIA fixés."""
     meta = lire_rho_meta()
     x0 = [float(meta.get("prob_tie", 0.12)), float(meta.get("prob_en", 0.22))]
-    log_nhl(f"🔬 Calibrage MLE empty-net/OT-tie sur {len(historique_matchs)} matchs (init {x0})...")
+    recency_label = (
+        f", recency demi-vie {NHL_MLE_RECENCY_HALFLIFE_JOURS:.0f}j"
+        if NHL_MLE_RECENCY_ACTIF and NHL_MLE_RECENCY_HALFLIFE_JOURS > 0
+        else ""
+    )
+    log_nhl(f"🔬 Calibrage MLE empty-net/OT-tie sur {len(historique_matchs)} matchs (init {x0}{recency_label})...")
     resultat = minimize(
         log_likelihood_empty_net,
         x0,
@@ -2527,6 +2564,11 @@ def run_sniper():
             f"{NHL_LIGUE_CALIB_LOOKBACK_JOURS}j/cycle puis {NHL_LIGUE_CALIB_SCAN_JOURS}j/cycle "
             f"après {NHL_LIGUE_CALIB_MIN_MATCHS} matchs indexés (max {NHL_LIGUE_CALIB_MAX_GAMES} conservés)"
         )
+    if NHL_MLE_RECENCY_ACTIF and NHL_MLE_RECENCY_HALFLIFE_JOURS > 0:
+        log_nhl(
+            f"⏳ MLE recency actif — demi-vie {NHL_MLE_RECENCY_HALFLIFE_JOURS:.0f}j "
+            f"(match récent poids ≈1, à {NHL_MLE_RECENCY_HALFLIFE_JOURS:.0f}j poids ≈0.5)"
+        )
     migrer_journal_si_besoin()
 
     while True:
@@ -2941,6 +2983,7 @@ def entrainer_ia_dixon_coles():
     if NHL_LIGUE_CALIB_ACTIF:
         for gid, data in lire_league_calib_meta().get("games", {}).items():
             historique_unique[gid] = {
+                "date": data.get("date"),
                 "vrai_score_domicile": data["vrai_score_domicile"],
                 "vrai_score_exterieur": data["vrai_score_exterieur"],
                 "lambda_domicile_calcule": data["lambda_domicile_calcule"],
@@ -2961,6 +3004,7 @@ def entrainer_ia_dixon_coles():
                     # Lambdas pré-match réelles (calculées au moment du pari) :
                     # priment sur le proxy rétrospectif du scan ligue.
                     historique_unique[game_id_brut] = {
+                        "date": row.get("Date", "").split()[0] or None,
                         "vrai_score_domicile": int(row["Score_Dom"]),
                         "vrai_score_exterieur": int(row["Score_Ext"]),
                         "lambda_domicile_calcule": float(row["Lam_Dom"]),
