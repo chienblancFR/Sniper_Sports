@@ -139,6 +139,10 @@ PIT_CACHE_FILE = "nhl_pit_moneypuck_cache.json"
 MONEYPUCK_GBG_ALL_TEAMS_URL = (
     "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/all_teams.csv"
 )
+MONEYPUCK_GBG_ALL_GOALIES_URL = (
+    "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/all_goalies.csv"
+)
+GOALIE_PIT_CACHE_FILE = "nhl_goalie_pit_moneypuck_cache.json"
 HIA_TEAM_META_FILE = "hia_equipes_meta.json"
 # Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
 XG_FOR_COLONNES = (
@@ -166,6 +170,9 @@ _marche_coherence_logue = False
 _ref_shrink_logue = False
 _hia_equipe_logue = False
 _pit_index_memo = None
+_goalie_pit_index_memo = None
+_goalie_by_game_memo = None
+_goalie_pit_build_logue = False
 _pit_fallback_logue = False
 _pit_build_logue = False
 _kelly_param_logue = False
@@ -192,6 +199,16 @@ NHL_REF_SENSIBILITE = float(os.environ.get("NHL_REF_SENSIBILITE", "0.20"))
 NHL_REF_CALIB_ACTIF = _env_bool("NHL_REF_CALIB_ACTIF", True)
 NHL_REF_CALIB_MIN_MATCHS = int(os.environ.get("NHL_REF_CALIB_MIN_MATCHS", "80"))
 NHL_PP_LAM_SHARE = float(os.environ.get("NHL_PP_LAM_SHARE", "0.20"))
+NHL_PP_LAM_SHARE_CALIB_ACTIF = _env_bool("NHL_PP_LAM_SHARE_CALIB_ACTIF", True)
+NHL_PP_LAM_SHARE_CALIB_MIN_MATCHS = int(os.environ.get("NHL_PP_LAM_SHARE_CALIB_MIN_MATCHS", "80"))
+NHL_TRAVEL_CALIB_ACTIF = _env_bool("NHL_TRAVEL_CALIB_ACTIF", True)
+NHL_TRAVEL_CALIB_MIN_MATCHS = int(os.environ.get("NHL_TRAVEL_CALIB_MIN_MATCHS", "80"))
+NHL_GSAX_CALIB_ACTIF = _env_bool("NHL_GSAX_CALIB_ACTIF", True)
+NHL_GSAX_CALIB_MIN_MATCHS = int(os.environ.get("NHL_GSAX_CALIB_MIN_MATCHS", "60"))
+NHL_GSAX_LAM_MULT_DEFAULT = float(os.environ.get("NHL_GSAX_LAM_MULT", "1.0"))
+NHL_PL_CALIB_ACTIF = _env_bool("NHL_PL_CALIB_ACTIF", True)
+NHL_PL_CALIB_MIN_MATCHS = int(os.environ.get("NHL_PL_CALIB_MIN_MATCHS", "80"))
+NHL_PL_SCALE_DEFAULT = float(os.environ.get("NHL_PL_SCALE", "1.0"))
 NHL_REF_LOOKBACK_JOURS = int(os.environ.get("NHL_REF_LOOKBACK_JOURS", "30"))
 NHL_REF_SCAN_JOURS = int(os.environ.get("NHL_REF_SCAN_JOURS", "3"))
 NHL_REF_MIN_MATCHS = int(os.environ.get("NHL_REF_MIN_MATCHS", "12"))
@@ -698,6 +715,265 @@ def construire_index_pit_moneypuck(season=None, teams_n1=None, force=False):
 def _invalider_pit_index_memo():
     global _pit_index_memo
     _pit_index_memo = None
+
+
+def _fetch_moneypuck_gbg_all_goalies():
+    """Télécharge le CSV game-by-game agrégé gardiens (toutes saisons)."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(MONEYPUCK_GBG_ALL_GOALIES_URL, headers=headers, timeout=90)
+        if response.status_code == 200 and response.text.strip():
+            return response.text
+        log_nhl(
+            f"⚠️ MoneyPuck goalies game-by-game : HTTP {response.status_code}",
+            level="warning",
+        )
+    except Exception as e:
+        log_nhl(f"⚠️ MoneyPuck goalies game-by-game : {e}", level="warning")
+    return None
+
+
+def _parser_gbg_goalies(texte, seasons):
+    """Parse all_goalies.csv → une ligne par (saison, gameId, gardien)."""
+    csv_reader = csv.DictReader(StringIO(texte))
+    matchs = {}
+    seasons_set = {int(s) for s in seasons}
+    for row in csv_reader:
+        if (row.get("situation") or "").strip() not in ("all", ""):
+            continue
+        try:
+            season = int(float(row.get("season", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if season not in seasons_set:
+            continue
+        name = (row.get("name") or row.get("playerName") or "").strip()
+        game_id = row.get("gameId") or row.get("game_id")
+        date_str = _normaliser_date_iso(
+            row.get("gameDate") or row.get("game_date") or row.get("date")
+        )
+        if not name or not game_id or not date_str:
+            continue
+        icetime = float(row.get("icetime", 0) or 0)
+        if icetime < 600:
+            continue
+        cle = (season, str(game_id), name)
+        matchs[cle] = {
+            "name": name,
+            "season": season,
+            "game_id": str(game_id),
+            "date": date_str,
+            "team": (row.get("team") or "").strip(),
+            "icetime": icetime,
+            "xgoals": float(row.get("xGoals", 0) or 0),
+            "goals": float(row.get("goals", 0) or 0),
+        }
+    return list(matchs.values())
+
+
+def _build_goalie_pit_index(matchs):
+    """Index gardien → snapshots GSAx/60 cumulé strictement avant chaque match."""
+    par_gardien = {}
+    for match in matchs:
+        par_gardien.setdefault(match["name"], []).append(match)
+
+    index = {}
+    for name, games in par_gardien.items():
+        games.sort(key=lambda g: (g["date"], g["game_id"]))
+        cumul_icetime = 0.0
+        cumul_xg = 0.0
+        cumul_goals = 0.0
+        cumul_gp = 0
+        snapshots = []
+        for game in games:
+            if cumul_gp > 0 and cumul_icetime >= 600:
+                heures = cumul_icetime / 3600.0
+                gsax_per_60 = (cumul_xg - cumul_goals) / heures
+                w_shrink = min(1.0, cumul_gp / NHL_GSAX_SHRINK_GP_PLEIN) if NHL_GSAX_SHRINK_GP_PLEIN > 0 else 1.0
+                gsax_per_60 *= w_shrink
+            else:
+                gsax_per_60 = 0.0
+            snapshots.append({
+                "date": game["date"],
+                "game_id": game["game_id"],
+                "team": game.get("team", ""),
+                "gsax_per_60": round(gsax_per_60, 3),
+                "gp_before": cumul_gp,
+            })
+            cumul_gp += 1
+            cumul_icetime += game["icetime"]
+            cumul_xg += game["xgoals"]
+            cumul_goals += game["goals"]
+        index[name] = snapshots
+        norm = normaliser_nom_joueur(name)
+        if norm != name:
+            index.setdefault(norm, snapshots)
+    return index
+
+
+def _lire_goalie_pit_cache_meta():
+    if os.path.exists(GOALIE_PIT_CACHE_FILE):
+        try:
+            with open(GOALIE_PIT_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _ecrire_goalie_pit_cache_meta(meta):
+    with open(GOALIE_PIT_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+
+
+def _build_goalie_by_game_lookup(matchs, goalie_index):
+    """game_id → {team_abbrev: {name, gsax_per_60}} pour les partants MoneyPuck."""
+    by_game = {}
+    for m in matchs:
+        team = m.get("team")
+        if not team:
+            continue
+        gsax = _gsax_gardien_avant_match(goalie_index, m["name"], m["date"], m["game_id"])
+        by_game.setdefault(m["game_id"], {})[team] = {
+            "name": m["name"],
+            "gsax_per_60": gsax,
+        }
+    return by_game
+
+
+def construire_index_gsax_gardiens(season=None, force=False):
+    """Index point-in-time GSAx/60 par gardien (MoneyPuck game-by-game)."""
+    global _goalie_pit_index_memo, _goalie_by_game_memo, _goalie_pit_build_logue
+    if season is None:
+        season = NHL_SEASON
+    if not force and _goalie_pit_index_memo is not None and _goalie_pit_index_memo.get("season") == season:
+        return _goalie_pit_index_memo.get("index")
+
+    cache = _lire_goalie_pit_cache_meta()
+    if not force and _pit_cache_est_frais(cache, season) and cache.get("index"):
+        _goalie_pit_index_memo = {"season": season, "index": cache["index"]}
+        _goalie_by_game_memo = cache.get("by_game", {})
+        return cache["index"]
+
+    texte = _fetch_moneypuck_gbg_all_goalies()
+    if not texte:
+        if cache.get("index") and cache.get("season") == season:
+            log_nhl("ℹ️ GSAx PIT — repli cache local MoneyPuck gardiens", level="warning")
+            _goalie_pit_index_memo = {"season": season, "index": cache["index"]}
+            _goalie_by_game_memo = cache.get("by_game", {})
+            return cache["index"]
+        return None
+
+    matchs = _parser_gbg_goalies(texte, seasons=(season, season - 1))
+    if not matchs:
+        return None
+    index = _build_goalie_pit_index(matchs)
+    if not index:
+        return None
+    by_game = _build_goalie_by_game_lookup(matchs, index)
+
+    _ecrire_goalie_pit_cache_meta({
+        "season": season,
+        "date_fetched": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "nb_lignes": len(matchs),
+        "index": index,
+        "by_game": by_game,
+    })
+    _goalie_pit_index_memo = {"season": season, "index": index}
+    _goalie_by_game_memo = by_game
+    if not _goalie_pit_build_logue:
+        _goalie_pit_build_logue = True
+        nb_gardiens = len({m["name"] for m in matchs})
+        log_nhl(
+            f"🥅 Index GSAx PIT gardiens — {len(matchs)} apparitions, "
+            f"{nb_gardiens} gardiens, {len(by_game)} matchs (saisons {season - 1}/{season})"
+        )
+    return index
+
+
+def lire_goalie_by_game_lookup(season=None):
+    """Lookup partants + GSAx pré-match par game_id NHL."""
+    construire_index_gsax_gardiens(season=season)
+    return _goalie_by_game_memo or {}
+
+
+def _invalider_goalie_pit_index_memo():
+    global _goalie_pit_index_memo, _goalie_by_game_memo
+    _goalie_pit_index_memo = None
+    _goalie_by_game_memo = None
+
+
+def _gsax_gardien_avant_match(goalie_index, goalie_name, date_str, game_id=None):
+    """GSAx/60 cumulé avant un match (sans look-ahead)."""
+    if not goalie_index or not goalie_name:
+        return 0.0
+    snapshots = goalie_index.get(goalie_name) or goalie_index.get(normaliser_nom_joueur(goalie_name))
+    if not snapshots:
+        return 0.0
+    if game_id:
+        for snap in snapshots:
+            if snap["game_id"] == str(game_id) and snap["date"] == date_str:
+                return float(snap.get("gsax_per_60", 0.0))
+    prior = [snap for snap in snapshots if snap["date"] < date_str]
+    if prior:
+        return float(prior[-1].get("gsax_per_60", 0.0))
+    if snapshots and snapshots[0]["date"] == date_str:
+        return float(snapshots[0].get("gsax_per_60", 0.0))
+    return 0.0
+
+
+def _fetch_goalie_starters_boxscore(game_id):
+    """Noms des gardiens partants (boxscore NHL)."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(
+            f"https://api-web.nhle.com/v1/gamecenter/{game_id}/boxscore",
+            headers=headers,
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return None, None
+        data = response.json()
+        away_g = data.get("playerByGameStats", {}).get("awayTeam", {}).get("goalies", [])
+        home_g = data.get("playerByGameStats", {}).get("homeTeam", {}).get("goalies", [])
+        g_ext = away_g[0]["name"]["default"] if away_g else None
+        g_dom = home_g[0]["name"]["default"] if home_g else None
+        return g_ext, g_dom
+    except Exception:
+        return None, None
+
+
+def _etat_calendrier_avant_date(games_db, before_date):
+    """Dernière date et arène par équipe avant une date (pour B2B / voyage)."""
+    team_last_venue, team_last_date = {}, {}
+    for g in sorted(
+        (x for x in games_db.values() if (x.get("date") or "") < before_date),
+        key=lambda x: x.get("date", ""),
+    ):
+        home, away, d = g.get("home"), g.get("away"), g.get("date")
+        if not home or not away or not d:
+            continue
+        team_last_venue[home] = home
+        team_last_venue[away] = home
+        team_last_date[home] = d
+        team_last_date[away] = d
+    return team_last_venue, team_last_date
+
+
+def _contexte_calendrier_match(date_str, home, away, games_db):
+    """B2B et miles de voyage pour un match historique."""
+    prev_date = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    venues, last_dates = _etat_calendrier_avant_date(games_db, date_str)
+    home_b2b = last_dates.get(home) == prev_date
+    away_b2b = last_dates.get(away) == prev_date
+    home_travel = 0.0
+    away_travel = 0.0
+    if NHL_TRAVEL_FATIGUE_ACTIF:
+        if venues.get(home):
+            home_travel = round(_distance_entre_arènes(venues[home], home), 1)
+        if venues.get(away):
+            away_travel = round(_distance_entre_arènes(venues[away], home), 1)
+    return home_b2b, away_b2b, home_travel, away_travel
 
 
 def _stats_equipe_avant_match(pit_index, team, date_str, opponent=None):
@@ -1536,21 +1812,23 @@ def calculate_circadian_fatigue(team_abbrev, opponent_abbrev, is_b2b, is_home):
     return round(mod_atk, 3), round(mod_def, 3)
 
 
-def calculate_schedule_fatigue(team_abbrev, opponent_abbrev, is_b2b, is_home, travel_miles=0.0):
+def calculate_schedule_fatigue(team_abbrev, opponent_abbrev, is_b2b, is_home, travel_miles=0.0, coeffs=None):
     """
     Fatigue calendrier : B2B + fuseau horaire + miles parcourus depuis le dernier match.
+    coeffs optionnel pour la grille de calibration voyage.
     """
     global _travel_fatigue_logue
+    c = coeffs or _lire_travel_coeffs()
     mod_atk, mod_def = calculate_circadian_fatigue(team_abbrev, opponent_abbrev, is_b2b, is_home)
 
     if NHL_TRAVEL_FATIGUE_ACTIF and travel_miles > 0 and NHL_TRAVEL_MILES_REF > 0:
         scale = min(travel_miles / NHL_TRAVEL_MILES_REF, 2.0)
         if is_b2b:
-            mod_atk *= max(1.0 - NHL_TRAVEL_B2B_ATK_PCT * scale, 0.88)
-            mod_def *= min(1.0 + NHL_TRAVEL_B2B_DEF_PCT * scale, 1.20)
+            mod_atk *= max(1.0 - c["b2b_atk"] * scale, 0.88)
+            mod_def *= min(1.0 + c["b2b_def"] * scale, 1.20)
         elif travel_miles >= NHL_TRAVEL_LONG_MILES:
-            mod_atk *= max(1.0 - NHL_TRAVEL_SOLO_ATK_PCT * scale, 0.95)
-            mod_def *= min(1.0 + NHL_TRAVEL_SOLO_DEF_PCT * scale, 1.10)
+            mod_atk *= max(1.0 - c["solo_atk"] * scale, 0.95)
+            mod_def *= min(1.0 + c["solo_def"] * scale, 1.10)
 
     mod_atk = round(mod_atk, 3)
     mod_def = round(mod_def, 3)
@@ -1559,7 +1837,8 @@ def calculate_schedule_fatigue(team_abbrev, opponent_abbrev, is_b2b, is_home, tr
         _travel_fatigue_logue = True
         log_nhl(
             f"✈️ Fatigue voyage actif — lookback {NHL_TRAVEL_LOOKBACK_JOURS}j, "
-            f"ref {NHL_TRAVEL_MILES_REF:.0f} mi (B2B atk-{NHL_TRAVEL_B2B_ATK_PCT:.0%}/def+{NHL_TRAVEL_B2B_DEF_PCT:.0%} par ref)"
+            f"ref {NHL_TRAVEL_MILES_REF:.0f} mi (B2B atk-{c['b2b_atk']:.0%}/def+{c['b2b_def']:.0%} par ref)"
+            + (" (calibrée)" if NHL_TRAVEL_CALIB_ACTIF else "")
         )
     return mod_atk, mod_def
 
@@ -1726,8 +2005,309 @@ def lire_faceoff_sensibilite():
     return float(lire_rho_meta().get("faceoff_sensibilite", NHL_FACEOFF_SENSIBILITE))
 
 
+def _lire_travel_coeffs():
+    """Coefficients voyage/fatigue calibrés (repli env si absent)."""
+    meta = lire_rho_meta()
+    return {
+        "b2b_atk": float(meta.get("travel_b2b_atk_pct", NHL_TRAVEL_B2B_ATK_PCT)),
+        "b2b_def": float(meta.get("travel_b2b_def_pct", NHL_TRAVEL_B2B_DEF_PCT)),
+        "solo_atk": float(meta.get("travel_solo_atk_pct", NHL_TRAVEL_SOLO_ATK_PCT)),
+        "solo_def": float(meta.get("travel_solo_def_pct", NHL_TRAVEL_SOLO_DEF_PCT)),
+    }
+
+
+def lire_pp_lam_share():
+    if not NHL_PP_LAM_SHARE_CALIB_ACTIF:
+        return NHL_PP_LAM_SHARE
+    return float(lire_rho_meta().get("pp_lam_share", NHL_PP_LAM_SHARE))
+
+
+def lire_gsax_lam_mult():
+    if not NHL_GSAX_CALIB_ACTIF:
+        return NHL_GSAX_LAM_MULT_DEFAULT
+    return float(lire_rho_meta().get("gsax_lam_mult", NHL_GSAX_LAM_MULT_DEFAULT))
+
+
+def lire_pl_scale():
+    if not NHL_PL_CALIB_ACTIF:
+        return NHL_PL_SCALE_DEFAULT
+    return float(lire_rho_meta().get("pl_scale", NHL_PL_SCALE_DEFAULT))
+
+
+def _lambdas_avec_travel(lam_h, lam_a, match, coeffs=None):
+    """Approximation multiplicative de l'effet voyage sur les lambdas de base."""
+    c = coeffs or _lire_travel_coeffs()
+    home, away = match.get("home"), match.get("away")
+    if not home or not away:
+        return lam_h, lam_a
+    home_atk, home_def = calculate_schedule_fatigue(
+        home, away, bool(match.get("home_b2b")), True,
+        float(match.get("home_travel_mi", 0) or 0), coeffs=c,
+    )
+    away_atk, away_def = calculate_schedule_fatigue(
+        away, home, bool(match.get("away_b2b")), False,
+        float(match.get("away_travel_mi", 0) or 0), coeffs=c,
+    )
+    lam_h_adj = lam_h * home_atk * away_def
+    lam_a_adj = lam_a * away_atk * home_def
+    return max(lam_h_adj, 0.1), max(lam_a_adj, 0.1)
+
+
+def _match_a_signal_travel(match):
+    return bool(
+        match.get("home_b2b") or match.get("away_b2b")
+        or float(match.get("home_travel_mi", 0) or 0) >= NHL_TRAVEL_LONG_MILES
+        or float(match.get("away_travel_mi", 0) or 0) >= NHL_TRAVEL_LONG_MILES
+    )
+
+
+def _mse_travel_fatigue(coeffs, historique_matchs):
+    """MSE totaux buts sur matchs avec signal B2B/voyage."""
+    sse, n = 0.0, 0
+    for match in historique_matchs:
+        if not _match_a_signal_travel(match):
+            continue
+        try:
+            lam_h = float(match["lambda_domicile_calcule"])
+            lam_a = float(match["lambda_exterieur_calcule"])
+            total = int(match["vrai_score_domicile"]) + int(match["vrai_score_exterieur"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        lam_h, lam_a = _lambdas_avec_travel(lam_h, lam_a, match, coeffs)
+        w = _poids_recency_mle(match)
+        sse += w * (total - (lam_h + lam_a)) ** 2
+        n += 1
+    return sse / max(n, 1)
+
+
+def calibrer_travel_fatigue(historique_matchs):
+    """Grille 2D (échelle B2B / solo) sur les coefficients voyage."""
+    base = _lire_travel_coeffs()
+    echelles = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75]
+    meilleur, meilleur_mse = dict(base), float("inf")
+    for b2b_s in echelles:
+        for solo_s in echelles:
+            trial = {
+                "b2b_atk": NHL_TRAVEL_B2B_ATK_PCT * b2b_s,
+                "b2b_def": NHL_TRAVEL_B2B_DEF_PCT * b2b_s,
+                "solo_atk": NHL_TRAVEL_SOLO_ATK_PCT * solo_s,
+                "solo_def": NHL_TRAVEL_SOLO_DEF_PCT * solo_s,
+            }
+            mse = _mse_travel_fatigue(trial, historique_matchs)
+            if mse < meilleur_mse:
+                meilleur_mse, meilleur = mse, trial
+    n_travel = sum(1 for m in historique_matchs if _match_a_signal_travel(m))
+    log_nhl(
+        f"🔬 Calibrage voyage/fatigue sur {n_travel} matchs signal "
+        f"(B2B atk {meilleur['b2b_atk']:.1%}/def+{meilleur['b2b_def']:.1%}, "
+        f"solo atk {meilleur['solo_atk']:.1%}/def+{meilleur['solo_def']:.1%}, MSE {meilleur_mse:.3f})"
+    )
+    return meilleur, n_travel
+
+
+def _mse_pp_lam_share(share, sens, historique_matchs):
+    sse, n = 0.0, 0
+    for match in historique_matchs:
+        rel = match.get("ref_rel")
+        if rel is None:
+            continue
+        try:
+            lam_h = float(match["lambda_domicile_calcule"])
+            lam_a = float(match["lambda_exterieur_calcule"])
+            total = int(match["vrai_score_domicile"]) + int(match["vrai_score_exterieur"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        mult = max(min(1.0 + sens * rel, 1.12), 0.88)
+        mu_pred = (lam_h + lam_a) * (1.0 + share * (mult - 1.0))
+        w = _poids_recency_mle(match)
+        sse += w * (total - mu_pred) ** 2
+        n += 1
+    return sse / max(n, 1)
+
+
+def calibrer_pp_lam_share(historique_matchs, ref_sensibilite=None):
+    """Grille sur la part PP de l'effet arbitral dans les totaux buts."""
+    sens = ref_sensibilite if ref_sensibilite is not None else lire_ref_sensibilite()
+    candidats = [i / 100.0 for i in range(5, 51)]
+    meilleur_share, meilleur_mse = NHL_PP_LAM_SHARE, float("inf")
+    for share in candidats:
+        mse = _mse_pp_lam_share(share, sens, historique_matchs)
+        if mse < meilleur_mse:
+            meilleur_mse, meilleur_share = mse, share
+    n_ref = sum(1 for m in historique_matchs if m.get("ref_rel") is not None)
+    opt = round(meilleur_share, 3)
+    log_nhl(
+        f"✅ Calibrage PP lam share — {opt:.0%} (défaut {NHL_PP_LAM_SHARE:.0%}, "
+        f"{n_ref} matchs crew, MSE {meilleur_mse:.3f})"
+    )
+    return opt, n_ref
+
+
+def _mse_gsax_lam_mult(mult, historique_matchs):
+    """MSE totaux sur matchs où GSAx partant connu (PIT)."""
+    sse, n = 0.0, 0
+    for match in historique_matchs:
+        if match.get("home_gsax") is None and match.get("away_gsax") is None:
+            continue
+        try:
+            lam_h = float(match["lambda_domicile_calcule"])
+            lam_a = float(match["lambda_exterieur_calcule"])
+            total = int(match["vrai_score_domicile"]) + int(match["vrai_score_exterieur"])
+            gsax_h = float(match.get("home_gsax") or 0.0)
+            gsax_a = float(match.get("away_gsax") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        adj_h = gsax_per_60_vers_lambda(gsax_a) * mult
+        adj_a = gsax_per_60_vers_lambda(gsax_h) * mult
+        mu_pred = max(lam_h - adj_h, 0.1) + max(lam_a - adj_a, 0.1)
+        w = _poids_recency_mle(match)
+        sse += w * (total - mu_pred) ** 2
+        n += 1
+    return sse / max(n, 1)
+
+
+def calibrer_gsax_lam_mult(historique_matchs):
+    """Grille sur le multiplicateur d'impact GSAx → lambda."""
+    candidats = [i / 100.0 for i in range(50, 151)]
+    meilleur, meilleur_mse = NHL_GSAX_LAM_MULT_DEFAULT, float("inf")
+    for mult in candidats:
+        mse = _mse_gsax_lam_mult(mult, historique_matchs)
+        if mse < meilleur_mse:
+            meilleur_mse, meilleur = mse, mult
+    n_gsax = sum(
+        1 for m in historique_matchs
+        if m.get("home_gsax") is not None or m.get("away_gsax") is not None
+    )
+    opt = round(meilleur, 3)
+    log_nhl(
+        f"✅ Calibrage GSAx→λ — mult {opt:.2f} (défaut {NHL_GSAX_LAM_MULT_DEFAULT:.2f}, "
+        f"{n_gsax} matchs gardiens, MSE {meilleur_mse:.3f})"
+    )
+    return opt, n_gsax
+
+
+def _matrice_scores_normalisee(lam_h, lam_a, rho, prob_tie=None, prob_en=None):
+    """Matrice 12×12 normalisée (Poisson + DC + empty-net)."""
+    if prob_tie is None:
+        prob_tie = lire_prob_tie_dynamique()
+    if prob_en is None:
+        prob_en = lire_prob_en_dynamique()
+    prob_tie = min(max(float(prob_tie), 0.0), 0.30)
+    prob_en = min(max(float(prob_en), 0.0), 0.40)
+
+    matrice_brute = [[0.0] * 12 for _ in range(12)]
+    for h in range(12):
+        for a in range(12):
+            matrice_brute[h][a] = (
+                poisson(lam_h, h) * poisson(lam_a, a)
+                * tau_dixon_coles(lam_h, lam_a, h, a, rho)
+            )
+
+    matrice_finale = [[0.0] * 12 for _ in range(12)]
+    for h in range(12):
+        for a in range(12):
+            p = matrice_brute[h][a]
+            if p == 0:
+                continue
+            if h - a == 1 and h < 11 and a < 11:
+                matrice_finale[h][a] += p - (p * prob_tie + p * prob_en)
+                matrice_finale[h][a + 1] += p * prob_tie
+                matrice_finale[h + 1][a] += p * prob_en
+            elif a - h == 1 and h < 11 and a < 11:
+                matrice_finale[h][a] += p - (p * prob_tie + p * prob_en)
+                matrice_finale[h + 1][a] += p * prob_tie
+                matrice_finale[h][a + 1] += p * prob_en
+            else:
+                matrice_finale[h][a] += p
+
+    masse = sum(matrice_finale[h][a] for h in range(12) for a in range(12))
+    if masse <= 0:
+        return None
+    for h in range(12):
+        for a in range(12):
+            matrice_finale[h][a] /= masse
+    return matrice_finale
+
+
+def _prob_pl_home_from_lambdas(lam_h, lam_a, rho, pl_scale=1.0):
+    """Probabilité puck line domicile -1.5 (régulation) avec scale calibré."""
+    matrice = _matrice_scores_normalisee(lam_h, lam_a, rho)
+    if not matrice:
+        return None
+    prob_1, prob_pl_home = 0.0, 0.0
+    for h in range(12):
+        for a in range(12):
+            p = matrice[h][a]
+            if h > a:
+                prob_1 += p
+            if (h - a) >= 2:
+                prob_pl_home += p
+    prob_pl_home = min(prob_pl_home * pl_scale, max(prob_1, 0.001))
+    return min(max(prob_pl_home, 0.001), 0.999)
+
+
+def _renormaliser_puck_line_explicite(prob_ml_home, prob_ml_away, prob_pl_home, prob_pl_away, pl_scale=None):
+    """Renormalisation jointe ML 2-way + puck line (PL ≤ ML)."""
+    scale = pl_scale if pl_scale is not None else lire_pl_scale()
+    s_ml = prob_ml_home + prob_ml_away
+    if s_ml > 0:
+        prob_ml_home /= s_ml
+        prob_ml_away /= s_ml
+    prob_pl_home = min(prob_pl_home * scale, prob_ml_home)
+    prob_pl_away = min(prob_pl_away * scale, prob_ml_away)
+    prob_pl_home = min(max(prob_pl_home, 0.001), 0.999)
+    prob_pl_away = min(max(prob_pl_away, 0.001), 0.999)
+    return prob_ml_home, prob_ml_away, prob_pl_home, prob_pl_away
+
+
+def _outcome_margin_ge_2(home_goals, away_goals, cote_home):
+    """True si le pari puck line -1.5 domicile/extérieur aurait gagné."""
+    margin = int(home_goals) - int(away_goals)
+    return margin >= 2 if cote_home else margin <= -2
+
+
+def _mse_pl_scale(scale, historique_matchs, rho, hia):
+    """Brier simplifié puck line domicile avec facteur d'échelle."""
+    sse, n = 0.0, 0
+    for match in historique_matchs:
+        try:
+            lam_h = float(match["lambda_domicile_calcule"])
+            lam_a = float(match["lambda_exterieur_calcule"])
+            h_goals = int(match["vrai_score_domicile"])
+            a_goals = int(match["vrai_score_exterieur"])
+            hia_ref = match.get("hia_ref", HIA_REF_CALIBRATION)
+        except (KeyError, TypeError, ValueError):
+            continue
+        lam_h, lam_a = _ajuster_lambdas_pour_hia(lam_h, lam_a, hia, hia_ref)
+        prob_pl = _prob_pl_home_from_lambdas(lam_h, lam_a, rho, scale)
+        if prob_pl is None:
+            continue
+        outcome = 1.0 if _outcome_margin_ge_2(h_goals, a_goals, True) else 0.0
+        w = _poids_recency_mle(match)
+        sse += w * (outcome - prob_pl) ** 2
+        n += 1
+    return sse / max(n, 1)
+
+
+def calibrer_pl_scale(historique_matchs, rho, hia):
+    """Grille sur facteur d'échelle prob PL domicile (après matrice)."""
+    candidats = [i / 100.0 for i in range(75, 126)]
+    meilleur, meilleur_mse = NHL_PL_SCALE_DEFAULT, float("inf")
+    for scale in candidats:
+        mse = _mse_pl_scale(scale, historique_matchs, rho, hia)
+        if mse < meilleur_mse:
+            meilleur_mse, meilleur = mse, scale
+    opt = round(meilleur, 3)
+    log_nhl(
+        f"✅ Calibrage puck line — scale {opt:.2f} (défaut {NHL_PL_SCALE_DEFAULT:.2f}, "
+        f"MSE Brier {meilleur_mse:.4f})"
+    )
+    return opt
+
+
 def _mse_ref_sensibilite(sens, historique_matchs):
-    """MSE totaux buts : modèle simplifié PP (part fixe des lambdas) × mult arbitral."""
+    """MSE totaux buts : modèle simplifié PP (part calibrée des lambdas) × mult arbitral."""
+    share = lire_pp_lam_share()
     sse, n = 0.0, 0
     for match in historique_matchs:
         rel = match.get("ref_rel")
@@ -1741,7 +2321,7 @@ def _mse_ref_sensibilite(sens, historique_matchs):
             continue
         mu = lam_h + lam_a
         mult = max(min(1.0 + sens * rel, 1.12), 0.88)
-        mu_pred = mu * (1.0 + NHL_PP_LAM_SHARE * (mult - 1.0))
+        mu_pred = mu * (1.0 + share * (mult - 1.0))
         w = _poids_recency_mle(match)
         sse += w * (total - mu_pred) ** 2
         n += 1
@@ -2022,18 +2602,21 @@ def calculate_master_odds_v4(
     away_pp_att *= away_fatigue_atk
     away_pk_def *= away_fatigue_def
 
-    # Crew arbitral : plus de sifflets → plus d'occasions PP des deux côtés
+    # Crew arbitral : part calibrée de l'effet PP sur les taux d'attaque spéciaux
     if referee_pp_mult != 1.0:
-        home_pp_att = round(home_pp_att * referee_pp_mult, 3)
-        away_pp_att = round(away_pp_att * referee_pp_mult, 3)
+        pp_share = lire_pp_lam_share()
+        mult_pp = 1.0 + pp_share * (referee_pp_mult - 1.0)
+        home_pp_att = round(home_pp_att * mult_pp, 3)
+        away_pp_att = round(away_pp_att * mult_pp, 3)
 
     lam_home_5v5 = (home_xgf / league_avg_5v5) * (away_xga / league_avg_5v5) * league_avg_5v5
     lam_away_5v5 = (away_xgf / league_avg_5v5) * (home_xga / league_avg_5v5) * league_avg_5v5
     lam_home_pp = (home_pp_att / safe_league_pp) * (away_pk_def / safe_league_pp) * safe_league_pp
     lam_away_pp = (away_pp_att / safe_league_pp) * (home_pk_def / safe_league_pp) * safe_league_pp
 
-    adj_gsax_away = gsax_per_60_vers_lambda(away_gsax)
-    adj_gsax_home = gsax_per_60_vers_lambda(home_gsax)
+    gsax_mult = lire_gsax_lam_mult()
+    adj_gsax_away = gsax_per_60_vers_lambda(away_gsax) * gsax_mult
+    adj_gsax_home = gsax_per_60_vers_lambda(home_gsax) * gsax_mult
     final_lam_home = max(lam_home_5v5 + lam_home_pp - adj_gsax_away, 0.1)
     final_lam_away = max(lam_away_5v5 + lam_away_pp - adj_gsax_home, 0.1)
 
@@ -2116,6 +2699,10 @@ def calculate_master_odds_v4(
     prob_ml_away = min(max(prob_ml_away, 0.001), 0.999)
     prob_pl_home = min(max(prob_pl_home, 0.001), 0.999)
     prob_pl_away = min(max(prob_pl_away, 0.001), 0.999)
+
+    prob_ml_home, prob_ml_away, prob_pl_home, prob_pl_away = _renormaliser_puck_line_explicite(
+        prob_ml_home, prob_ml_away, prob_pl_home, prob_pl_away,
+    )
 
     for cut in cuts_cibles:
         s_ou = prob_over_cuts[cut] + prob_under_cuts[cut]
@@ -3584,9 +4171,12 @@ def run_sniper():
             f"ref ≥{NHL_LINE_MIN_AGE_MIN} min, block ≥{NHL_LINE_STEAM_BLOCK_PCT:.1%}"
         )
     if NHL_TRAVEL_FATIGUE_ACTIF:
+        tc = _lire_travel_coeffs()
         log_nhl(
             f"✈️ Fatigue voyage : lookback {NHL_TRAVEL_LOOKBACK_JOURS}j, ref {NHL_TRAVEL_MILES_REF:.0f} mi "
-            f"+ fuseau/B2B (long solo ≥ {NHL_TRAVEL_LONG_MILES:.0f} mi)"
+            f"+ fuseau/B2B (long solo ≥ {NHL_TRAVEL_LONG_MILES:.0f} mi) — "
+            f"B2B atk-{tc['b2b_atk']:.0%}/def+{tc['b2b_def']:.0%}"
+            + (" (calibrée)" if NHL_TRAVEL_CALIB_ACTIF else " (fixe)")
         )
     if NHL_FACEOFF_ADJ_ACTIF:
         fo_sens = lire_faceoff_sensibilite()
@@ -3612,6 +4202,18 @@ def run_sniper():
             f"📅 Calibration PIT actif — lambdas historiques via MoneyPuck game-by-game "
             f"(cache {NHL_PIT_CACHE_JOURS}j, blend N-1 si GP<{NHL_BLEND_GP_PLEIN:.0f})"
         )
+    if NHL_GSAX_CALIB_ACTIF:
+        log_nhl(
+            f"🥅 GSAx PIT + calibrage λ — mult {lire_gsax_lam_mult():.2f} "
+            f"(min {NHL_GSAX_CALIB_MIN_MATCHS} matchs gardiens)"
+        )
+    if NHL_PP_LAM_SHARE_CALIB_ACTIF:
+        log_nhl(
+            f"📐 PP lam share calibré — {lire_pp_lam_share():.0%} "
+            f"(effet arbitral sur PP, min {NHL_PP_LAM_SHARE_CALIB_MIN_MATCHS} matchs)"
+        )
+    if NHL_PL_CALIB_ACTIF:
+        log_nhl(f"🏒 Puck line — scale calibré {lire_pl_scale():.2f} (renorm explicite PL ≤ ML)")
     if NHL_MLE_RECENCY_ACTIF and NHL_MLE_RECENCY_HALFLIFE_JOURS > 0:
         log_nhl(
             f"⏳ MLE recency actif — demi-vie {NHL_MLE_RECENCY_HALFLIFE_JOURS:.0f}j "
@@ -3630,6 +4232,7 @@ def run_sniper():
             lancer_la_balayeuse()
             _invalider_rho_meta_cache()
             _invalider_pit_index_memo()
+            _invalider_goalie_pit_index_memo()
 
             log_nhl("📡 Synchronisation bases de données...")
             teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
@@ -3945,6 +4548,13 @@ def lire_rho_meta():
         "ot_home_adv": NHL_OT_HOME_ADVANTAGE,
         "ref_sensibilite": NHL_REF_SENSIBILITE,
         "faceoff_sensibilite": NHL_FACEOFF_SENSIBILITE,
+        "pp_lam_share": NHL_PP_LAM_SHARE,
+        "travel_b2b_atk_pct": NHL_TRAVEL_B2B_ATK_PCT,
+        "travel_b2b_def_pct": NHL_TRAVEL_B2B_DEF_PCT,
+        "travel_solo_atk_pct": NHL_TRAVEL_SOLO_ATK_PCT,
+        "travel_solo_def_pct": NHL_TRAVEL_SOLO_DEF_PCT,
+        "gsax_lam_mult": NHL_GSAX_LAM_MULT_DEFAULT,
+        "pl_scale": NHL_PL_SCALE_DEFAULT,
         "nb_matchs": 0,
     }
     resultat = default
@@ -4107,7 +4717,11 @@ def lire_league_calib_meta():
 
 def _lambda_referentiel_match(
     teams_data, home_team, away_team,
-    date_str=None, pit_index=None, teams_n1=None, opponent_home=None, opponent_away=None,
+    date_str=None, pit_index=None, teams_n1=None,
+    home_b2b=False, away_b2b=False,
+    home_travel_mi=0.0, away_travel_mi=0.0,
+    home_gsax=0.0, away_gsax=0.0,
+    referee_pp_mult=1.0,
 ):
     """
     Lambdas 'attendues' pour un match historique (proxy calibration MLE).
@@ -4135,7 +4749,10 @@ def _lambda_referentiel_match(
 
     resultat = calculate_master_odds_v4(
         snapshot, home_team, away_team,
-        home_gsax=0.0, away_gsax=0.0,
+        home_gsax=home_gsax, away_gsax=away_gsax,
+        home_is_b2b=home_b2b, away_is_b2b=away_b2b,
+        home_travel_miles=home_travel_mi, away_travel_miles=away_travel_mi,
+        referee_pp_mult=referee_pp_mult,
         hia=hia,
     )
     if not resultat:
@@ -4143,7 +4760,7 @@ def _lambda_referentiel_match(
     return resultat["lam_home"], resultat["lam_away"], hia
 
 
-def _appliquer_lambdas_pit_aux_matchs_ligue(historique_unique, pit_index, teams_n1=None):
+def _appliquer_lambdas_pit_aux_matchs_ligue(historique_unique, pit_index, teams_n1=None, goalie_by_game=None):
     """Recalcule lambdas/FO des matchs ligue (pas journal) sans look-ahead."""
     if not NHL_PIT_CALIB_ACTIF or not pit_index:
         return 0
@@ -4155,11 +4772,32 @@ def _appliquer_lambdas_pit_aux_matchs_ligue(historique_unique, pit_index, teams_
         home, away = match.get("home"), match.get("away")
         if not date_str or not home or not away:
             continue
+        gid = match.get("game_id")
+        starters = (goalie_by_game or {}).get(str(gid), {}) if gid else {}
+        home_gsax = match.get("home_gsax")
+        away_gsax = match.get("away_gsax")
+        if home_gsax is None and home in starters:
+            home_gsax = starters[home].get("gsax_per_60", 0.0)
+        if away_gsax is None and away in starters:
+            away_gsax = starters[away].get("gsax_per_60", 0.0)
+        ref_mult = 1.0
+        ref_keys = match.get("referee_keys") or []
+        if ref_keys:
+            rel = _compute_crew_penalty_rel(ref_keys)
+            if rel is not None:
+                ref_mult = max(min(1.0 + lire_ref_sensibilite() * rel, 1.12), 0.88)
         lam_h, lam_a, hia_ref = _lambda_referentiel_match(
             None, home, away,
             date_str=date_str,
             pit_index=pit_index,
             teams_n1=teams_n1,
+            home_b2b=bool(match.get("home_b2b")),
+            away_b2b=bool(match.get("away_b2b")),
+            home_travel_mi=float(match.get("home_travel_mi", 0) or 0),
+            away_travel_mi=float(match.get("away_travel_mi", 0) or 0),
+            home_gsax=float(home_gsax or 0.0),
+            away_gsax=float(away_gsax or 0.0),
+            referee_pp_mult=ref_mult,
         )
         if lam_h is None:
             continue
@@ -4191,6 +4829,7 @@ def actualiser_historique_ligue(teams_data):
 
     teams_n1 = get_team_stats(season=NHL_SEASON - 1, blend=False) if NHL_BLEND_GP_PLEIN > 0 else None
     pit_index = construire_index_pit_moneypuck(teams_n1=teams_n1) if NHL_PIT_CALIB_ACTIF else None
+    goalie_by_game = lire_goalie_by_game_lookup() if NHL_GSAX_CALIB_ACTIF else {}
 
     meta = lire_league_calib_meta()
     games_db = meta.setdefault("games", {})
@@ -4224,11 +4863,43 @@ def actualiser_historique_ligue(teams_data):
                 home_score, away_score = home_info.get("score"), away_info.get("score")
                 if not home_abbrev or not away_abbrev or home_score is None or away_score is None:
                     continue
+                home_b2b, away_b2b, home_travel, away_travel = _contexte_calendrier_match(
+                    date_str, home_abbrev, away_abbrev, games_db,
+                )
+                starters = goalie_by_game.get(gid, {})
+                home_goalie = starters.get(home_abbrev, {}).get("name")
+                away_goalie = starters.get(away_abbrev, {}).get("name")
+                home_gsax = starters.get(home_abbrev, {}).get("gsax_per_60")
+                away_gsax = starters.get(away_abbrev, {}).get("gsax_per_60")
+                if home_gsax is None or away_gsax is None:
+                    g_ext, g_dom = _fetch_goalie_starters_boxscore(game["id"])
+                    if home_gsax is None and g_dom:
+                        home_goalie = g_dom
+                        home_gsax = _gsax_gardien_avant_match(
+                            construire_index_gsax_gardiens(), g_dom, date_str, gid,
+                        )
+                    if away_gsax is None and g_ext:
+                        away_goalie = g_ext
+                        away_gsax = _gsax_gardien_avant_match(
+                            construire_index_gsax_gardiens(), g_ext, date_str, gid,
+                        )
+                ref_names = get_game_referees(game["id"])
+                ref_keys = [_normaliser_nom_arbitre(n) for n in ref_names] if ref_names else []
+                ref_mult = 1.0
+                if ref_keys:
+                    rel = _compute_crew_penalty_rel(ref_keys)
+                    if rel is not None:
+                        ref_mult = max(min(1.0 + lire_ref_sensibilite() * rel, 1.12), 0.88)
                 lam_h, lam_a, hia_ref = _lambda_referentiel_match(
                     teams_data, home_abbrev, away_abbrev,
                     date_str=date_str,
                     pit_index=pit_index,
                     teams_n1=teams_n1,
+                    home_b2b=home_b2b, away_b2b=away_b2b,
+                    home_travel_mi=home_travel, away_travel_mi=away_travel,
+                    home_gsax=float(home_gsax or 0.0),
+                    away_gsax=float(away_gsax or 0.0),
+                    referee_pp_mult=ref_mult,
                 )
                 if lam_h is None:
                     scanned.add(gid)
@@ -4250,9 +4921,8 @@ def actualiser_historique_ligue(teams_data):
                     away_base = next((t for t in teams_data if t.get("team") == away_abbrev), None)
                     home_fo = home_base.get("fo_pct", 0.5) if home_base else 0.5
                     away_fo = away_base.get("fo_pct", 0.5) if away_base else 0.5
-                ref_names = get_game_referees(game["id"])
-                ref_keys = [_normaliser_nom_arbitre(n) for n in ref_names] if ref_names else []
                 games_db[gid] = {
+                    "game_id": gid,
                     "date": date_str,
                     "home": home_abbrev, "away": away_abbrev,
                     "vrai_score_domicile": int(home_score),
@@ -4264,6 +4934,14 @@ def actualiser_historique_ligue(teams_data):
                     "referee_keys": ref_keys,
                     "home_fo_pct": round(float(home_fo), 4),
                     "away_fo_pct": round(float(away_fo), 4),
+                    "home_b2b": home_b2b,
+                    "away_b2b": away_b2b,
+                    "home_travel_mi": home_travel,
+                    "away_travel_mi": away_travel,
+                    "home_goalie": home_goalie,
+                    "away_goalie": away_goalie,
+                    "home_gsax": home_gsax,
+                    "away_gsax": away_gsax,
                     "lambdas_pit": bool(pit_index),
                 }
                 scanned.add(gid)
@@ -4295,11 +4973,13 @@ def entrainer_ia_dixon_coles():
     historique_unique = {}
     teams_n1 = get_team_stats(season=NHL_SEASON - 1, blend=False) if NHL_BLEND_GP_PLEIN > 0 else None
     pit_index = construire_index_pit_moneypuck(teams_n1=teams_n1) if NHL_PIT_CALIB_ACTIF else None
+    goalie_by_game = lire_goalie_by_game_lookup() if NHL_GSAX_CALIB_ACTIF else {}
 
     if NHL_LIGUE_CALIB_ACTIF:
         for gid, data in lire_league_calib_meta().get("games", {}).items():
             ref_keys = data.get("referee_keys", [])
             historique_unique[gid] = {
+                "game_id": gid,
                 "date": data.get("date"),
                 "home": data.get("home"),
                 "away": data.get("away"),
@@ -4313,6 +4993,12 @@ def entrainer_ia_dixon_coles():
                 "ref_rel": _compute_crew_penalty_rel(ref_keys) if ref_keys else None,
                 "home_fo_pct": data.get("home_fo_pct"),
                 "away_fo_pct": data.get("away_fo_pct"),
+                "home_b2b": data.get("home_b2b"),
+                "away_b2b": data.get("away_b2b"),
+                "home_travel_mi": data.get("home_travel_mi"),
+                "away_travel_mi": data.get("away_travel_mi"),
+                "home_gsax": data.get("home_gsax"),
+                "away_gsax": data.get("away_gsax"),
                 "lambdas_pit": data.get("lambdas_pit", False),
             }
     nb_ligue = len(historique_unique)
@@ -4351,7 +5037,9 @@ def entrainer_ia_dixon_coles():
                         "_from_journal": True,
                     }
 
-    nb_pit = _appliquer_lambdas_pit_aux_matchs_ligue(historique_unique, pit_index, teams_n1=teams_n1)
+    nb_pit = _appliquer_lambdas_pit_aux_matchs_ligue(
+        historique_unique, pit_index, teams_n1=teams_n1, goalie_by_game=goalie_by_game,
+    )
     if nb_pit > 0:
         log_nhl(f"📅 Lambdas PIT recalculées sur {nb_pit} match(s) ligue (sans look-ahead)")
 
@@ -4387,6 +5075,23 @@ def entrainer_ia_dixon_coles():
         "faceoff_sensibilite": float(
             meta_precedent.get("faceoff_sensibilite", NHL_FACEOFF_SENSIBILITE)
         ),
+        "pp_lam_share": float(meta_precedent.get("pp_lam_share", NHL_PP_LAM_SHARE)),
+        "travel_b2b_atk_pct": float(
+            meta_precedent.get("travel_b2b_atk_pct", NHL_TRAVEL_B2B_ATK_PCT)
+        ),
+        "travel_b2b_def_pct": float(
+            meta_precedent.get("travel_b2b_def_pct", NHL_TRAVEL_B2B_DEF_PCT)
+        ),
+        "travel_solo_atk_pct": float(
+            meta_precedent.get("travel_solo_atk_pct", NHL_TRAVEL_SOLO_ATK_PCT)
+        ),
+        "travel_solo_def_pct": float(
+            meta_precedent.get("travel_solo_def_pct", NHL_TRAVEL_SOLO_DEF_PCT)
+        ),
+        "gsax_lam_mult": float(
+            meta_precedent.get("gsax_lam_mult", NHL_GSAX_LAM_MULT_DEFAULT)
+        ),
+        "pl_scale": float(meta_precedent.get("pl_scale", NHL_PL_SCALE_DEFAULT)),
         "nb_matchs": nb,
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
@@ -4418,6 +5123,27 @@ def entrainer_ia_dixon_coles():
     )
     if NHL_FACEOFF_CALIB_ACTIF and n_fo_calib >= NHL_FACEOFF_CALIB_MIN_MATCHS:
         meta["faceoff_sensibilite"], _ = calibrer_faceoff_sensibilite(dataset)
+
+    if NHL_PP_LAM_SHARE_CALIB_ACTIF and n_ref_calib >= NHL_PP_LAM_SHARE_CALIB_MIN_MATCHS:
+        meta["pp_lam_share"], _ = calibrer_pp_lam_share(dataset, meta["ref_sensibilite"])
+
+    n_travel = sum(1 for m in dataset if _match_a_signal_travel(m))
+    if NHL_TRAVEL_CALIB_ACTIF and n_travel >= NHL_TRAVEL_CALIB_MIN_MATCHS:
+        coeffs, _ = calibrer_travel_fatigue(dataset)
+        meta["travel_b2b_atk_pct"] = coeffs["b2b_atk"]
+        meta["travel_b2b_def_pct"] = coeffs["b2b_def"]
+        meta["travel_solo_atk_pct"] = coeffs["solo_atk"]
+        meta["travel_solo_def_pct"] = coeffs["solo_def"]
+
+    n_gsax = sum(
+        1 for m in dataset
+        if m.get("home_gsax") is not None or m.get("away_gsax") is not None
+    )
+    if NHL_GSAX_CALIB_ACTIF and n_gsax >= NHL_GSAX_CALIB_MIN_MATCHS:
+        meta["gsax_lam_mult"], _ = calibrer_gsax_lam_mult(dataset)
+
+    if NHL_PL_CALIB_ACTIF and nb >= NHL_PL_CALIB_MIN_MATCHS:
+        meta["pl_scale"] = calibrer_pl_scale(dataset, meta["rho"], meta["hia"])
 
     with open(RHO_META_FILE, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

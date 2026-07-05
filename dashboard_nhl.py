@@ -211,8 +211,16 @@ def _afficher_etat_modele():
         c3.caption(f"NB O/U r **{float(rho_meta.get('nb_ou_dispersion', 25)):.1f}**")
         c4.caption(
             f"ref sens. **{float(rho_meta.get('ref_sensibilite', 0.2)):.2f}** · "
-            f"FO sens. **{float(rho_meta.get('faceoff_sensibilite', 0.25)):.2f}**"
+            f"FO sens. **{float(rho_meta.get('faceoff_sensibilite', 0.25)):.2f}** · "
+            f"PP share **{float(rho_meta.get('pp_lam_share', 0.2)):.0%}**"
         )
+        c5, c6, c7 = st.columns(3)
+        c5.caption(
+            f"voyage B2B **{float(rho_meta.get('travel_b2b_atk_pct', 0.04)):.0%}**/"
+            f"**+{float(rho_meta.get('travel_b2b_def_pct', 0.06)):.0%}**"
+        )
+        c6.caption(f"GSAx→λ mult **{float(rho_meta.get('gsax_lam_mult', 1.0)):.2f}**")
+        c7.caption(f"PL scale **{float(rho_meta.get('pl_scale', 1.0)):.2f}**")
 
     if hia_meta and hia_meta.get("teams"):
         teams = hia_meta["teams"]
