@@ -101,6 +101,11 @@ NHL_MLE_RECENCY_ACTIF = _env_bool("NHL_MLE_RECENCY_ACTIF", True)
 NHL_MLE_RECENCY_HALFLIFE_JOURS = float(os.environ.get("NHL_MLE_RECENCY_HALFLIFE_JOURS", "28"))
 NHL_MARCHE_COHERENCE_ACTIF = _env_bool("NHL_MARCHE_COHERENCE_ACTIF", True)
 NHL_REF_SHRINK_ACTIF = _env_bool("NHL_REF_SHRINK_ACTIF", True)
+NHL_KELLY_PORTFOLIO_ACTIF = _env_bool("NHL_KELLY_PORTFOLIO_ACTIF", True)
+NHL_KELLY_PORTFOLIO_RHO_LIGUE = float(os.environ.get("NHL_KELLY_PORTFOLIO_RHO_LIGUE", "0.05"))
+NHL_KELLY_PORTFOLIO_RHO_REF = float(os.environ.get("NHL_KELLY_PORTFOLIO_RHO_REF", "0.12"))
+NHL_KELLY_PORTFOLIO_RHO_MEME_MATCH = float(os.environ.get("NHL_KELLY_PORTFOLIO_RHO_MEME_MATCH", "0.70"))
+NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT = float(os.environ.get("NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT", "4.0"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
 NHL_HIA_PAR_EQUIPE_ACTIF = _env_bool("NHL_HIA_PAR_EQUIPE_ACTIF", True)
@@ -137,6 +142,7 @@ _line_move_logue = False
 _marche_coherence_logue = False
 _ref_shrink_logue = False
 _hia_equipe_logue = False
+_kelly_portfolio_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -2348,6 +2354,211 @@ def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kel
         'statut_gardiens': "CONFIRMÉ" if gardiens_confirmes else "PROBABLE",
     }
 
+
+def _marche_depuis_type_pari(type_pari):
+    t = (type_pari or "").upper()
+    if t.startswith("OVER") or t.startswith("UNDER"):
+        return "OU"
+    if "PUCK LINE" in t:
+        return "PL"
+    return "ML"
+
+
+def _lire_paris_en_cours_soiree():
+    """Paris EN ATTENTE du jour (exposition déjà engagée ce soir)."""
+    if not os.path.exists(FICHIER_JOURNAL):
+        return []
+    today = datetime.now().strftime("%Y-%m-%d")
+    paris = []
+    try:
+        with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if not row.get("Date", "").startswith(today):
+                    continue
+                if row.get("Statut") != "EN ATTENTE":
+                    continue
+                try:
+                    mise = float(row.get("Mise_€", 0) or 0)
+                except (TypeError, ValueError):
+                    mise = 0.0
+                if mise <= 0:
+                    continue
+                paris.append({
+                    "game_id": row["ID_Match"].split("_")[0],
+                    "home_team": row.get("Local", ""),
+                    "away_team": row.get("Visiteur", ""),
+                    "marche": _marche_depuis_type_pari(row.get("Pari", "")),
+                    "type": row.get("Pari", ""),
+                    "mise": mise,
+                    "referee_names": [],
+                })
+    except Exception as e:
+        log_nhl(f"⚠️ Erreur lecture paris soirée (Kelly portefeuille) : {e}", level="warning")
+    return paris
+
+
+def _meta_correlation_pari(source):
+    """Normalise métadonnées pour l'estimation de corrélation entre paris."""
+    if "m" in source:
+        m = source["m"]
+        best = source.get("best_pari", {})
+        return {
+            "game_id": str(m.get("game_id", "")),
+            "home_team": m.get("home_team", ""),
+            "away_team": m.get("away_team", ""),
+            "marche": best.get("marche", _marche_depuis_type_pari(best.get("type", ""))),
+            "type": best.get("type", ""),
+            "mise": float(best.get("inv", {}).get("mise", 0) or 0),
+            "referee_names": source.get("referee_names") or [],
+        }
+    return {
+        "game_id": str(source.get("game_id", "")),
+        "home_team": source.get("home_team", ""),
+        "away_team": source.get("away_team", ""),
+        "marche": source.get("marche", _marche_depuis_type_pari(source.get("type", ""))),
+        "type": source.get("type", ""),
+        "mise": float(source.get("mise", 0) or 0),
+        "referee_names": source.get("referee_names") or [],
+    }
+
+
+def _estimer_correlation_pari(pari_a, pari_b):
+    """
+    Corrélation heuristique entre deux paris NHL simultanés :
+    - même match (rare si 1 pari/match) → forte
+    - même soir, arbitres communs → modérée
+    - matchs différents → faible (slate ligue)
+    """
+    a, b = _meta_correlation_pari(pari_a), _meta_correlation_pari(pari_b)
+    if a["game_id"] and a["game_id"] == b["game_id"]:
+        return NHL_KELLY_PORTFOLIO_RHO_MEME_MATCH
+
+    refs_a = set(a.get("referee_names") or [])
+    refs_b = set(b.get("referee_names") or [])
+    if refs_a and refs_b and (refs_a & refs_b):
+        return NHL_KELLY_PORTFOLIO_RHO_REF
+
+    return NHL_KELLY_PORTFOLIO_RHO_LIGUE
+
+
+def _ajuster_opportunites_portefeuille(opportunites, bankroll):
+    """
+    Réduit les mises Kelly quand plusieurs paris partagent du risque corrélé
+    la même soirée (paris déjà en journal + nouvelles opportunités du scan).
+    """
+    global _kelly_portfolio_logue
+    if not NHL_KELLY_PORTFOLIO_ACTIF or not opportunites or bankroll <= 0:
+        return opportunites
+
+    if not _kelly_portfolio_logue:
+        _kelly_portfolio_logue = True
+        log_nhl(
+            f"📊 Kelly portefeuille actif — ρ ligue {NHL_KELLY_PORTFOLIO_RHO_LIGUE:.2f}, "
+            f"ρ arbitres {NHL_KELLY_PORTFOLIO_RHO_REF:.2f}, "
+            f"exposition max soir {NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT:.1f}% bankroll"
+        )
+
+    existants = _lire_paris_en_cours_soiree()
+    selected = list(existants)
+    exposure = sum(p["mise"] for p in existants)
+    max_exposure = bankroll * (NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT / 100.0)
+
+    triees = sorted(
+        opportunites,
+        key=lambda o: o["best_pari"]["inv"]["edge"],
+        reverse=True,
+    )
+    resultat = []
+
+    for opp in triees:
+        inv = dict(opp["best_pari"]["inv"])
+        mise = float(inv["mise"])
+
+        penalty = 1.0
+        for other in selected:
+            rho = _estimer_correlation_pari(opp, other)
+            if rho > 0:
+                penalty += rho * (other["mise"] / bankroll)
+
+        mise_adj = mise / max(penalty, 1.0)
+
+        if exposure + mise_adj > max_exposure:
+            mise_adj = max(0.0, max_exposure - exposure)
+
+        mise_adj = round(mise_adj, 2)
+        if mise_adj <= 0:
+            log_nhl(
+                f"📊 Kelly portefeuille — mise annulée (exposition soir saturée) : "
+                f"{opp['best_pari']['type']} ({opp['m']['away_team']} @ {opp['m']['home_team']})",
+                level="warning",
+            )
+            continue
+
+        if mise_adj + 0.009 < mise:
+            log_nhl(
+                f"📊 Kelly portefeuille — {opp['best_pari']['type']} "
+                f"({opp['m']['away_team']} @ {opp['m']['home_team']}) : "
+                f"{mise} € → {mise_adj} € (pénalité x{penalty:.2f})"
+            )
+
+        inv["mise"] = mise_adj
+        inv["pct_bankroll"] = round((mise_adj / bankroll) * 100, 2) if bankroll > 0 else 0.0
+
+        opp_ajust = dict(opp)
+        opp_ajust["best_pari"] = dict(opp["best_pari"])
+        opp_ajust["best_pari"]["inv"] = inv
+        resultat.append(opp_ajust)
+
+        selected.append(_meta_correlation_pari(opp_ajust))
+        exposure += mise_adj
+
+    return resultat
+
+
+def _executer_opportunite(opp):
+    """Envoie Telegram + journal pour une opportunité validée."""
+    m = opp["m"]
+    best_pari = opp["best_pari"]
+    id_match = opp["id_match"]
+    g_ext, g_dom = opp["g_ext"], opp["g_dom"]
+    cotes_vraies = opp["cotes_vraies"]
+
+    log_nhl(
+        f"🎯 Edge {best_pari['inv']['edge']}% [{best_pari.get('marche', '?')}] — "
+        f"{best_pari['type']} ({m['away_team']} @ {m['home_team']}) "
+        f"mise {best_pari['inv']['mise']} €"
+    )
+
+    if limite_paris_jour_atteinte():
+        log_nhl(
+            f"🛑 Limite paris/jour atteinte ({NHL_PARIS_JOUR_MAX}) — signal ignoré.",
+            level="warning",
+        )
+        return
+
+    if NHL_DRY_RUN:
+        envoyer_alerte(
+            m["away_team"], g_ext, m["home_team"], g_dom,
+            best_pari["cote_vraie"], best_pari["inv"], best_pari["type"],
+            dry_run=True,
+        )
+        enregistrer_notification(id_match)
+        return
+
+    envoyer_alerte(
+        m["away_team"], g_ext, m["home_team"], g_dom,
+        best_pari["cote_vraie"], best_pari["inv"], best_pari["type"],
+    )
+    enregistrer_transaction(
+        id_match, m["away_team"], m["home_team"], best_pari["type"],
+        best_pari["cote_vraie"], cotes_vraies, best_pari["inv"], best_pari["cote_book"],
+        gardien_ext=g_ext, gardien_dom=g_dom,
+        gardiens_confirmes=opp["gardiens_verrouilles"],
+        b2b_home=opp["home_b2b"], b2b_away=opp["away_b2b"],
+        rho=opp["rho"], hia=opp["hia_match"],
+    )
+    enregistrer_notification(id_match)
+
 # ==========================================
 # 6. JOURNAL DE TRADING & NOTIFICATIONS
 # ==========================================
@@ -2632,6 +2843,11 @@ def run_sniper():
             f"📊 Kelly CLV actif — fenêtre {NHL_KELLY_CLV_FENETRE} paris (min {NHL_KELLY_CLV_MIN_PARIS}), "
             f"sensibilité {NHL_KELLY_CLV_SENSIBILITE:.0%}, mult. plancher x{NHL_KELLY_CLV_MULT_MIN:.2f}"
         )
+    if NHL_KELLY_PORTFOLIO_ACTIF:
+        log_nhl(
+            f"📊 Kelly portefeuille actif — ρ ligue {NHL_KELLY_PORTFOLIO_RHO_LIGUE:.2f}, "
+            f"exposition max soir {NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT:.1f}% bankroll"
+        )
     if NHL_LINE_MOVE_ACTIF:
         log_nhl(
             f"📉 Line movement / steam — snapshots max {NHL_LINE_MAX_SNAPSHOTS}, "
@@ -2711,6 +2927,7 @@ def run_sniper():
             odds_cache = fetch_all_pinnacle_odds()
 
             matchs = get_nhl_games_today()
+            opportunites = []
             if not matchs:
                 log_nhl("🏒 Aucun match NHL éligible dans la fenêtre de scan — veille active.")
             else:
@@ -2840,38 +3057,21 @@ def run_sniper():
                     )
                     best_pari = _choisir_meilleur_pari(candidats)
 
-                    # --- Envoi de la transaction finale ---
                     if best_pari:
-                        log_nhl(
-                            f"🎯 Edge {best_pari['inv']['edge']}% [{best_pari.get('marche', '?')}] — "
-                            f"{best_pari['type']} ({m['away_team']} @ {m['home_team']}) "
-                            f"mise {best_pari['inv']['mise']} €"
-                        )
-                        if limite_paris_jour_atteinte():
-                            log_nhl(
-                                f"🛑 Limite paris/jour atteinte ({NHL_PARIS_JOUR_MAX}) — signal ignoré.",
-                                level="warning",
-                            )
-                        elif NHL_DRY_RUN:
-                            envoyer_alerte(
-                                m['away_team'], g_ext, m['home_team'], g_dom,
-                                best_pari['cote_vraie'], best_pari['inv'], best_pari['type'],
-                                dry_run=True,
-                            )
-                            enregistrer_notification(id_match)
-                        else:
-                            envoyer_alerte(
-                                m['away_team'], g_ext, m['home_team'], g_dom,
-                                best_pari['cote_vraie'], best_pari['inv'], best_pari['type'],
-                            )
-                            enregistrer_transaction(
-                                id_match, m['away_team'], m['home_team'], best_pari['type'],
-                                best_pari['cote_vraie'], cotes_vraies, best_pari['inv'], best_pari['cote_book'],
-                                gardien_ext=g_ext, gardien_dom=g_dom,
-                                gardiens_confirmes=gardiens_verrouilles,
-                                b2b_home=home_b2b, b2b_away=away_b2b, rho=rho_actuel, hia=hia_match,
-                            )
-                            enregistrer_notification(id_match)
+                        opportunites.append({
+                            "m": m,
+                            "id_match": id_match,
+                            "best_pari": best_pari,
+                            "cotes_vraies": cotes_vraies,
+                            "g_ext": g_ext,
+                            "g_dom": g_dom,
+                            "gardiens_verrouilles": gardiens_verrouilles,
+                            "home_b2b": home_b2b,
+                            "away_b2b": away_b2b,
+                            "hia_match": hia_match,
+                            "rho": rho_actuel,
+                            "referee_names": referee_names,
+                        })
                     else:
                         if not gardiens_verrouilles:
                             log_nhl(
@@ -2880,6 +3080,11 @@ def run_sniper():
                             )
                         else:
                             log_nhl(f"— Pas d'edge suffisant — {m['away_team']} @ {m['home_team']}")
+
+            if opportunites:
+                opportunites = _ajuster_opportunites_portefeuille(opportunites, bankroll_actuelle)
+                for opp in opportunites:
+                    _executer_opportunite(opp)
             time.sleep(900)
         except Exception as e:
             log_nhl(f"⚠️ Erreur système : {e}", level="error")
