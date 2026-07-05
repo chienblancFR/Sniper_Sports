@@ -1,4 +1,5 @@
 import copy
+import unicodedata
 import requests
 import csv
 import math
@@ -51,7 +52,7 @@ FICHIER_JOURNAL = (
     else JOURNAL_NOM
 )
 BANKROLL_INITIALE = float(os.environ.get("NHL_BANKROLL", "1000.0"))
-NHL_SEASON = int(os.environ.get("NHL_SEASON", "2026"))
+NHL_SEASON = int(os.environ.get("NHL_SEASON", "2027"))
 EDGE_MINIMUM = float(os.environ.get("NHL_EDGE_MIN", "0.02"))
 # Edge min plus élevé tant que les gardiens ne sont pas confirmés (sinon on attend)
 NHL_EDGE_MIN_PROBABLE = float(os.environ.get("NHL_EDGE_MIN_PROBABLE", "0.04"))
@@ -82,6 +83,9 @@ NHL_LINE_STEAM_EDGE_EXTRA = float(os.environ.get("NHL_LINE_STEAM_EDGE_EXTRA", "0
 NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
 NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
 NHL_ODDS_QUOTA_ALERT = int(os.environ.get("NHL_ODDS_QUOTA_ALERT", "100"))
+NHL_OPS_ALERTES_ACTIF = _env_bool("NHL_OPS_ALERTES_ACTIF", True)
+NHL_OPS_ALERTE_COOLDOWN_H = float(os.environ.get("NHL_OPS_ALERTE_COOLDOWN_H", "6"))
+NHL_LIGUE_CALIB_BOOTSTRAP_DEMARRAGE = _env_bool("NHL_LIGUE_CALIB_BOOTSTRAP_DEMARRAGE", True)
 NHL_BLEND_GP_PLEIN = float(os.environ.get("NHL_BLEND_GP_PLEIN", "20"))
 NHL_PP_PK_SHRINK_GP = float(os.environ.get("NHL_PP_PK_SHRINK_GP", "20"))
 # MoneyPuck fournit nativement des CSV "forme récente" (10 ou 20 derniers matchs)
@@ -212,8 +216,14 @@ NHL_TEAMS_MAPPING = {
 
 # Alias The-Odds-API (noms alternatifs Pinnacle → clé interne)
 ODDS_API_ALIASES = {
-    "Montreal Canadiens": ["Montréal Canadiens"],
-    "Utah Hockey Club": ["Utah Mammoth"],
+    "Montreal Canadiens": ["Montréal Canadiens", "Montreal Canadians"],
+    "Utah Hockey Club": ["Utah Mammoth", "Utah HC", "Utah"],
+    "St Louis Blues": ["St. Louis Blues"],
+    "Los Angeles Kings": ["LA Kings"],
+    "New York Islanders": ["NY Islanders"],
+    "New York Rangers": ["NY Rangers"],
+    "Tampa Bay Lightning": ["TB Lightning"],
+    "Vegas Golden Knights": ["Vegas Knights"],
 }
 # Index inverse : alias → nom primaire
 _ODDS_NOM_PRIMAIRE = {}
@@ -255,6 +265,8 @@ JOURNAL_COLONNES = [
 ]
 
 _odds_quota_state = {"derniere_alerte": None}
+_ops_alerte_derniere = {}
+_odds_alias_runtime = {}
 
 # ==========================================
 # 1. ASPIRATEURS DE DONNÉES (MoneyPuck)
@@ -291,6 +303,16 @@ def _fetch_moneypuck_csv(kind, season):
     return None, None
 
 
+def verifier_moneypuck_saison(season=None):
+    """Vérifie que teams.csv MoneyPuck est disponible (saison N puis N-1)."""
+    season = season or NHL_SEASON
+    texte, saison_utilisee = _fetch_moneypuck_csv("teams", season)
+    if not texte:
+        return False, f"teams.csv indisponible pour saison {season} et {season - 1}", None
+    teams = _parser_team_stats_csv(texte)
+    if not teams:
+        return False, f"teams.csv vide pour saison {saison_utilisee}", saison_utilisee
+    return True, f"{len(teams)} équipes (saison MoneyPuck {saison_utilisee})", saison_utilisee
 
 
 def _resoudre_colonnes_xg(fieldnames):
@@ -2273,19 +2295,182 @@ def shrink_cotes_vers_marche(cotes_vraies, cotes_bookmaker, cotes_puckline, gp_m
 # ==========================================
 # 5. INTEGRATION THE-ODDS-API & FINANCIAL
 # ==========================================
+def _cle_nom_odds(nom):
+    """Normalise un nom d'équipe pour comparaison fuzzy (accents, ponctuation)."""
+    if not nom:
+        return ""
+    txt = unicodedata.normalize("NFKD", str(nom))
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+    return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in txt).split())
+
+
+def _resoudre_primaire_depuis_nom(nom_api):
+    """Résout un nom Odds API vers notre nom primaire interne, ou None si inconnu."""
+    if not nom_api:
+        return None
+    if nom_api in NHL_TEAMS_MAPPING.values():
+        return nom_api
+    if nom_api in _ODDS_NOM_PRIMAIRE:
+        return _ODDS_NOM_PRIMAIRE[nom_api]
+    cle = _cle_nom_odds(nom_api)
+    for primaire in NHL_TEAMS_MAPPING.values():
+        if _cle_nom_odds(primaire) == cle:
+            return primaire
+        for alias in ODDS_API_ALIASES.get(primaire, []):
+            if _cle_nom_odds(alias) == cle:
+                return primaire
+    return None
+
+
+def _ops_alerte_envoyer(cle, message, niveau="warning"):
+    """Alerte Telegram ops throttlée (cooldown configurable)."""
+    if not NHL_OPS_ALERTES_ACTIF:
+        log_nhl(message.replace("*", ""), level=niveau)
+        return
+    now = datetime.now()
+    last = _ops_alerte_derniere.get(cle)
+    if last and (now - last).total_seconds() < NHL_OPS_ALERTE_COOLDOWN_H * 3600:
+        return
+    _ops_alerte_derniere[cle] = now
+    log_nhl(message.replace("*", ""), level=niveau)
+    envoyer_alerte_systeme(message)
+
+
+def _extraire_matchs_uniques_odds_cache(cache):
+    """Déduplique les matchs indexés dans le cache Odds API."""
+    seen = set()
+    matchs = []
+    for parsed in cache.values():
+        h, a = parsed.get("home_full"), parsed.get("away_full")
+        if not h or not a:
+            continue
+        key = (h, a)
+        if key in seen:
+            continue
+        seen.add(key)
+        matchs.append(parsed)
+    return matchs
+
+
+def _enregistrer_aliases_runtime(odds_cache):
+    """Mémorise les noms API découverts pour enrichir le mapping au fil des cycles."""
+    global _odds_alias_runtime
+    for parsed in _extraire_matchs_uniques_odds_cache(odds_cache):
+        for nom in (parsed["home_full"], parsed["away_full"]):
+            primaire = _resoudre_primaire_depuis_nom(nom)
+            if primaire:
+                _odds_alias_runtime.setdefault(primaire, set()).add(nom)
+
+
+def auditer_mapping_odds_api(odds_cache):
+    """Compare les noms Pinnacle aux abréviations NHL internes ; alerte si non résolu."""
+    if not odds_cache:
+        if ODDS_API_KEY:
+            log_nhl("ℹ️ Odds API : aucun match NHL Pinnacle indexé (off-season ou marché vide).")
+        return
+    noms_api = set()
+    for parsed in _extraire_matchs_uniques_odds_cache(odds_cache):
+        noms_api.add(parsed["home_full"])
+        noms_api.add(parsed["away_full"])
+    non_resolus = sorted(n for n in noms_api if _resoudre_primaire_depuis_nom(n) is None)
+    if non_resolus:
+        liste = "\n".join(f"• {n}" for n in non_resolus)
+        log_nhl(f"⚠️ Noms Odds API non mappés : {', '.join(non_resolus)}", level="warning")
+        _ops_alerte_envoyer(
+            "mapping_odds",
+            f"⚠️ **Mapping Odds API — équipes non reconnues**\n\n{liste}\n\n"
+            f"Ajouter un alias dans `ODDS_API_ALIASES` ou vérifier `NHL_TEAMS_MAPPING`.",
+        )
+    else:
+        log_nhl(f"✅ Mapping Odds API OK — {len(noms_api)} nom(s) Pinnacle reconnus")
+
+
+def auditer_couverture_odds(matchs, odds_cache):
+    """Compte les matchs NHL scannés avec/sans cotes Pinnacle."""
+    sans_cotes = []
+    avec = 0
+    abbrevs_inconnues = []
+    for m in matchs:
+        for abbrev in (m.get("home_team"), m.get("away_team")):
+            if abbrev and abbrev not in NHL_TEAMS_MAPPING:
+                abbrevs_inconnues.append(abbrev)
+        hit = get_odds_for_match(
+            m["home_team"], m["away_team"], odds_cache, log_si_absent=False,
+        )
+        if hit:
+            avec += 1
+        else:
+            sans_cotes.append(f"{m['away_team']} @ {m['home_team']}")
+    if abbrevs_inconnues:
+        uniques = sorted(set(abbrevs_inconnues))
+        log_nhl(f"⚠️ Abréviations NHL sans mapping Odds : {', '.join(uniques)}", level="warning")
+        _ops_alerte_envoyer(
+            "abbrev_inconnue",
+            f"⚠️ **Abréviations NHL inconnues**\n\n"
+            f"{', '.join(uniques)}\n\nMettre à jour `NHL_TEAMS_MAPPING`.",
+        )
+    return {"eligible": len(matchs), "avec_cotes": avec, "sans_cotes": sans_cotes}
+
+
+def diagnostic_pret_saison():
+    """Contrôles ops au démarrage : MoneyPuck, Odds API, mapping, bootstrap calibration."""
+    log_nhl(f"🔍 Diagnostic prêt-saison — NHL_SEASON={NHL_SEASON} (MoneyPuck/NHL convention)")
+
+    if not ODDS_API_KEY:
+        _ops_alerte_envoyer(
+            "odds_key_absente",
+            "🚨 **Sniper NHL — clé Odds API absente**\n\n"
+            "Sans `API_ODDS_KEY`, aucune cote Pinnacle → **zéro signal possible**.",
+        )
+
+    mp_ok, mp_msg, mp_saison = verifier_moneypuck_saison()
+    if mp_ok:
+        log_nhl(f"✅ MoneyPuck : {mp_msg}")
+        if mp_saison != NHL_SEASON:
+            log_nhl(
+                f"ℹ️ Repli MoneyPuck N-1 actif ({mp_saison}) — normal en pré-saison "
+                f"si {NHL_SEASON} pas encore publié.",
+            )
+    else:
+        _ops_alerte_envoyer(
+            "moneypuck_indisponible",
+            f"⚠️ **MoneyPuck indisponible**\n\n{mp_msg}\n\nLe bot tournera en veille.",
+        )
+
+    odds_cache = fetch_all_pinnacle_odds()
+    auditer_mapping_odds_api(odds_cache)
+
+    if NHL_LIGUE_CALIB_BOOTSTRAP_DEMARRAGE and NHL_LIGUE_CALIB_ACTIF:
+        meta = lire_league_calib_meta()
+        nb_avant = len(meta.get("games", {}))
+        if nb_avant < NHL_LIGUE_CALIB_MIN_MATCHS:
+            log_nhl(
+                f"📚 Bootstrap calibration ligue au démarrage : {nb_avant}/"
+                f"{NHL_LIGUE_CALIB_MIN_MATCHS} matchs indexés…"
+            )
+            teams = get_team_stats(blend=True)
+            if teams:
+                actualiser_historique_ligue(teams)
+                entrainer_ia_dixon_coles()
+                nb_apres = len(lire_league_calib_meta().get("games", {}))
+                log_nhl(f"📚 Bootstrap terminé : {nb_apres} match(s) ligue indexés")
+            entrainer_ia_dixon_coles()
+
+
 def _noms_odds_pour_equipe(abbrev):
-    """Liste des noms possibles pour une équipe (primaire + alias Pinnacle)."""
+    """Liste des noms possibles pour une équipe (primaire + alias Pinnacle + runtime)."""
     primaire = NHL_TEAMS_MAPPING.get(abbrev)
     if not primaire:
         return []
-    return [primaire] + ODDS_API_ALIASES.get(primaire, [])
+    noms = {primaire, *ODDS_API_ALIASES.get(primaire, [])}
+    noms.update(_odds_alias_runtime.get(primaire, set()))
+    return list(noms)
 
 
 def _nom_odds_vers_primaire(nom_api):
     """Mappe un nom Odds API vers notre nom primaire interne."""
-    if nom_api in NHL_TEAMS_MAPPING.values():
-        return nom_api
-    return _ODDS_NOM_PRIMAIRE.get(nom_api, nom_api)
+    resolu = _resoudre_primaire_depuis_nom(nom_api)
+    return resolu if resolu else nom_api
 
 
 def _noms_equipe_equivalents(nom):
@@ -2293,12 +2478,16 @@ def _noms_equipe_equivalents(nom):
     if not nom:
         return set()
     primaire = _nom_odds_vers_primaire(nom)
-    return {nom, primaire} | set(ODDS_API_ALIASES.get(primaire, []))
+    equiv = {nom, primaire} | set(ODDS_API_ALIASES.get(primaire, []))
+    equiv.update(_odds_alias_runtime.get(primaire, set()))
+    return equiv
 
 
 def _outcome_est_equipe(outcome_name, team_name):
     """True si le libellé Pinnacle correspond à l'équipe (alias inclus)."""
     if outcome_name == team_name:
+        return True
+    if _cle_nom_odds(outcome_name) == _cle_nom_odds(team_name):
         return True
     equiv_outcome = _noms_equipe_equivalents(outcome_name)
     equiv_team = _noms_equipe_equivalents(team_name)
@@ -2383,7 +2572,9 @@ def fetch_all_pinnacle_odds():
             parsed = _parse_pinnacle_game(game)
             if parsed:
                 _indexer_cotes_cache(cache, parsed)
-        log_nhl(f"📡 Odds API : {len(cache)} clé(s) de match indexées")
+        _enregistrer_aliases_runtime(cache)
+        nb_matchs = len(_extraire_matchs_uniques_odds_cache(cache))
+        log_nhl(f"📡 Odds API : {nb_matchs} match(s) Pinnacle, {len(cache)} clé(s) indexées")
         return cache
     except Exception as e:
         log_nhl(f"⚠️ Erreur Odds API globale : {e}", level="warning")
@@ -3432,6 +3623,7 @@ def run_sniper():
             f"{NHL_HIA_TEAM_GP_PLEIN:.0f} matchs domicile (min {NHL_HIA_TEAM_MIN_GAMES})"
         )
     migrer_journal_si_besoin()
+    diagnostic_pret_saison()
 
     while True:
         try:
@@ -3446,6 +3638,11 @@ def run_sniper():
                 log_nhl(
                     f"⚠️ Données MoneyPuck indisponibles (saison {NHL_SEASON}). Nouvelle tentative dans 5 min...",
                     level="warning",
+                )
+                _ops_alerte_envoyer(
+                    "moneypuck_indisponible",
+                    f"⚠️ **MoneyPuck indisponible**\n\n"
+                    f"Saison {NHL_SEASON} — bot en veille 5 min.",
                 )
                 time.sleep(300)
                 continue
@@ -3484,6 +3681,21 @@ def run_sniper():
                 log_nhl("🏒 Aucun match NHL éligible dans la fenêtre de scan — veille active.")
             else:
                 log_nhl(f"🏒 {len(matchs)} match(s) dans la fenêtre de scan.")
+                cov = auditer_couverture_odds(matchs, odds_cache)
+                if cov["eligible"] > 0:
+                    log_nhl(
+                        f"📡 Couverture cotes Pinnacle : {cov['avec_cotes']}/{cov['eligible']} match(s)"
+                    )
+                    if cov["sans_cotes"]:
+                        for ligne in cov["sans_cotes"][:5]:
+                            log_nhl(f"   ⚠️ Sans cotes : {ligne}", level="warning")
+                        if cov["avec_cotes"] == 0:
+                            _ops_alerte_envoyer(
+                                "zero_couverture_cotes",
+                                f"🚨 **Zéro couverture Pinnacle**\n\n"
+                                f"{cov['eligible']} match(s) scanné(s), aucune cote trouvée.\n"
+                                f"Vérifier mapping Odds API ou disponibilité Pinnacle.",
+                            )
                 if NHL_LINE_MOVE_ACTIF:
                     enregistrer_snapshots_cotes(matchs, odds_cache)
             for m in matchs:
@@ -4146,6 +4358,12 @@ def entrainer_ia_dixon_coles():
     dataset = list(historique_unique.values())
     nb = len(dataset)
     if nb < NHL_RHO_MIN_MATCHS:
+        _ops_alerte_envoyer(
+            "mle_insuffisant",
+            f"ℹ️ **Calibration MLE en attente**\n\n"
+            f"{nb}/{NHL_RHO_MIN_MATCHS} matchs indexés — rho/HIA par défaut.",
+            niveau="info",
+        )
         return
 
     meta = lire_rho_meta()
