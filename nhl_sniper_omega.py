@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 import traceback
 from scipy.optimize import minimize
+from scipy.stats import nbinom
 from config_env import env_files_hint, load_project_env
 
 load_project_env("nhl")
@@ -54,6 +55,9 @@ NHL_SEASON = int(os.environ.get("NHL_SEASON", "2026"))
 EDGE_MINIMUM = float(os.environ.get("NHL_EDGE_MIN", "0.02"))
 # Edge min plus élevé tant que les gardiens ne sont pas confirmés (sinon on attend)
 NHL_EDGE_MIN_PROBABLE = float(os.environ.get("NHL_EDGE_MIN_PROBABLE", "0.04"))
+NHL_EDGE_DYNAMIQUE_ACTIF = _env_bool("NHL_EDGE_DYNAMIQUE_ACTIF", True)
+NHL_EDGE_DYNAMIQUE_EXTRA = float(os.environ.get("NHL_EDGE_DYNAMIQUE_EXTRA", "0.02"))
+NHL_EDGE_DYNAMIQUE_GP_PLEIN = float(os.environ.get("NHL_EDGE_DYNAMIQUE_GP_PLEIN", "20"))
 KELLY_FRACTION = float(os.environ.get("NHL_KELLY_FRACTION", "0.25"))
 KELLY_FRACTION_GARDIEN_INCERTAIN = float(os.environ.get("NHL_KELLY_GARDIEN", "0.125"))
 NHL_KELLY_DYNAMIQUE_ACTIF = _env_bool("NHL_KELLY_DYNAMIQUE_ACTIF", True)
@@ -99,6 +103,10 @@ NHL_LIGUE_CALIB_MAX_GAMES = int(os.environ.get("NHL_LIGUE_CALIB_MAX_GAMES", "140
 NHL_MLE_RECENCY_ACTIF = _env_bool("NHL_MLE_RECENCY_ACTIF", True)
 NHL_MLE_RECENCY_HALFLIFE_JOURS = float(os.environ.get("NHL_MLE_RECENCY_HALFLIFE_JOURS", "28"))
 NHL_MARCHE_COHERENCE_ACTIF = _env_bool("NHL_MARCHE_COHERENCE_ACTIF", True)
+NHL_NB_OU_ACTIF = _env_bool("NHL_NB_OU_ACTIF", True)
+NHL_NB_OU_CALIB_ACTIF = _env_bool("NHL_NB_OU_CALIB_ACTIF", True)
+NHL_NB_OU_DISPERSION_DEFAULT = float(os.environ.get("NHL_NB_OU_DISPERSION_DEFAULT", "25"))
+NHL_NB_OU_MIN_MATCHS = int(os.environ.get("NHL_NB_OU_MIN_MATCHS", "100"))
 NHL_REF_SHRINK_ACTIF = _env_bool("NHL_REF_SHRINK_ACTIF", True)
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
@@ -1204,6 +1212,76 @@ def tau_dixon_coles(lam_home, lam_away, h, a, rho=-0.12):
     elif h == 1 and a == 1: return max(0, 1 - rho)
     return 1.0
 
+
+def _prob_over_under_nb(mu_total, r_disp, cuts_cibles):
+    """
+    Probabilités O/U via Negative Binomial sur le total de buts.
+    r_disp élevé → proche Poisson ; r_disp bas → queues plus épaisses (7.5+).
+    """
+    mu_total = max(min(float(mu_total), 15.0), 1.5)
+    r_disp = max(float(r_disp), 0.5)
+    p = r_disp / (r_disp + mu_total)
+    prob_over, prob_under = {}, {}
+    for cut in cuts_cibles:
+        po = float(nbinom.sf(int(cut), r_disp, p))
+        po = min(max(po, 0.001), 0.999)
+        prob_over[cut] = po
+        prob_under[cut] = min(max(1.0 - po, 0.001), 0.999)
+    return prob_over, prob_under
+
+
+def log_likelihood_nb_ou_dispersion(r_disp, historique_matchs):
+    """MLE de la dispersion NB sur les totaux observés vs lambdas pré-match."""
+    if r_disp <= 0.5:
+        return 1e10
+    ll = 0.0
+    for match in historique_matchs:
+        try:
+            lam_h = float(match["lambda_domicile_calcule"])
+            lam_a = float(match["lambda_exterieur_calcule"])
+            total = int(match["vrai_score_domicile"]) + int(match["vrai_score_exterieur"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        mu = max(lam_h + lam_a, 1.0)
+        p = r_disp / (r_disp + mu)
+        ll += _poids_recency_mle(match) * nbinom.logpmf(total, r_disp, p)
+    return -ll
+
+
+def optimiser_nb_ou_dispersion(historique_matchs):
+    """Calibre r (dispersion NB) sur l'historique ligue + journal."""
+    meta = lire_rho_meta()
+    r0 = float(meta.get("nb_ou_dispersion", NHL_NB_OU_DISPERSION_DEFAULT))
+    recency_label = (
+        f", recency demi-vie {NHL_MLE_RECENCY_HALFLIFE_JOURS:.0f}j"
+        if NHL_MLE_RECENCY_ACTIF and NHL_MLE_RECENCY_HALFLIFE_JOURS > 0
+        else ""
+    )
+    log_nhl(
+        f"🔬 Calibrage MLE dispersion NB O/U sur {len(historique_matchs)} matchs "
+        f"(init r={r0:.1f}{recency_label})..."
+    )
+    resultat = minimize(
+        log_likelihood_nb_ou_dispersion,
+        [r0],
+        args=(historique_matchs,),
+        bounds=[(1.0, 150.0)],
+        method="L-BFGS-B",
+    )
+    r_opt = round(max(1.0, min(150.0, resultat.x[0])), 2)
+    log_nhl(
+        f"✅ Calibrage NB O/U terminé — dispersion r={r_opt:.1f} "
+        f"(r↓ = plus de surdispersion, r→∞ ≈ Poisson)"
+    )
+    return r_opt
+
+
+def lire_nb_ou_dispersion():
+    if not NHL_NB_OU_ACTIF:
+        return NHL_NB_OU_DISPERSION_DEFAULT
+    return float(lire_rho_meta().get("nb_ou_dispersion", NHL_NB_OU_DISPERSION_DEFAULT))
+
+
 def _ajuster_lambdas_pour_hia(lam_h, lam_a, hia, hia_ref=HIA_REF_CALIBRATION):
     """
     Approximation : les lambdas journalisés intègrent (1+hia_ref) attaque / (1-hia_ref) défense domicile.
@@ -1460,8 +1538,6 @@ def calculate_master_odds_v4(
     prob_1, prob_X, prob_2 = 0, 0, 0
     prob_pl_home, prob_pl_away = 0, 0
     cuts_cibles = [4.5, 5.5, 6.5, 7.5]
-    prob_over_cuts = {cut: 0.0 for cut in cuts_cibles}
-    prob_under_cuts = {cut: 0.0 for cut in cuts_cibles}
 
     for h in range(12):
         for a in range(12):
@@ -1473,10 +1549,25 @@ def calculate_master_odds_v4(
             if (h - a) >= 2: prob_pl_home += p_final
             if (a - h) >= 2: prob_pl_away += p_final
 
-            total_buts = h + a
-            for cut in cuts_cibles:
-                if total_buts > cut: prob_over_cuts[cut] += p_final
-                else: prob_under_cuts[cut] += p_final
+    if NHL_NB_OU_ACTIF:
+        mu_total = sum(
+            (h + a) * matrice_finale[h][a] for h in range(12) for a in range(12)
+        )
+        prob_over_cuts, prob_under_cuts = _prob_over_under_nb(
+            mu_total, lire_nb_ou_dispersion(), cuts_cibles,
+        )
+    else:
+        prob_over_cuts = {cut: 0.0 for cut in cuts_cibles}
+        prob_under_cuts = {cut: 0.0 for cut in cuts_cibles}
+        for h in range(12):
+            for a in range(12):
+                p_final = matrice_finale[h][a]
+                total_buts = h + a
+                for cut in cuts_cibles:
+                    if total_buts > cut:
+                        prob_over_cuts[cut] += p_final
+                    else:
+                        prob_under_cuts[cut] += p_final
 
     s_1x2 = prob_1 + prob_X + prob_2
     if s_1x2 <= 0:
@@ -1532,6 +1623,19 @@ def _poids_confiance_modele(gp_moyen):
         return NHL_MODEL_TRUST_MAX
     part_gp = min(1.0, max(gp_moyen, 0.0) / NHL_MODEL_TRUST_GP_PLEIN)
     return NHL_MODEL_TRUST_MIN + (NHL_MODEL_TRUST_MAX - NHL_MODEL_TRUST_MIN) * part_gp
+
+
+def _edge_minimum_dynamique(gp_moyen, gardiens_confirmes=True):
+    """
+    Edge minimum selon la maturité du modèle (GP moyen des deux équipes).
+    Début de saison / petit échantillon → seuil plus élevé (moins de confiance
+    dans les xG blendés) ; pleine confiance à NHL_EDGE_DYNAMIQUE_GP_PLEIN GP.
+    """
+    base = EDGE_MINIMUM if gardiens_confirmes else NHL_EDGE_MIN_PROBABLE
+    if not NHL_EDGE_DYNAMIQUE_ACTIF or NHL_EDGE_DYNAMIQUE_GP_PLEIN <= 0:
+        return base
+    immaturite = 1.0 - min(1.0, max(float(gp_moyen or 0), 0.0) / NHL_EDGE_DYNAMIQUE_GP_PLEIN)
+    return round(base + immaturite * NHL_EDGE_DYNAMIQUE_EXTRA, 4)
 
 
 def _blend_proba_marche(prob_modele_a, prob_modele_b, cote_marche_a, cote_marche_b, w_modele):
@@ -1976,7 +2080,7 @@ def evaluer_steam_movement(game_id, candidat, m):
     }
 
 
-def filtrer_candidats_line_movement(game_id, candidats, m, gardiens_confirmes=True):
+def filtrer_candidats_line_movement(game_id, candidats, m, gardiens_confirmes=True, gp_moyen=None):
     """
     Retire les paris pris contre un steam move Pinnacle (sharp money adverse).
     Zone intermédiaire : edge minimum majoré de NHL_LINE_STEAM_EDGE_EXTRA.
@@ -1993,7 +2097,7 @@ def filtrer_candidats_line_movement(game_id, candidats, m, gardiens_confirmes=Tr
             f"+{NHL_LINE_STEAM_EDGE_EXTRA:.1%} edge si ≥{NHL_LINE_STEAM_WARN_PCT:.1%} contre"
         )
 
-    edge_min_pct = (EDGE_MINIMUM if gardiens_confirmes else NHL_EDGE_MIN_PROBABLE) * 100
+    edge_min_pct = _edge_minimum_dynamique(gp_moyen, gardiens_confirmes) * 100
     edge_min_steam_pct = edge_min_pct + NHL_LINE_STEAM_EDGE_EXTRA * 100
     filtres = []
 
@@ -2095,28 +2199,30 @@ def _choisir_meilleur_pari(candidats):
 
 
 def _construire_candidats_pari(
-    m, cotes_vraies, cotes_bookmaker, cotes_puckline, bankroll, gardiens_verrouilles, kelly_mult=None,
+    m, cotes_vraies, cotes_bookmaker, cotes_puckline, bankroll, gardiens_verrouilles,
+    kelly_mult=None, gp_moyen_match=None,
 ):
     """Évalue ML / PL / O-U selon NHL_MARCHES_ACTIFS."""
     candidats = []
     if kelly_mult is None:
         kelly_mult = _multiplicateur_kelly_dynamique()
 
+    kelly_kw = dict(
+        bankroll=bankroll,
+        gardiens_confirmes=gardiens_verrouilles,
+        kelly_mult=kelly_mult,
+        gp_moyen=gp_moyen_match,
+    )
+
     if "ML" in NHL_MARCHES_ACTIFS:
-        inv = calculate_kelly(
-            cotes_vraies["prob_1"], cotes_bookmaker["cote_1"],
-            bankroll, gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
-        )
+        inv = calculate_kelly(cotes_vraies["prob_1"], cotes_bookmaker["cote_1"], **kelly_kw)
         if inv:
             candidats.append({
                 "type": f"Victoire {m['home_team']}", "inv": inv,
                 "cote_book": cotes_bookmaker["cote_1"], "cote_vraie": cotes_vraies["cote_1"],
                 "marche": "ML",
             })
-        inv = calculate_kelly(
-            cotes_vraies["prob_2"], cotes_bookmaker["cote_2"],
-            bankroll, gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
-        )
+        inv = calculate_kelly(cotes_vraies["prob_2"], cotes_bookmaker["cote_2"], **kelly_kw)
         if inv:
             candidats.append({
                 "type": f"Victoire {m['away_team']}", "inv": inv,
@@ -2126,10 +2232,7 @@ def _construire_candidats_pari(
 
     if "PL" in NHL_MARCHES_ACTIFS and cotes_puckline:
         if "cote_pl_home" in cotes_puckline:
-            inv = calculate_kelly(
-                cotes_vraies["prob_pl_home"], cotes_puckline["cote_pl_home"],
-                bankroll, gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
-            )
+            inv = calculate_kelly(cotes_vraies["prob_pl_home"], cotes_puckline["cote_pl_home"], **kelly_kw)
             if inv:
                 candidats.append({
                     "type": f"Puck Line {m['home_team']} -1.5", "inv": inv,
@@ -2137,10 +2240,7 @@ def _construire_candidats_pari(
                     "marche": "PL",
                 })
         if "cote_pl_away" in cotes_puckline:
-            inv = calculate_kelly(
-                cotes_vraies["prob_pl_away"], cotes_puckline["cote_pl_away"],
-                bankroll, gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
-            )
+            inv = calculate_kelly(cotes_vraies["prob_pl_away"], cotes_puckline["cote_pl_away"], **kelly_kw)
             if inv:
                 candidats.append({
                     "type": f"Puck Line {m['away_team']} -1.5", "inv": inv,
@@ -2156,10 +2256,7 @@ def _construire_candidats_pari(
             if prob_over is None:
                 continue
             if "Over" in prices:
-                inv = calculate_kelly(
-                    prob_over, prices["Over"], bankroll,
-                    gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
-                )
+                inv = calculate_kelly(prob_over, prices["Over"], **kelly_kw)
                 if inv:
                     candidats.append({
                         "type": f"OVER {cut_arrondi}", "inv": inv,
@@ -2168,10 +2265,7 @@ def _construire_candidats_pari(
                         "marche": "OU",
                     })
             if "Under" in prices and prob_under is not None:
-                inv = calculate_kelly(
-                    prob_under, prices["Under"], bankroll,
-                    gardiens_confirmes=gardiens_verrouilles, kelly_mult=kelly_mult,
-                )
+                inv = calculate_kelly(prob_under, prices["Under"], **kelly_kw)
                 if inv:
                     candidats.append({
                         "type": f"UNDER {cut_arrondi}", "inv": inv,
@@ -2308,11 +2402,11 @@ def _multiplicateur_kelly_dynamique():
     return mult
 
 
-def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kelly_mult=None):
+def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kelly_mult=None, gp_moyen=None):
     if book_odds <= 1.0 or true_prob <= 0.01 or true_prob >= 0.99:
         return None
     edge = true_prob - (1 / book_odds)
-    edge_min = EDGE_MINIMUM if gardiens_confirmes else NHL_EDGE_MIN_PROBABLE
+    edge_min = _edge_minimum_dynamique(gp_moyen, gardiens_confirmes)
     if edge <= edge_min:
         return None
     b = book_odds - 1.0
@@ -2322,8 +2416,8 @@ def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kel
     fraction_kelly *= kelly_mult
     if not gardiens_confirmes:
         log_nhl(
-            f"🛡️ Gardiens probables — Kelly ÷2, edge min {NHL_EDGE_MIN_PROBABLE:.0%} "
-            f"(seuil confirmés : {EDGE_MINIMUM:.0%})"
+            f"🛡️ Gardiens probables — Kelly ÷2, edge min {_edge_minimum_dynamique(gp_moyen, False):.0%} "
+            f"(seuil confirmés : {_edge_minimum_dynamique(gp_moyen, True):.0%})"
         )
     safe_kelly = ((b * true_prob - (1 - true_prob)) / b) * fraction_kelly
     mise_brute = bankroll * safe_kelly
@@ -2617,7 +2711,12 @@ def run_sniper():
     log_nhl(
         f"🎯 Marchés actifs : {', '.join(sorted(NHL_MARCHES_ACTIFS)) or 'aucun'} | "
         f"OT home adv ML : {NHL_OT_HOME_ADVANTAGE:.0%} | "
-        f"edge min {EDGE_MINIMUM:.0%} (confirmés) / {NHL_EDGE_MIN_PROBABLE:.0%} (probables) | "
+        f"edge min {EDGE_MINIMUM:.0%} (confirmés) / {NHL_EDGE_MIN_PROBABLE:.0%} (probables)"
+        + (
+            f" + dynamique +{NHL_EDGE_DYNAMIQUE_EXTRA:.0%} à 0 GP → base à {NHL_EDGE_DYNAMIQUE_GP_PLEIN:.0f} GP"
+            if NHL_EDGE_DYNAMIQUE_ACTIF else ""
+        )
+        + " | "
         f"rho+HIA recalibrés tous les {NHL_RHO_INTERVAL_MATCHS} matchs (min {NHL_RHO_MIN_MATCHS}) | "
         f"empty-net/tie recalibrés dès {NHL_EMPTY_NET_MIN_MATCHS} matchs"
     )
@@ -2640,8 +2739,20 @@ def run_sniper():
             f"⚖️ Shrinkage marché actif — confiance modèle {NHL_MODEL_TRUST_MIN:.0%} à 0 GP → "
             f"{NHL_MODEL_TRUST_MAX:.0%} à {NHL_MODEL_TRUST_GP_PLEIN:.0f}+ GP (reste : no-vig Pinnacle)"
         )
+    if NHL_EDGE_DYNAMIQUE_ACTIF:
+        log_nhl(
+            f"📏 Edge min dynamique — +{NHL_EDGE_DYNAMIQUE_EXTRA:.0%} max à 0 GP "
+            f"(base confirmés {EDGE_MINIMUM:.0%} → {EDGE_MINIMUM + NHL_EDGE_DYNAMIQUE_EXTRA:.0%}, "
+            f"plein à {NHL_EDGE_DYNAMIQUE_GP_PLEIN:.0f} GP moyen/match)"
+        )
     if NHL_MARCHE_COHERENCE_ACTIF:
         log_nhl("🔗 Cohérence inter-marchés active — PL ≤ ML, totaux O/U monotones après shrinkage")
+    if NHL_NB_OU_ACTIF:
+        r_nb = lire_nb_ou_dispersion()
+        log_nhl(
+            f"📈 O/U Negative Binomial actif — dispersion r={r_nb:.1f} "
+            f"(calibrée MLE si ≥{NHL_NB_OU_MIN_MATCHS} matchs, défaut {NHL_NB_OU_DISPERSION_DEFAULT:.0f})"
+        )
     if NHL_KELLY_DYNAMIQUE_ACTIF:
         log_nhl(
             f"🎚️ Kelly dynamique actif — BSS fenêtre {NHL_KELLY_BRIER_FENETRE} paris (min {NHL_KELLY_BRIER_MIN_PARIS}), "
@@ -2855,9 +2966,11 @@ def run_sniper():
                     candidats = _construire_candidats_pari(
                         m, cotes_vraies, cotes_bookmaker, cotes_puckline,
                         bankroll_actuelle, gardiens_verrouilles, kelly_mult=kelly_mult_actuel,
+                        gp_moyen_match=gp_moyen_match,
                     )
                     candidats = filtrer_candidats_line_movement(
                         m["game_id"], candidats, m, gardiens_verrouilles,
+                        gp_moyen=gp_moyen_match,
                     )
                     best_pari = _choisir_meilleur_pari(candidats)
 
@@ -2876,13 +2989,18 @@ def run_sniper():
                             "rho": rho_actuel,
                         })
                     else:
+                        edge_min_dyn = _edge_minimum_dynamique(gp_moyen_match, gardiens_verrouilles)
                         if not gardiens_verrouilles:
                             log_nhl(
-                                f"— Pas d'edge ≥ {NHL_EDGE_MIN_PROBABLE:.0%} (gardiens probables) "
-                                f"— attente confirmation {m['away_team']} @ {m['home_team']}"
+                                f"— Pas d'edge ≥ {edge_min_dyn:.0%} (gardiens probables, "
+                                f"GP moy {gp_moyen_match:.0f}) — attente confirmation "
+                                f"{m['away_team']} @ {m['home_team']}"
                             )
                         else:
-                            log_nhl(f"— Pas d'edge suffisant — {m['away_team']} @ {m['home_team']}")
+                            log_nhl(
+                                f"— Pas d'edge ≥ {edge_min_dyn:.0%} (GP moy {gp_moyen_match:.0f}) — "
+                                f"{m['away_team']} @ {m['home_team']}"
+                            )
 
             if opportunites:
                 for opp in opportunites:
@@ -2950,6 +3068,7 @@ def lire_rho_meta():
     default = {
         "rho": -0.12, "hia": NHL_HIA_DEFAULT,
         "prob_tie": 0.12, "prob_en": 0.22,
+        "nb_ou_dispersion": NHL_NB_OU_DISPERSION_DEFAULT,
         "nb_matchs": 0,
     }
     if os.path.exists(RHO_META_FILE):
@@ -3255,6 +3374,9 @@ def entrainer_ia_dixon_coles():
         "hia": nouveau_hia,
         "prob_tie": meta_precedent.get("prob_tie", 0.12),
         "prob_en": meta_precedent.get("prob_en", 0.22),
+        "nb_ou_dispersion": float(
+            meta_precedent.get("nb_ou_dispersion", NHL_NB_OU_DISPERSION_DEFAULT)
+        ),
         "nb_matchs": nb,
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
@@ -3263,6 +3385,9 @@ def entrainer_ia_dixon_coles():
     if nb >= NHL_EMPTY_NET_MIN_MATCHS:
         nouveau_prob_tie, nouveau_prob_en = optimiser_empty_net_ot(dataset, nouveau_rho, nouveau_hia)
         meta["prob_tie"], meta["prob_en"] = nouveau_prob_tie, nouveau_prob_en
+
+    if NHL_NB_OU_CALIB_ACTIF and NHL_NB_OU_ACTIF and nb >= NHL_NB_OU_MIN_MATCHS:
+        meta["nb_ou_dispersion"] = optimiser_nb_ou_dispersion(dataset)
 
     with open(RHO_META_FILE, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
