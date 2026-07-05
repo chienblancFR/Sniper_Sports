@@ -102,6 +102,9 @@ NHL_LIGUE_CALIB_SCAN_JOURS = int(os.environ.get("NHL_LIGUE_CALIB_SCAN_JOURS", "3
 NHL_LIGUE_CALIB_LOOKBACK_JOURS = int(os.environ.get("NHL_LIGUE_CALIB_LOOKBACK_JOURS", "30"))
 NHL_LIGUE_CALIB_MIN_MATCHS = int(os.environ.get("NHL_LIGUE_CALIB_MIN_MATCHS", "200"))
 NHL_LIGUE_CALIB_MAX_GAMES = int(os.environ.get("NHL_LIGUE_CALIB_MAX_GAMES", "1400"))
+# Lambdas rétrospectives sans look-ahead : stats MoneyPuck cumulées avant chaque match
+NHL_PIT_CALIB_ACTIF = _env_bool("NHL_PIT_CALIB_ACTIF", True)
+NHL_PIT_CACHE_JOURS = int(os.environ.get("NHL_PIT_CACHE_JOURS", "7"))
 # Pondération temporelle MLE : les matchs récents comptent plus (demi-vie en jours)
 NHL_MLE_RECENCY_ACTIF = _env_bool("NHL_MLE_RECENCY_ACTIF", True)
 NHL_MLE_RECENCY_HALFLIFE_JOURS = float(os.environ.get("NHL_MLE_RECENCY_HALFLIFE_JOURS", "28"))
@@ -125,6 +128,10 @@ RHO_META_FILE = "rho_calibrage_meta.json"
 REFEREE_META_FILE = "referee_calibrage_meta.json"
 ODDS_HISTORY_FILE = "nhl_odds_history.json"
 LEAGUE_CALIB_FILE = "nhl_league_calib.json"
+PIT_CACHE_FILE = "nhl_pit_moneypuck_cache.json"
+MONEYPUCK_GBG_ALL_TEAMS_URL = (
+    "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/all_teams.csv"
+)
 HIA_TEAM_META_FILE = "hia_equipes_meta.json"
 # Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
 XG_FOR_COLONNES = (
@@ -151,6 +158,9 @@ _line_move_logue = False
 _marche_coherence_logue = False
 _ref_shrink_logue = False
 _hia_equipe_logue = False
+_pit_index_memo = None
+_pit_fallback_logue = False
+_pit_build_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -415,6 +425,286 @@ def _blend_team_recent_form(teams, teams_recent):
             f"({nb_blend}/{len(teams)} équipes partiellement blendées)"
         )
     return teams
+
+
+def _normaliser_date_iso(date_brut):
+    """Normalise une date MoneyPuck/NHL en YYYY-MM-DD."""
+    if not date_brut:
+        return None
+    texte = str(date_brut).strip()[:10]
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(texte, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return texte if len(texte) == 10 and texte[4] == "-" else None
+
+
+def _fetch_moneypuck_gbg_all_teams():
+    """Télécharge le CSV game-by-game agrégé équipes (toutes saisons)."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(MONEYPUCK_GBG_ALL_TEAMS_URL, headers=headers, timeout=60)
+        if response.status_code == 200 and response.text.strip():
+            return response.text
+        log_nhl(
+            f"⚠️ MoneyPuck game-by-game : HTTP {response.status_code}",
+            level="warning",
+        )
+    except Exception as e:
+        log_nhl(f"⚠️ MoneyPuck game-by-game : {e}", level="warning")
+    return None
+
+
+def _parser_gbg_vers_matchs(texte, seasons):
+    """
+    Agrège les lignes situation (5on5 / 5on4 / 4on5) en un dict par
+  (saison, gameId, équipe).
+    """
+    csv_reader = csv.DictReader(StringIO(texte))
+    col_for, col_against = _resoudre_colonnes_xg(csv_reader.fieldnames)
+    matchs = {}
+    seasons_set = {int(s) for s in seasons}
+    for row in csv_reader:
+        try:
+            season = int(float(row.get("season", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if season not in seasons_set:
+            continue
+        team = (row.get("team") or "").strip()
+        sit = (row.get("situation") or "").strip()
+        if sit not in ("5on5", "5on4", "4on5") or not team:
+            continue
+        game_id = row.get("gameId") or row.get("game_id")
+        date_str = _normaliser_date_iso(
+            row.get("gameDate") or row.get("game_date") or row.get("date")
+        )
+        if not game_id or not date_str:
+            continue
+        cle = (season, str(game_id), team)
+        match = matchs.setdefault(
+            cle,
+            {
+                "team": team,
+                "season": season,
+                "game_id": str(game_id),
+                "date": date_str,
+                "opponent": (row.get("opponent") or row.get("opposingTeam") or "").strip(),
+                "xgf_55": 0.0,
+                "xga_55": 0.0,
+                "xgf_pp": 0.0,
+                "xga_pk": 0.0,
+                "fo_won": 0.0,
+                "fo_lost": 0.0,
+            },
+        )
+        if not match["opponent"]:
+            match["opponent"] = (row.get("opponent") or row.get("opposingTeam") or "").strip()
+        if sit == "5on5":
+            match["xgf_55"] += float(row.get(col_for, 0) or 0)
+            match["xga_55"] += float(row.get(col_against, 0) or 0)
+            match["fo_won"] += float(row.get("faceOffsWonFor", 0) or 0)
+            match["fo_lost"] += float(row.get("faceOffsWonAgainst", 0) or 0)
+        elif sit == "5on4":
+            match["xgf_pp"] += float(row.get(col_for, 0) or 0)
+        elif sit == "4on5":
+            match["xga_pk"] += float(row.get(col_against, 0) or 0)
+    return list(matchs.values())
+
+
+def _cumul_vers_stats_equipe(team, cumul, teams_n1_map=None):
+    """Convertit des totaux cumulés pré-match en dict compatible get_team_stats."""
+    gp = int(cumul.get("gp", 0))
+    if gp <= 0:
+        if teams_n1_map and team in teams_n1_map:
+            return dict(teams_n1_map[team])
+        return {
+            "team": team,
+            "xGF_per_game": 2.8,
+            "xGA_per_game": 2.8,
+            "xGF_PP": 0.55,
+            "xGA_PK": 0.55,
+            "fo_pct": 0.5,
+            "games_played": 0,
+        }
+
+    fo_total = cumul["fo_won"] + cumul["fo_lost"]
+    stats = {
+        "team": team,
+        "xGF_per_game": round(cumul["xgf_55"] / gp, 3),
+        "xGA_per_game": round(cumul["xga_55"] / gp, 3),
+        "xGF_PP": round(cumul["xgf_pp"] / gp, 3),
+        "xGA_PK": round(cumul["xga_pk"] / gp, 3),
+        "fo_pct": round(cumul["fo_won"] / fo_total, 4) if fo_total > 0 else 0.5,
+        "games_played": gp,
+    }
+    if teams_n1_map and team in teams_n1_map and NHL_BLEND_GP_PLEIN > 0:
+        w = min(1.0, gp / NHL_BLEND_GP_PLEIN)
+        if w < 1.0:
+            prev = teams_n1_map[team]
+            for key in ("xGF_per_game", "xGA_per_game", "xGF_PP", "xGA_PK", "fo_pct"):
+                stats[key] = round(
+                    w * stats[key] + (1.0 - w) * prev.get(key, stats[key]),
+                    4 if key == "fo_pct" else 3,
+                )
+    return stats
+
+
+def _build_pit_index_from_gbg(matchs, teams_n1=None):
+    """
+    Index équipe → liste de snapshots pré-match triés (date, game_id).
+    Chaque snapshot = stats cumulées strictement avant ce match.
+    """
+    teams_n1_map = {t["team"]: t for t in (teams_n1 or [])}
+    par_equipe = {}
+    for match in matchs:
+        par_equipe.setdefault(match["team"], []).append(match)
+
+    index = {}
+    for team, games in par_equipe.items():
+        games.sort(key=lambda g: (g["date"], g["game_id"]))
+        cumul = {
+            "gp": 0,
+            "xgf_55": 0.0,
+            "xga_55": 0.0,
+            "xgf_pp": 0.0,
+            "xga_pk": 0.0,
+            "fo_won": 0.0,
+            "fo_lost": 0.0,
+        }
+        snapshots = []
+        for game in games:
+            snapshots.append({
+                "date": game["date"],
+                "game_id": game["game_id"],
+                "opponent": game.get("opponent", ""),
+                "stats": _cumul_vers_stats_equipe(team, cumul, teams_n1_map),
+            })
+            cumul["gp"] += 1
+            cumul["xgf_55"] += game["xgf_55"]
+            cumul["xga_55"] += game["xga_55"]
+            cumul["xgf_pp"] += game["xgf_pp"]
+            cumul["xga_pk"] += game["xga_pk"]
+            cumul["fo_won"] += game["fo_won"]
+            cumul["fo_lost"] += game["fo_lost"]
+        index[team] = snapshots
+    return index
+
+
+def _lire_pit_cache_meta():
+    if os.path.exists(PIT_CACHE_FILE):
+        try:
+            with open(PIT_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _ecrire_pit_cache_meta(meta):
+    with open(PIT_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+
+
+def _pit_cache_est_frais(meta, season):
+    if not meta or meta.get("season") != season:
+        return False
+    date_txt = meta.get("date_fetched")
+    if not date_txt:
+        return False
+    try:
+        age = (datetime.now() - datetime.strptime(date_txt, "%Y-%m-%d %H:%M")).days
+    except ValueError:
+        return False
+    return age < NHL_PIT_CACHE_JOURS
+
+
+def construire_index_pit_moneypuck(season=None, teams_n1=None, force=False):
+    """
+    Charge ou reconstruit l'index point-in-time (stats équipe avant chaque match)
+    à partir du CSV MoneyPuck game-by-game. Mémoire + fichier cache local.
+    """
+    global _pit_index_memo, _pit_build_logue
+    if season is None:
+        season = NHL_SEASON
+    if not force and _pit_index_memo is not None and _pit_index_memo.get("season") == season:
+        return _pit_index_memo.get("index")
+
+    cache = _lire_pit_cache_meta()
+    if not force and _pit_cache_est_frais(cache, season) and cache.get("index"):
+        _pit_index_memo = {"season": season, "index": cache["index"]}
+        return cache["index"]
+
+    texte = _fetch_moneypuck_gbg_all_teams()
+    if not texte:
+        if cache.get("index") and cache.get("season") == season:
+            log_nhl("ℹ️ PIT calibration — repli sur cache local MoneyPuck", level="warning")
+            _pit_index_memo = {"season": season, "index": cache["index"]}
+            return cache["index"]
+        return None
+
+    matchs = _parser_gbg_vers_matchs(texte, seasons=(season, season - 1))
+    if not matchs:
+        return None
+
+    index = _build_pit_index_from_gbg(matchs, teams_n1=teams_n1)
+    if not index:
+        return None
+
+    _ecrire_pit_cache_meta({
+        "season": season,
+        "date_fetched": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "nb_matchs": len(matchs),
+        "index": index,
+    })
+    _pit_index_memo = {"season": season, "index": index}
+    if not _pit_build_logue:
+        _pit_build_logue = True
+        log_nhl(
+            f"📅 Index PIT MoneyPuck construit — {len(matchs)} lignes match, "
+            f"{len(index)} équipes (saisons {season - 1}/{season})"
+        )
+    return index
+
+
+def _invalider_pit_index_memo():
+    global _pit_index_memo
+    _pit_index_memo = None
+
+
+def _stats_equipe_avant_match(pit_index, team, date_str, opponent=None):
+    """Stats cumulées strictement avant un match donné (date + adversaire si dispo)."""
+    snapshots = pit_index.get(team, [])
+    if not snapshots:
+        return None
+    if opponent:
+        for snap in snapshots:
+            if snap["date"] == date_str and snap.get("opponent") == opponent:
+                return snap["stats"]
+    prior = [snap for snap in snapshots if snap["date"] < date_str]
+    if prior:
+        return prior[-1]["stats"]
+    if snapshots and snapshots[0]["date"] == date_str:
+        return snapshots[0]["stats"]
+    return None
+
+
+def _teams_data_snapshot_pit(pit_index, date_str, teams_n1=None):
+    """Snapshot ligue complet : dernières stats connues de chaque équipe avant date_str."""
+    teams_n1_map = {t["team"]: t for t in (teams_n1 or [])}
+    teams = []
+    for team, snapshots in pit_index.items():
+        prior = [snap for snap in snapshots if snap["date"] < date_str]
+        if prior:
+            teams.append(dict(prior[-1]["stats"]))
+        elif snapshots and snapshots[0]["date"] == date_str:
+            teams.append(dict(snapshots[0]["stats"]))
+        elif team in teams_n1_map:
+            teams.append(dict(teams_n1_map[team]))
+    if len(teams) < 2:
+        return None
+    return _shrink_special_teams(teams)
 
 
 def get_team_stats(season=None, blend=True):
@@ -3010,6 +3300,11 @@ def run_sniper():
             f"{NHL_LIGUE_CALIB_LOOKBACK_JOURS}j/cycle puis {NHL_LIGUE_CALIB_SCAN_JOURS}j/cycle "
             f"après {NHL_LIGUE_CALIB_MIN_MATCHS} matchs indexés (max {NHL_LIGUE_CALIB_MAX_GAMES} conservés)"
         )
+    if NHL_PIT_CALIB_ACTIF:
+        log_nhl(
+            f"📅 Calibration PIT actif — lambdas historiques via MoneyPuck game-by-game "
+            f"(cache {NHL_PIT_CACHE_JOURS}j, blend N-1 si GP<{NHL_BLEND_GP_PLEIN:.0f})"
+        )
     if NHL_MLE_RECENCY_ACTIF and NHL_MLE_RECENCY_HALFLIFE_JOURS > 0:
         log_nhl(
             f"⏳ MLE recency actif — demi-vie {NHL_MLE_RECENCY_HALFLIFE_JOURS:.0f}j "
@@ -3026,6 +3321,7 @@ def run_sniper():
         try:
             lancer_la_balayeuse()
             _invalider_rho_meta_cache()
+            _invalider_pit_index_memo()
 
             log_nhl("📡 Synchronisation bases de données...")
             teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
@@ -3469,16 +3765,36 @@ def lire_league_calib_meta():
     return {"games": {}, "scanned_game_ids": []}
 
 
-def _lambda_referentiel_match(teams_data, home_team, away_team):
+def _lambda_referentiel_match(
+    teams_data, home_team, away_team,
+    date_str=None, pit_index=None, teams_n1=None, opponent_home=None, opponent_away=None,
+):
     """
-    Lambdas 'attendues' pour un match à partir des stats d'équipe courantes,
-    sans ajustement spécifique (gardien/fatigue/arbitre) — sert de proxy
-    rétrospectif pour élargir l'échantillon de calibration MLE (rho/HIA/
-    empty-net) à tous les matchs ligue, pas seulement les paris placés.
+    Lambdas 'attendues' pour un match historique (proxy calibration MLE).
+    Utilise HIA_REF fixe et, si activé, les stats MoneyPuck cumulées avant
+    la date du match (sans look-ahead sur la saison courante).
     """
-    hia = lire_hia_dynamique()
+    global _pit_fallback_logue
+    hia = HIA_REF_CALIBRATION
+    snapshot = teams_data
+
+    if NHL_PIT_CALIB_ACTIF and date_str and pit_index:
+        pit_snap = _teams_data_snapshot_pit(pit_index, date_str, teams_n1=teams_n1)
+        if pit_snap:
+            snapshot = pit_snap
+        elif not _pit_fallback_logue:
+            _pit_fallback_logue = True
+            log_nhl(
+                "ℹ️ PIT calibration indisponible pour certains matchs — "
+                "repli stats courantes (look-ahead possible)",
+                level="warning",
+            )
+
+    if not snapshot:
+        return None, None, None
+
     resultat = calculate_master_odds_v4(
-        teams_data, home_team, away_team,
+        snapshot, home_team, away_team,
         home_gsax=0.0, away_gsax=0.0,
         hia=hia,
     )
@@ -3487,17 +3803,54 @@ def _lambda_referentiel_match(teams_data, home_team, away_team):
     return resultat["lam_home"], resultat["lam_away"], hia
 
 
+def _appliquer_lambdas_pit_aux_matchs_ligue(historique_unique, pit_index, teams_n1=None):
+    """Recalcule lambdas/FO des matchs ligue (pas journal) sans look-ahead."""
+    if not NHL_PIT_CALIB_ACTIF or not pit_index:
+        return 0
+    nb = 0
+    for match in historique_unique.values():
+        if match.get("_from_journal"):
+            continue
+        date_str = match.get("date")
+        home, away = match.get("home"), match.get("away")
+        if not date_str or not home or not away:
+            continue
+        lam_h, lam_a, hia_ref = _lambda_referentiel_match(
+            None, home, away,
+            date_str=date_str,
+            pit_index=pit_index,
+            teams_n1=teams_n1,
+        )
+        if lam_h is None:
+            continue
+        match["lambda_domicile_calcule"] = lam_h
+        match["lambda_exterieur_calcule"] = lam_a
+        match["hia_ref"] = hia_ref
+        snap_h = _stats_equipe_avant_match(pit_index, home, date_str, opponent=away)
+        snap_a = _stats_equipe_avant_match(pit_index, away, date_str, opponent=home)
+        if snap_h:
+            match["home_fo_pct"] = round(float(snap_h.get("fo_pct", 0.5)), 4)
+        if snap_a:
+            match["away_fo_pct"] = round(float(snap_a.get("fo_pct", 0.5)), 4)
+        match["lambdas_pit"] = True
+        nb += 1
+    return nb
+
+
 def actualiser_historique_ligue(teams_data):
     """
     Scan incrémental de tous les matchs NHL terminés (pas seulement ceux
     pariés par le bot) pour alimenter la calibration MLE rho/HIA/empty-net/
     tie avec un échantillon bien plus large et rapide à constituer.
-    Lambdas approximées via les stats d'équipe courantes (proxy rétrospectif) ;
-    les paris réellement placés (lambdas pré-match exactes) restent
-    prioritaires en cas de doublon lors de la fusion (voir entrainer_ia_dixon_coles).
+    Lambdas approximées via stats MoneyPuck cumulées avant chaque match
+    (PIT, sans look-ahead) ; les paris réellement placés (lambdas pré-match
+    exactes) restent prioritaires en cas de doublon (entrainer_ia_dixon_coles).
     """
     if not NHL_LIGUE_CALIB_ACTIF or not teams_data:
         return
+
+    teams_n1 = get_team_stats(season=NHL_SEASON - 1, blend=False) if NHL_BLEND_GP_PLEIN > 0 else None
+    pit_index = construire_index_pit_moneypuck(teams_n1=teams_n1) if NHL_PIT_CALIB_ACTIF else None
 
     meta = lire_league_calib_meta()
     games_db = meta.setdefault("games", {})
@@ -3531,15 +3884,32 @@ def actualiser_historique_ligue(teams_data):
                 home_score, away_score = home_info.get("score"), away_info.get("score")
                 if not home_abbrev or not away_abbrev or home_score is None or away_score is None:
                     continue
-                lam_h, lam_a, hia_ref = _lambda_referentiel_match(teams_data, home_abbrev, away_abbrev)
+                lam_h, lam_a, hia_ref = _lambda_referentiel_match(
+                    teams_data, home_abbrev, away_abbrev,
+                    date_str=date_str,
+                    pit_index=pit_index,
+                    teams_n1=teams_n1,
+                )
                 if lam_h is None:
                     scanned.add(gid)
                     continue
                 last_period = (game.get("gameOutcome", {}) or {}).get("lastPeriodType", "REG")
-                home_base = next((t for t in teams_data if t.get("team") == home_abbrev), None)
-                away_base = next((t for t in teams_data if t.get("team") == away_abbrev), None)
-                home_fo = home_base.get("fo_pct", 0.5) if home_base else 0.5
-                away_fo = away_base.get("fo_pct", 0.5) if away_base else 0.5
+                snap_h = (
+                    _stats_equipe_avant_match(pit_index, home_abbrev, date_str, opponent=away_abbrev)
+                    if pit_index else None
+                )
+                snap_a = (
+                    _stats_equipe_avant_match(pit_index, away_abbrev, date_str, opponent=home_abbrev)
+                    if pit_index else None
+                )
+                if snap_h:
+                    home_fo = snap_h.get("fo_pct", 0.5)
+                    away_fo = snap_a.get("fo_pct", 0.5) if snap_a else 0.5
+                else:
+                    home_base = next((t for t in teams_data if t.get("team") == home_abbrev), None)
+                    away_base = next((t for t in teams_data if t.get("team") == away_abbrev), None)
+                    home_fo = home_base.get("fo_pct", 0.5) if home_base else 0.5
+                    away_fo = away_base.get("fo_pct", 0.5) if away_base else 0.5
                 ref_names = get_game_referees(game["id"])
                 ref_keys = [_normaliser_nom_arbitre(n) for n in ref_names] if ref_names else []
                 games_db[gid] = {
@@ -3554,6 +3924,7 @@ def actualiser_historique_ligue(teams_data):
                     "referee_keys": ref_keys,
                     "home_fo_pct": round(float(home_fo), 4),
                     "away_fo_pct": round(float(away_fo), 4),
+                    "lambdas_pit": bool(pit_index),
                 }
                 scanned.add(gid)
                 nouveaux += 1
@@ -3582,12 +3953,16 @@ def actualiser_historique_ligue(teams_data):
 
 def entrainer_ia_dixon_coles():
     historique_unique = {}
+    teams_n1 = get_team_stats(season=NHL_SEASON - 1, blend=False) if NHL_BLEND_GP_PLEIN > 0 else None
+    pit_index = construire_index_pit_moneypuck(teams_n1=teams_n1) if NHL_PIT_CALIB_ACTIF else None
 
     if NHL_LIGUE_CALIB_ACTIF:
         for gid, data in lire_league_calib_meta().get("games", {}).items():
             ref_keys = data.get("referee_keys", [])
             historique_unique[gid] = {
                 "date": data.get("date"),
+                "home": data.get("home"),
+                "away": data.get("away"),
                 "vrai_score_domicile": data["vrai_score_domicile"],
                 "vrai_score_exterieur": data["vrai_score_exterieur"],
                 "lambda_domicile_calcule": data["lambda_domicile_calcule"],
@@ -3598,6 +3973,7 @@ def entrainer_ia_dixon_coles():
                 "ref_rel": _compute_crew_penalty_rel(ref_keys) if ref_keys else None,
                 "home_fo_pct": data.get("home_fo_pct"),
                 "away_fo_pct": data.get("away_fo_pct"),
+                "lambdas_pit": data.get("lambdas_pit", False),
             }
     nb_ligue = len(historique_unique)
 
@@ -3613,12 +3989,15 @@ def entrainer_ia_dixon_coles():
                     # Lambdas pré-match réelles (calculées au moment du pari) :
                     # priment sur le proxy rétrospectif du scan ligue. On conserve
                     # last_period_type du scan ligue s'il existe (journal ne l'a pas).
-                    last_period = historique_unique.get(game_id_brut, {}).get("last_period_type", "REG")
-                    ref_keys = historique_unique.get(game_id_brut, {}).get("referee_keys", [])
-                    home_fo = historique_unique.get(game_id_brut, {}).get("home_fo_pct")
-                    away_fo = historique_unique.get(game_id_brut, {}).get("away_fo_pct")
+                    existant = historique_unique.get(game_id_brut, {})
+                    last_period = existant.get("last_period_type", "REG")
+                    ref_keys = existant.get("referee_keys", [])
+                    home_fo = existant.get("home_fo_pct")
+                    away_fo = existant.get("away_fo_pct")
                     historique_unique[game_id_brut] = {
                         "date": row.get("Date", "").split()[0] or None,
+                        "home": existant.get("home"),
+                        "away": existant.get("away"),
                         "vrai_score_domicile": int(row["Score_Dom"]),
                         "vrai_score_exterieur": int(row["Score_Ext"]),
                         "lambda_domicile_calcule": float(row["Lam_Dom"]),
@@ -3629,7 +4008,12 @@ def entrainer_ia_dixon_coles():
                         "ref_rel": _compute_crew_penalty_rel(ref_keys) if ref_keys else None,
                         "home_fo_pct": home_fo,
                         "away_fo_pct": away_fo,
+                        "_from_journal": True,
                     }
+
+    nb_pit = _appliquer_lambdas_pit_aux_matchs_ligue(historique_unique, pit_index, teams_n1=teams_n1)
+    if nb_pit > 0:
+        log_nhl(f"📅 Lambdas PIT recalculées sur {nb_pit} match(s) ligue (sans look-ahead)")
 
     dataset = list(historique_unique.values())
     nb = len(dataset)
