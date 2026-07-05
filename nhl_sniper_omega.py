@@ -2143,8 +2143,10 @@ def calibrer_pp_lam_share(historique_matchs, ref_sensibilite=None):
     return opt, n_ref
 
 
-def _mse_gsax_lam_mult(mult, historique_matchs):
+def _mse_gsax_lam_mult(mult, historique_matchs, mult_stocke=None):
     """MSE totaux sur matchs où GSAx partant connu (PIT)."""
+    if mult_stocke is None:
+        mult_stocke = lire_gsax_lam_mult()
     sse, n = 0.0, 0
     for match in historique_matchs:
         if match.get("home_gsax") is None and match.get("away_gsax") is None:
@@ -2157,9 +2159,15 @@ def _mse_gsax_lam_mult(mult, historique_matchs):
             gsax_a = float(match.get("away_gsax") or 0.0)
         except (KeyError, TypeError, ValueError):
             continue
+        # Les lambdas stockées intègrent déjà GSAx via calculate_master_odds_v4 :
+        # reconstruire la base avant d'appliquer le mult trial.
+        adj_stocke_h = gsax_per_60_vers_lambda(gsax_a) * mult_stocke
+        adj_stocke_a = gsax_per_60_vers_lambda(gsax_h) * mult_stocke
+        lam_h_base = lam_h + adj_stocke_h
+        lam_a_base = lam_a + adj_stocke_a
         adj_h = gsax_per_60_vers_lambda(gsax_a) * mult
         adj_a = gsax_per_60_vers_lambda(gsax_h) * mult
-        mu_pred = max(lam_h - adj_h, 0.1) + max(lam_a - adj_a, 0.1)
+        mu_pred = max(lam_h_base - adj_h, 0.1) + max(lam_a_base - adj_a, 0.1)
         w = _poids_recency_mle(match)
         sse += w * (total - mu_pred) ** 2
         n += 1
@@ -2168,10 +2176,11 @@ def _mse_gsax_lam_mult(mult, historique_matchs):
 
 def calibrer_gsax_lam_mult(historique_matchs):
     """Grille sur le multiplicateur d'impact GSAx → lambda."""
+    mult_stocke = lire_gsax_lam_mult()
     candidats = [i / 100.0 for i in range(50, 151)]
-    meilleur, meilleur_mse = NHL_GSAX_LAM_MULT_DEFAULT, float("inf")
+    meilleur, meilleur_mse = mult_stocke, float("inf")
     for mult in candidats:
-        mse = _mse_gsax_lam_mult(mult, historique_matchs)
+        mse = _mse_gsax_lam_mult(mult, historique_matchs, mult_stocke=mult_stocke)
         if mse < meilleur_mse:
             meilleur_mse, meilleur = mse, mult
     n_gsax = sum(
@@ -3041,7 +3050,11 @@ def diagnostic_pret_saison():
                 entrainer_ia_dixon_coles()
                 nb_apres = len(lire_league_calib_meta().get("games", {}))
                 log_nhl(f"📚 Bootstrap terminé : {nb_apres} match(s) ligue indexés")
-            entrainer_ia_dixon_coles()
+            else:
+                log_nhl(
+                    "⚠️ Bootstrap calibration ignoré — stats MoneyPuck indisponibles",
+                    level="warning",
+                )
 
 
 def _noms_odds_pour_equipe(abbrev):
