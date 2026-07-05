@@ -70,6 +70,9 @@ NHL_KELLY_CLV_FENETRE = int(os.environ.get("NHL_KELLY_CLV_FENETRE", "40"))
 NHL_KELLY_CLV_MIN_PARIS = int(os.environ.get("NHL_KELLY_CLV_MIN_PARIS", "15"))
 NHL_KELLY_CLV_SENSIBILITE = float(os.environ.get("NHL_KELLY_CLV_SENSIBILITE", "0.04"))
 NHL_KELLY_CLV_MULT_MIN = float(os.environ.get("NHL_KELLY_CLV_MULT_MIN", "0.5"))
+NHL_KELLY_PARAM_ACTIF = _env_bool("NHL_KELLY_PARAM_ACTIF", True)
+NHL_KELLY_PARAM_MULT_MIN = float(os.environ.get("NHL_KELLY_PARAM_MULT_MIN", "0.50"))
+NHL_KELLY_PARAM_GSAX_INCONNU = float(os.environ.get("NHL_KELLY_PARAM_GSAX_INCONNU", "0.25"))
 NHL_LINE_MOVE_ACTIF = _env_bool("NHL_LINE_MOVE_ACTIF", True)
 NHL_LINE_MIN_AGE_MIN = int(os.environ.get("NHL_LINE_MIN_AGE_MIN", "45"))
 NHL_LINE_MAX_SNAPSHOTS = int(os.environ.get("NHL_LINE_MAX_SNAPSHOTS", "48"))
@@ -161,6 +164,7 @@ _hia_equipe_logue = False
 _pit_index_memo = None
 _pit_fallback_logue = False
 _pit_build_logue = False
+_kelly_param_logue = False
 FLOAT_TOL = 0.01
 # Part du temps de jeu gardien (~54 min) pour convertir GSAx/60 → impact/match
 GSAX_MINUTES_PAR_MATCH = float(os.environ.get("NHL_GSAX_MINUTES", "54.0"))
@@ -247,6 +251,7 @@ JOURNAL_COLONNES = [
     "Lam_Ext", "Lam_Dom", "Score_Ext", "Score_Dom",
     "Edge(%)", "Risque(%)", "Mise_€", "Statut", "P&L",
     "Gardien_Ext", "Gardien_Dom", "Gardiens_Confirmes", "B2B_Home", "B2B_Away", "Rho", "Hia",
+    "Confiance_Kelly",
 ]
 
 _odds_quota_state = {"derniere_alerte": None}
@@ -1453,10 +1458,16 @@ def detecter_stars_absentes(team_abbr, roster_nhl, stars_vip):
 
 
 def trouver_gsax(nom_nhl, goalies_data):
+    gardien = trouver_gardien_meta(nom_nhl, goalies_data)
+    return gardien["gsax_per_60"] if gardien else 0.0
+
+
+def trouver_gardien_meta(nom_nhl, goalies_data):
+    """Retourne la ligne MoneyPuck du gardien (GSAx, games_played…) ou None."""
     for g in goalies_data:
-        if formater_nom(g['name']) == nom_nhl or joueur_present(g['name'], [nom_nhl]):
-            return g['gsax_per_60']
-    return 0.0
+        if formater_nom(g["name"]) == nom_nhl or joueur_present(g["name"], [nom_nhl]):
+            return g
+    return None
 
 
 def gsax_per_60_vers_lambda(gsax_per_60):
@@ -2701,7 +2712,7 @@ def _choisir_meilleur_pari(candidats):
 
 def _construire_candidats_pari(
     m, cotes_vraies, cotes_bookmaker, cotes_puckline, bankroll, gardiens_verrouilles,
-    kelly_mult=None, gp_moyen_match=None,
+    kelly_mult=None, gp_moyen_match=None, kelly_param_mult=1.0, confiance_detail=None,
 ):
     """Évalue ML / PL / O-U selon NHL_MARCHES_ACTIFS."""
     candidats = []
@@ -2713,6 +2724,7 @@ def _construire_candidats_pari(
         gardiens_confirmes=gardiens_verrouilles,
         kelly_mult=kelly_mult,
         gp_moyen=gp_moyen_match,
+        kelly_param_mult=kelly_param_mult,
     )
 
     if "ML" in NHL_MARCHES_ACTIFS:
@@ -2903,7 +2915,104 @@ def _multiplicateur_kelly_dynamique():
     return mult
 
 
-def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kelly_mult=None, gp_moyen=None):
+def _poids_confiance_gsax(nom_nhl, goalies_data):
+    """Confiance GSAx selon GP saison (même logique que _shrink_gsax_echantillon)."""
+    gardien = trouver_gardien_meta(nom_nhl, goalies_data)
+    if not gardien:
+        return NHL_KELLY_PARAM_GSAX_INCONNU
+    if not NHL_GSAX_SHRINK_ACTIF or NHL_GSAX_SHRINK_GP_PLEIN <= 0:
+        return 1.0
+    return min(1.0, gardien.get("games_played", 0) / NHL_GSAX_SHRINK_GP_PLEIN)
+
+
+def _poids_confiance_hia_equipe(home_team):
+    """Confiance HIA domicile selon shrink_weight (P9.5)."""
+    if not NHL_HIA_PAR_EQUIPE_ACTIF:
+        return 1.0
+    team_data = lire_hia_equipes_meta().get("teams", {}).get(home_team)
+    if not team_data:
+        if NHL_HIA_TEAM_GP_PLEIN <= 0:
+            return 0.5
+        return min(1.0, NHL_HIA_TEAM_MIN_GAMES / NHL_HIA_TEAM_GP_PLEIN)
+    return float(team_data.get("shrink_weight", 1.0))
+
+
+def _poids_confiance_pp_pk(home_base, away_base):
+    """Confiance PP/PK selon GP saison le plus faible des deux équipes."""
+    if NHL_PP_PK_SHRINK_GP <= 0:
+        return 1.0
+    gp_min = min(
+        home_base.get("games_played", 0),
+        away_base.get("games_played", 0),
+    )
+    return min(1.0, gp_min / NHL_PP_PK_SHRINK_GP)
+
+
+def _poids_confiance_arbitre(referee_names):
+    """Confiance crew arbitral selon GP indexés (même logique que shrink arbitral)."""
+    if not NHL_REF_ADJ_ACTIF or not referee_names:
+        return 1.0
+    ref_keys = [_normaliser_nom_arbitre(n) for n in referee_names]
+    meta = lire_referee_meta()
+    poids = []
+    for key in ref_keys:
+        ref_data = meta.get("referees", {}).get(key)
+        if not ref_data or ref_data.get("games", 0) < 1:
+            continue
+        games = ref_data["games"]
+        if NHL_REF_SHRINK_ACTIF:
+            poids.append(min(1.0, games / NHL_REF_MIN_MATCHS))
+        elif games >= NHL_REF_MIN_MATCHS:
+            poids.append(1.0)
+    if not poids:
+        return 0.0
+    return sum(poids) / len(poids)
+
+
+def _multiplicateur_kelly_parametrique(
+    g_dom, g_ext, goalies_data, home_team, home_base, away_base,
+    referee_names, ref_applique=False,
+):
+    """
+    Réduit la mise quand le pari repose sur des paramètres peu fiables
+    (GSAx gardien, HIA équipe, PP/PK, arbitre). Moyenne géométrique des
+    poids de confiance existants, plancher NHL_KELLY_PARAM_MULT_MIN.
+  """
+    global _kelly_param_logue
+    if not NHL_KELLY_PARAM_ACTIF:
+        return 1.0, {}
+
+    w_gsax = min(
+        _poids_confiance_gsax(g_dom, goalies_data),
+        _poids_confiance_gsax(g_ext, goalies_data),
+    )
+    w_hia = _poids_confiance_hia_equipe(home_team)
+    w_pp_pk = _poids_confiance_pp_pk(home_base, away_base)
+    w_ref = _poids_confiance_arbitre(referee_names) if ref_applique else 1.0
+
+    composantes = {
+        "gsax": round(w_gsax, 3),
+        "hia": round(w_hia, 3),
+        "pp_pk": round(w_pp_pk, 3),
+        "ref": round(w_ref, 3),
+    }
+    vals = [w_gsax, w_hia, w_pp_pk, w_ref]
+    mult = math.prod(vals) ** (1.0 / len(vals))
+    mult = round(max(mult, NHL_KELLY_PARAM_MULT_MIN), 3)
+
+    if mult < 1.0 and not _kelly_param_logue:
+        _kelly_param_logue = True
+        log_nhl(
+            f"🎚️ Kelly incertitude paramétrique actif — moy. géom. GSAx/HIA/PP-PK/ref, "
+            f"plancher x{NHL_KELLY_PARAM_MULT_MIN:.2f}"
+        )
+    return mult, composantes
+
+
+def calculate_kelly(
+    true_prob, book_odds, bankroll, gardiens_confirmes=True,
+    kelly_mult=None, gp_moyen=None, kelly_param_mult=1.0,
+):
     if book_odds <= 1.0 or true_prob <= 0.01 or true_prob >= 0.99:
         return None
     edge = true_prob - (1 / book_odds)
@@ -2914,7 +3023,7 @@ def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kel
     fraction_kelly = KELLY_FRACTION if gardiens_confirmes else KELLY_FRACTION_GARDIEN_INCERTAIN
     if kelly_mult is None:
         kelly_mult = _multiplicateur_kelly_dynamique()
-    fraction_kelly *= kelly_mult
+    fraction_kelly *= kelly_mult * kelly_param_mult
     if not gardiens_confirmes:
         log_nhl(
             f"🛡️ Gardiens probables — Kelly ÷2, edge min {_edge_minimum_dynamique(gp_moyen, False):.0%} "
@@ -2940,6 +3049,7 @@ def calculate_kelly(true_prob, book_odds, bankroll, gardiens_confirmes=True, kel
         'pct_bankroll': pct_effectif,
         'mise': mise,
         'statut_gardiens': "CONFIRMÉ" if gardiens_confirmes else "PROBABLE",
+        'confiance_kelly': round(kelly_param_mult, 3),
     }
 
 
@@ -3087,6 +3197,7 @@ def enregistrer_transaction(
         "B2B_Away": "OUI" if b2b_away else "NON",
         "Rho": rho,
         "Hia": hia,
+        "Confiance_Kelly": investissement.get("confiance_kelly", 1.0),
     }
     with open(FICHIER_JOURNAL, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES, extrasaction="ignore")
@@ -3270,6 +3381,11 @@ def run_sniper():
         log_nhl(
             f"📊 Kelly CLV actif — fenêtre {NHL_KELLY_CLV_FENETRE} paris (min {NHL_KELLY_CLV_MIN_PARIS}), "
             f"sensibilité {NHL_KELLY_CLV_SENSIBILITE:.0%}, mult. plancher x{NHL_KELLY_CLV_MULT_MIN:.2f}"
+        )
+    if NHL_KELLY_PARAM_ACTIF:
+        log_nhl(
+            f"🎚️ Kelly incertitude paramétrique actif — GSAx/HIA/PP-PK/ref (moy. géom.), "
+            f"plancher x{NHL_KELLY_PARAM_MULT_MIN:.2f}"
         )
     if NHL_LINE_MOVE_ACTIF:
         log_nhl(
@@ -3474,6 +3590,16 @@ def run_sniper():
                 gp_moyen_match = (
                     (home_base.get('games_played', 0) + away_base.get('games_played', 0)) / 2.0
                 )
+                kelly_param_mult, confiance_detail = _multiplicateur_kelly_parametrique(
+                    g_dom, g_ext, goalies, m["home_team"], home_base, away_base,
+                    referee_names, ref_applique=bool(ref_info),
+                )
+                if kelly_param_mult < 1.0:
+                    parts = [f"{k}={v:.2f}" for k, v in confiance_detail.items() if v < 1.0]
+                    log_nhl(
+                        f"🎚️ Kelly paramétrique x{kelly_param_mult:.2f} "
+                        f"({', '.join(parts)}) — {m['away_team']} @ {m['home_team']}"
+                    )
                 cotes_vraies, corr_marches = shrink_cotes_vers_marche(
                     cotes_vraies, cotes_bookmaker, cotes_puckline, gp_moyen_match,
                 )
@@ -3488,6 +3614,8 @@ def run_sniper():
                         m, cotes_vraies, cotes_bookmaker, cotes_puckline,
                         bankroll_actuelle, gardiens_verrouilles, kelly_mult=kelly_mult_actuel,
                         gp_moyen_match=gp_moyen_match,
+                        kelly_param_mult=kelly_param_mult,
+                        confiance_detail=confiance_detail,
                     )
                     candidats = filtrer_candidats_line_movement(
                         m["game_id"], candidats, m, gardiens_verrouilles,
