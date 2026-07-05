@@ -1800,32 +1800,37 @@ async def simuler_paris(conn, ligues=None):
             if not candidats:
                 continue
 
-            # 🔒 FILTRE 1 PARI/MATCH : garder uniquement le signal avec le meilleur EV final
+            # Meilleur signal par marché (AH + totaux indépendants sur le même match)
             candidats.sort(key=lambda x: x[0], reverse=True)
-            ev_final, market, outcome, h_val, cote_h24, k, mise, flag = candidats[0]
+            by_market: dict = {}
+            for row in candidats:
+                mk = row[1]
+                if mk not in by_market:
+                    by_market[mk] = row
 
-            # Cote de clôture
-            async with conn.execute(
-                "SELECT cote FROM bt_odds_cloture WHERE fixture_id=? AND market=? AND outcome=? AND h_val=?",
-                (fid, market, outcome, h_val)
-            ) as cur:
-                row = await cur.fetchone()
-            cote_cloture = row[0] if row else None
+            for ev_final, market, outcome, h_val, cote_h24, k, mise, flag in by_market.values():
+                # Cote de clôture
+                async with conn.execute(
+                    "SELECT cote FROM bt_odds_cloture WHERE fixture_id=? AND market=? AND outcome=? AND h_val=?",
+                    (fid, market, outcome, h_val)
+                ) as cur:
+                    row = await cur.fetchone()
+                cote_cloture = row[0] if row else None
 
-            # Résultat réel
-            if market == 'spreads':
-                res = resultat_ah(gh, ga, h_val, flag)
-            else:
-                res = resultat_total(gh, ga, h_val, flag)
+                # Résultat réel
+                if market == 'spreads':
+                    res = resultat_ah(gh, ga, h_val, flag)
+                else:
+                    res = resultat_total(gh, ga, h_val, flag)
 
-            clv = round((cote_h24 / cote_cloture) - 1, 4) if cote_cloture else None
+                clv = round((cote_h24 / cote_cloture) - 1, 4) if cote_cloture else None
 
-            pending.append((
-                fid, ligue['id'], saison, market, outcome, h_val,
-                cote_h24, cote_cloture, round(ev_final, 4), round(k, 4),
-                mise, gh, ga, res, clv,
-            ))
-            signaux += 1
+                pending.append((
+                    fid, ligue['id'], saison, market, outcome, h_val,
+                    cote_h24, cote_cloture, round(ev_final, 4), round(k, 4),
+                    mise, gh, ga, res, clv,
+                ))
+                signaux += 1
 
         all_pending.extend(pending)
         print(f"  {ligue['nom']} : {signaux} signaux générés")
@@ -1837,6 +1842,50 @@ async def simuler_paris(conn, ligues=None):
     else:
         print("\n❌ Phase 2 échouée (données en base inchangées — rapport = anciens signaux).")
     return n_saved
+
+
+def _t_stat_clv(clv_vals: list) -> float:
+    if len(clv_vals) < 2:
+        return float('nan')
+    m = float(np.mean(clv_vals))
+    s = float(np.std(clv_vals, ddof=1))
+    if s == 0:
+        return float('nan')
+    return m / (s / np.sqrt(len(clv_vals)))
+
+
+def _resume_signaux(rows, idx_res=13, idx_mise=10, idx_clv=14):
+    """Stats CLV / ROI / t-stat pour un sous-ensemble de signaux bt_signaux."""
+    if not rows:
+        return None
+    res = [(r[idx_res], r[idx_mise]) for r in rows if r[idx_res] is not None]
+    clv = [r[idx_clv] for r in rows if r[idx_clv] is not None]
+    if not res:
+        return None
+    pnl = sum(r * m for r, m in res)
+    mises = sum(m for _, m in res)
+    return {
+        'n': len(rows),
+        'clv': float(np.mean(clv)) if clv else 0.0,
+        'n_clv': len(clv),
+        't_clv': _t_stat_clv(clv),
+        'roi': pnl / mises if mises else 0.0,
+        'pnl': pnl,
+        'mises': mises,
+        'win_rate': sum(1 for r, _ in res if r > 0) / len(res),
+    }
+
+
+def _print_ligne_marche(label: str, st: dict | None, indent: str = "  "):
+    if not st:
+        print(f"{indent}{label:<22} — aucun signal")
+        return
+    t_s = f"{st['t_clv']:+.2f}" if st['n_clv'] >= 2 and not np.isnan(st['t_clv']) else "n/a"
+    print(
+        f"{indent}{label:<22} n={st['n']:>5}  "
+        f"CLV={st['clv']:>+7.2%} (t={t_s:>5})  "
+        f"ROI={st['roi']:>+7.2%}  P&L={st['pnl']:>+7.1f}u  WR={st['win_rate']:.1%}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1885,6 +1934,20 @@ async def generer_rapport(conn):
     print(f"  ROI                 : {pnl_total/mises_tot:+.2%}" if mises_tot else "  ROI : N/A")
     print(f"  Win rate            : {win_rate:.1%}")
     print(f"  Signaux avec CLV    : {len(clv_vals)}/{total}")
+
+    # ── AH vs Totaux (CLV + ROI séparés) ─────────────────────
+    print(f"\n{'─'*50}")
+    print(f"  PAR TYPE DE MARCHÉ — CLV vs Pinnacle + ROI")
+    print(f"{'─'*50}")
+    st_ah = _resume_signaux([s for s in signaux if s[3] == 'spreads'])
+    st_tot = _resume_signaux([s for s in signaux if s[3] == 'totals'])
+    _print_ligne_marche("Handicap Asiatique", st_ah)
+    _print_ligne_marche("Totaux (O/U)", st_tot)
+    if st_ah and st_tot:
+        delta_clv = st_ah['clv'] - st_tot['clv']
+        print(f"\n  Écart CLV AH − Totaux : {delta_clv:+.2%}")
+        if st_ah['clv'] > 0 and st_tot['clv'] <= 0:
+            print("  → Edge vs Pinnacle sur l'AH ; totaux sans CLV structurel dans ce backtest.")
 
     # Drawdown maximum
     bankroll = 100.0
@@ -1950,17 +2013,32 @@ async def generer_rapport(conn):
 
     # ── Rapport par marché ──────────────────────────────────
     print(f"\n{'─'*50}")
-    print(f"  PAR MARCHÉ")
+    print(f"  PAR MARCHÉ (détail)")
     print(f"{'─'*50}")
-    for market in ['spreads', 'totals']:
-        rows_m = [s for s in signaux if s[3] == market and s[13] is not None]
-        if not rows_m:
-            continue
-        pnl_m = sum(r[13] * r[10] for r in rows_m)
-        mis_m = sum(r[10] for r in rows_m)
-        roi_m = pnl_m / mis_m if mis_m else 0
-        label = "Handicap Asiatique" if market == 'spreads' else "Totaux"
-        print(f"  {label:<22} {len(rows_m):>5} signaux → ROI {roi_m:+.2%} | P&L {pnl_m:+.1f}u")
+    for market, label in [('spreads', 'Handicap Asiatique'), ('totals', 'Totaux (O/U)')]:
+        rows_m = [s for s in signaux if s[3] == market]
+        st_m = _resume_signaux(rows_m)
+        _print_ligne_marche(label, st_m)
+
+    # ── Par ligue × marché ───────────────────────────────────
+    print(f"\n{'─'*50}")
+    print(f"  PAR LIGUE × MARCHÉ (CLV / ROI)")
+    print(f"{'─'*50}")
+    print(f"  {'Ligue':<18} {'Marché':<8} {'N':>5} {'CLV':>8} {'t':>6} {'ROI':>8}")
+    print(f"  {'─'*18} {'─'*8} {'─'*5} {'─'*8} {'─'*6} {'─'*8}")
+    par_ligue_id = defaultdict(lambda: defaultdict(list))
+    for s in signaux:
+        par_ligue_id[s[-1]][s[3]].append(s)
+    for nom in sorted(par_ligue_id.keys()):
+        for market, mlabel in [('spreads', 'AH'), ('totals', 'Tot')]:
+            st_lm = _resume_signaux(par_ligue_id[nom][market])
+            if not st_lm or st_lm['n'] < 10:
+                continue
+            t_s = f"{st_lm['t_clv']:+.1f}" if st_lm['n_clv'] >= 2 and not np.isnan(st_lm['t_clv']) else "n/a"
+            print(
+                f"  {nom:<18} {mlabel:<8} {st_lm['n']:>5} "
+                f"{st_lm['clv']:>+7.2%} {t_s:>6} {st_lm['roi']:>+7.1%}"
+            )
 
     # ── Courbe de calibration ───────────────────────────────
     print(f"\n{'─'*50}")
