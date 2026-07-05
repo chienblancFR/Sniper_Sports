@@ -2801,6 +2801,7 @@ def run_sniper():
     while True:
         try:
             lancer_la_balayeuse()
+            _invalider_rho_meta_cache()
 
             log_nhl("📡 Synchronisation bases de données...")
             teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
@@ -3064,26 +3065,46 @@ def lancer_la_balayeuse():
         _ecrire_journal(rows)
         publier_journal_dashboard()
 
+_rho_meta_cache = None
+
+
 def lire_rho_meta():
+    """
+    Lit rho_calibrage_meta.json avec cache mémoire (invalidé à chaque cycle de
+    scan et après recalibration) — évite des centaines de lectures disque
+    redondantes lors du bootstrap historique (jusqu'à ~1400 matchs/cycle).
+    """
+    global _rho_meta_cache
+    if _rho_meta_cache is not None:
+        return dict(_rho_meta_cache)
+
     default = {
         "rho": -0.12, "hia": NHL_HIA_DEFAULT,
         "prob_tie": 0.12, "prob_en": 0.22,
         "nb_ou_dispersion": NHL_NB_OU_DISPERSION_DEFAULT,
         "nb_matchs": 0,
     }
+    resultat = default
     if os.path.exists(RHO_META_FILE):
         try:
             with open(RHO_META_FILE, "r", encoding="utf-8") as f:
-                return {**default, **json.load(f)}
+                resultat = {**default, **json.load(f)}
         except Exception:
-            pass
-    if os.path.exists("rho_optimal.txt"):
+            resultat = default
+    elif os.path.exists("rho_optimal.txt"):
         try:
             with open("rho_optimal.txt", "r", encoding="utf-8") as f:
-                return {**default, "rho": float(f.read().strip())}
+                resultat = {**default, "rho": float(f.read().strip())}
         except Exception:
-            pass
-    return default
+            resultat = default
+
+    _rho_meta_cache = dict(resultat)
+    return dict(resultat)
+
+
+def _invalider_rho_meta_cache():
+    global _rho_meta_cache
+    _rho_meta_cache = None
 
 
 def lire_rho_dynamique():
@@ -3393,6 +3414,8 @@ def entrainer_ia_dixon_coles():
         json.dump(meta, f, indent=2)
     with open("rho_optimal.txt", "w", encoding="utf-8") as f:
         f.write(str(nouveau_rho))
+    global _rho_meta_cache
+    _rho_meta_cache = dict(meta)
     nb_paris = nb - nb_ligue
     log_nhl(
         f"💾 Rho+HIA+EmptyNet sauvegardés ({nb} matchs = {nb_ligue} ligue + {nb_paris} paris, "
