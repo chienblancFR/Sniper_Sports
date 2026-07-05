@@ -512,23 +512,27 @@ def creer_graphique_pl_marche(
 def creer_graphique_clv_cumule(
     df_clv: pd.DataFrame,
     col_marche: str = "Type_Marche",
+    couleurs: dict | None = None,
 ) -> go.Figure:
     """CLV moyen cumulé par marché — axe X = Date si disponible."""
     fig = go.Figure()
-    couleurs = {"Totals (Buts)": "#FF4500", "Handicap Asiatique": "#00BFFF"}
+    couleurs_defaut = {"Totals (Buts)": "#FF4500", "Handicap Asiatique": "#00BFFF"}
+    couleurs_map = {**couleurs_defaut, **(couleurs or {})}
+    palette = ["#00BFFF", "#FF4500", "#00FF00", "#FFD700", "#DA70D6", "#FF69B4"]
     a_dates = "Date" in df_clv.columns and df_clv["Date"].notna().any()
 
-    for marche in df_clv[col_marche].unique():
+    for i, marche in enumerate(df_clv[col_marche].unique()):
         df_cat = df_clv[df_clv[col_marche] == marche].sort_values("Date").reset_index(drop=True)
         df_cat["CLV_Pct"] = df_cat["CLV"] * 100
         df_cat["CLV_Moy_Cumulee"] = df_cat["CLV_Pct"].expanding().mean()
         axe_x = df_cat["Date"] if a_dates else df_cat.index
+        couleur = couleurs_map.get(marche) or palette[i % len(palette)]
         fig.add_trace(go.Scatter(
             x=axe_x,
             y=df_cat["CLV_Moy_Cumulee"],
             mode="lines",
             name=marche,
-            line=dict(color=couleurs.get(marche, "#FFFFFF"), width=2.5),
+            line=dict(color=couleur, width=2.5),
         ))
 
     fig.add_hline(y=0, line_dash="dash", line_color="#FFFFFF", opacity=0.5)

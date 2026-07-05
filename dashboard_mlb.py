@@ -35,6 +35,13 @@ PA_DATA_DIR = "/home/chienblanc/data"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CAPITAL_INITIAL = float(os.environ.get("MLB_BANKROLL", "100"))
 
+COULEURS_CLV_MLB = {
+    "Full Game · Moneyline": "#00BFFF",
+    "Full Game · Over/Under": "#FF4500",
+    "F5 · Moneyline": "#FFD700",
+    "F5 · Over/Under": "#00FF00",
+}
+
 
 def _candidats_fichiers(nom: str) -> list[str]:
     paths = []
@@ -392,7 +399,11 @@ with col_droite:
         df_clv_chart = df_clv_ok.copy()
         df_clv_chart["CLV"] = df_clv_chart["CLV_Fermeture"] / 100.0
         df_clv_chart["Type_Marche"] = df_clv_chart["Catégorie"]
-        fig_clv = creer_graphique_clv_cumule(df_clv_chart, col_marche="Type_Marche")
+        fig_clv = creer_graphique_clv_cumule(
+            df_clv_chart,
+            col_marche="Type_Marche",
+            couleurs=COULEURS_CLV_MLB,
+        )
         st.plotly_chart(fig_clv, use_container_width=True)
     elif not df_termines.empty:
         st.write("En attente des données de fermeture Pinnacle.")
