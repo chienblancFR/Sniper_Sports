@@ -57,16 +57,51 @@ def _candidats_fichiers(nom: str) -> list[str]:
 
 
 def _score_mlb(df: pd.DataFrame, mtime: float) -> tuple:
+    """Priorité : plus de lignes, puis paris en attente, puis fraîcheur."""
     n_attente = 0
     if "Result" in df.columns:
-        n_attente = int((df["Result"].astype(str).str.strip() == "En attente").sum())
-    return (n_attente, mtime)
+        for val in df["Result"]:
+            if _statut_pari(val) == "En attente":
+                n_attente += 1
+    return (len(df), n_attente, mtime)
+
+
+def _reparer_encodage(val) -> str:
+    """Corrige le double encodage UTF-8 des emojis dans les CSV PA."""
+    if not isinstance(val, str):
+        return str(val)
+    try:
+        return val.encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return val
+
+
+def _statut_pari(val) -> str:
+    """Normalise les libellés Result (emojis, mojibake, variantes)."""
+    s = _reparer_encodage(str(val)).strip().upper()
+    if "GAGN" in s:
+        return "✅ GAGNÉ"
+    if "PERDU" in s:
+        return "❌ PERDU"
+    if "REMBOURS" in s or "VOID" in s or "PUSH" in s:
+        return "🔄 REMBOURSÉ"
+    if "ATTENTE" in s or s in ("PENDING", "OPEN"):
+        return "En attente"
+    return str(val).strip()
 
 
 def _charger_csv_mlb(url: str, fichier_local: str):
-    """Local le plus récent (priorité En attente) → URL PA."""
+    """Meilleure source disponible (local ou URL) — priorité au journal le plus complet."""
     erreurs = []
-    best_df, best_src, best_score = None, None, (-1, -1.0)
+    best_df, best_src, best_score = None, None, (-1, -1, -1.0)
+
+    def _consider(df: pd.DataFrame, src: str, mtime: float):
+        nonlocal best_df, best_src, best_score
+        if df is None or df.empty:
+            return
+        score = _score_mlb(df, mtime)
+        if score > best_score:
+            best_score, best_df, best_src = score, df, src
 
     for path in _candidats_fichiers(fichier_local):
         if not os.path.isfile(path):
@@ -76,31 +111,30 @@ def _charger_csv_mlb(url: str, fichier_local: str):
             if df.empty:
                 erreurs.append(f"{path}: vide")
                 continue
-            score = _score_mlb(df, os.path.getmtime(path))
-            if score > best_score:
-                best_score, best_df = score, df
-                mtime = datetime.fromtimestamp(score[1])
-                best_src = (
-                    f"fichier · {path} ({mtime:%d/%m %H:%M}, "
-                    f"{score[0]} en attente / {len(df)} lignes)"
-                )
+            mtime = os.path.getmtime(path)
+            _consider(
+                df,
+                f"fichier · {path} ({datetime.fromtimestamp(mtime):%d/%m %H:%M}, {len(df)} lignes)",
+                mtime,
+            )
         except Exception as e:
             erreurs.append(f"{path}: {e}")
-
-    if best_df is not None:
-        return best_df, "ok", best_src
 
     try:
         r = requests.get(url, timeout=20)
         if r.status_code == 200:
             df = pd.read_csv(StringIO(r.text))
             if not df.empty:
-                n_a = _score_mlb(df, 0)[0]
-                return df, "ok", f"URL PA · {fichier_local} ({n_a} en attente / {len(df)} lignes)"
-            return df, "empty", f"URL PA · {fichier_local} (vide)"
-        erreurs.append(f"URL HTTP {r.status_code}")
+                _consider(df, f"URL PA · {fichier_local} ({len(df)} lignes)", 0.0)
+            elif best_df is None:
+                return df, "empty", f"URL PA · {fichier_local} (vide)"
+        else:
+            erreurs.append(f"URL HTTP {r.status_code}")
     except Exception as e:
         erreurs.append(f"URL: {e}")
+
+    if best_df is not None:
+        return best_df, "ok", best_src
 
     return pd.DataFrame(), "missing", " | ".join(erreurs) if erreurs else "introuvable"
 
@@ -129,6 +163,9 @@ def _enrichir_df(df: pd.DataFrame) -> pd.DataFrame:
 
     if "Type_Pari" not in df.columns and "Pari" in df.columns:
         df["Type_Pari"] = df["Pari"].apply(_definir_type_pari)
+
+    if "Result" in df.columns:
+        df["Result"] = df["Result"].apply(_statut_pari)
 
     df["Edge_Pct"] = df["Edge"].apply(_parse_edge_pct) if "Edge" in df.columns else None
     df["Catégorie"] = df["Segment"] + " · " + df["Type_Pari"]
@@ -259,6 +296,7 @@ if df_live.empty:
 # ==========================================
 df_termines = df_live[df_live["Result"].isin(["✅ GAGNÉ", "❌ PERDU"])].copy()
 df_attente = df_live[df_live["Result"] == "En attente"].copy()
+df_clotures = df_live[df_live["Result"].isin(["✅ GAGNÉ", "❌ PERDU", "🔄 REMBOURSÉ"])].copy()
 
 total_pl = df_termines["P&L"].sum() if not df_termines.empty else 0.0
 capital_actuel = CAPITAL_INITIAL + total_pl
@@ -439,10 +477,38 @@ if not df_termines.empty:
 # 📰 JOURNAL DE BORD
 # ==========================================
 st.markdown("---")
+st.subheader("📰 Historique complet des paris clôturés")
+
+if not df_clotures.empty:
+    df_hist = df_clotures.sort_values(by="Date", ascending=False).copy()
+    colonnes_hist = ["Date", "Match", "Pari", "Segment", "Cote", "Mise", "Result", "P&L", "CLV_Fermeture"]
+    colonnes_hist = [c for c in colonnes_hist if c in df_hist.columns]
+    df_hist = df_hist[colonnes_hist]
+    df_hist["P&L"] = df_hist["P&L"].round(2)
+
+    def colorer_resultat(val):
+        if val == "✅ GAGNÉ":
+            return "color: #00FF00; font-weight: bold"
+        if val == "❌ PERDU":
+            return "color: #FF4500; font-weight: bold"
+        if val == "🔄 REMBOURSÉ":
+            return "color: #FFD700; font-weight: bold"
+        return ""
+
+    st.caption(f"{len(df_hist)} pari(s) clôturé(s) affiché(s) (filtres sidebar appliqués).")
+    st.dataframe(
+        df_hist.style.map(colorer_resultat, subset=["Result"]),
+        use_container_width=True,
+        height=min(600, 35 * len(df_hist) + 38),
+    )
+else:
+    st.write("Aucun pari clôturé pour le moment.")
+
+st.markdown("---")
 st.subheader("📰 Bilan : 10 derniers paris terminés")
 
-if not df_termines.empty:
-    df_derniers = df_termines.sort_values(by="Date", ascending=False).head(10)
+if not df_clotures.empty:
+    df_derniers = df_clotures.sort_values(by="Date", ascending=False).head(10)
     colonnes_hist = ["Date", "Match", "Pari", "Segment", "Cote", "Mise", "Result", "P&L", "CLV_Fermeture"]
     colonnes_hist = [c for c in colonnes_hist if c in df_derniers.columns]
     df_derniers = df_derniers[colonnes_hist].copy()
@@ -453,6 +519,8 @@ if not df_termines.empty:
             return "color: #00FF00; font-weight: bold"
         if val == "❌ PERDU":
             return "color: #FF4500; font-weight: bold"
+        if val == "🔄 REMBOURSÉ":
+            return "color: #FFD700; font-weight: bold"
         return ""
 
     st.dataframe(
