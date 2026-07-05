@@ -90,6 +90,12 @@ NHL_MODEL_TRUST_GP_PLEIN = float(os.environ.get("NHL_MODEL_TRUST_GP_PLEIN", "20"
 NHL_RHO_MIN_MATCHS = int(os.environ.get("NHL_RHO_MIN_MATCHS", "30"))
 NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
 NHL_EMPTY_NET_MIN_MATCHS = int(os.environ.get("NHL_EMPTY_NET_MIN_MATCHS", "60"))
+# Calibration MLE élargie à tous les matchs ligue (pas seulement les paris placés)
+NHL_LIGUE_CALIB_ACTIF = _env_bool("NHL_LIGUE_CALIB_ACTIF", True)
+NHL_LIGUE_CALIB_SCAN_JOURS = int(os.environ.get("NHL_LIGUE_CALIB_SCAN_JOURS", "3"))
+NHL_LIGUE_CALIB_LOOKBACK_JOURS = int(os.environ.get("NHL_LIGUE_CALIB_LOOKBACK_JOURS", "30"))
+NHL_LIGUE_CALIB_MIN_MATCHS = int(os.environ.get("NHL_LIGUE_CALIB_MIN_MATCHS", "200"))
+NHL_LIGUE_CALIB_MAX_GAMES = int(os.environ.get("NHL_LIGUE_CALIB_MAX_GAMES", "1400"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
 HIA_REF_CALIBRATION = 0.05  # HIA utilisé lors du calcul des lambdas historiques du journal
@@ -97,6 +103,7 @@ NHL_MARCHES_ACTIFS = {m.strip().upper() for m in os.environ.get("NHL_MARCHES_ACT
 RHO_META_FILE = "rho_calibrage_meta.json"
 REFEREE_META_FILE = "referee_calibrage_meta.json"
 ODDS_HISTORY_FILE = "nhl_odds_history.json"
+LEAGUE_CALIB_FILE = "nhl_league_calib.json"
 # Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
 XG_FOR_COLONNES = (
     "flurryScoreVenueAdjustedxGoalsFor",
@@ -2514,11 +2521,31 @@ def run_sniper():
             f"👨‍⚖️ Ajustement arbitral actif — sensibilité {NHL_REF_SENSIBILITE:.2f}, "
             f"scan {NHL_REF_SCAN_JOURS}j/cycle, min {NHL_REF_MIN_MATCHS} matchs/arbitre"
         )
+    if NHL_LIGUE_CALIB_ACTIF:
+        log_nhl(
+            f"📚 Calibration MLE élargie à tous les matchs ligue — bootstrap "
+            f"{NHL_LIGUE_CALIB_LOOKBACK_JOURS}j/cycle puis {NHL_LIGUE_CALIB_SCAN_JOURS}j/cycle "
+            f"après {NHL_LIGUE_CALIB_MIN_MATCHS} matchs indexés (max {NHL_LIGUE_CALIB_MAX_GAMES} conservés)"
+        )
     migrer_journal_si_besoin()
 
     while True:
         try:
             lancer_la_balayeuse()
+
+            log_nhl("📡 Synchronisation bases de données...")
+            teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
+
+            if not teams or not goalies:
+                log_nhl(
+                    f"⚠️ Données MoneyPuck indisponibles (saison {NHL_SEASON}). Nouvelle tentative dans 5 min...",
+                    level="warning",
+                )
+                time.sleep(300)
+                continue
+
+            if NHL_LIGUE_CALIB_ACTIF:
+                actualiser_historique_ligue(teams)
             entrainer_ia_dixon_coles()
             actualiser_stats_arbitres()
 
@@ -2540,19 +2567,9 @@ def run_sniper():
             )
             kelly_mult_actuel = _multiplicateur_kelly_dynamique()
 
-            log_nhl("📡 Synchronisation bases de données...")
-            teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
             equipes_en_b2b_hier = get_teams_played_yesterday()
             derniers_lieux = get_team_last_game_venues()
             odds_cache = fetch_all_pinnacle_odds()
-
-            if not teams or not goalies:
-                log_nhl(
-                    f"⚠️ Données MoneyPuck indisponibles (saison {NHL_SEASON}). Nouvelle tentative dans 5 min...",
-                    level="warning",
-                )
-                time.sleep(300)
-                continue
 
             matchs = get_nhl_games_today()
             if not matchs:
@@ -2808,25 +2825,149 @@ def lire_prob_en_dynamique():
     return float(lire_rho_meta().get("prob_en", 0.22))
 
 
-def entrainer_ia_dixon_coles():
-    if not os.path.exists(FICHIER_JOURNAL):
+def lire_league_calib_meta():
+    if os.path.exists(LEAGUE_CALIB_FILE):
+        try:
+            with open(LEAGUE_CALIB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"games": {}, "scanned_game_ids": []}
+
+
+def _lambda_referentiel_match(teams_data, home_team, away_team):
+    """
+    Lambdas 'attendues' pour un match à partir des stats d'équipe courantes,
+    sans ajustement spécifique (gardien/fatigue/arbitre) — sert de proxy
+    rétrospectif pour élargir l'échantillon de calibration MLE (rho/HIA/
+    empty-net) à tous les matchs ligue, pas seulement les paris placés.
+    """
+    hia = lire_hia_dynamique()
+    resultat = calculate_master_odds_v4(
+        teams_data, home_team, away_team,
+        home_gsax=0.0, away_gsax=0.0,
+        hia=hia,
+    )
+    if not resultat:
+        return None, None, None
+    return resultat["lam_home"], resultat["lam_away"], hia
+
+
+def actualiser_historique_ligue(teams_data):
+    """
+    Scan incrémental de tous les matchs NHL terminés (pas seulement ceux
+    pariés par le bot) pour alimenter la calibration MLE rho/HIA/empty-net/
+    tie avec un échantillon bien plus large et rapide à constituer.
+    Lambdas approximées via les stats d'équipe courantes (proxy rétrospectif) ;
+    les paris réellement placés (lambdas pré-match exactes) restent
+    prioritaires en cas de doublon lors de la fusion (voir entrainer_ia_dixon_coles).
+    """
+    if not NHL_LIGUE_CALIB_ACTIF or not teams_data:
         return
+
+    meta = lire_league_calib_meta()
+    games_db = meta.setdefault("games", {})
+    scanned = set(meta.get("scanned_game_ids", []))
+    etats_finaux = {"FINAL", "OFF", "OFFICIAL"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    bootstrap = len(games_db) < NHL_LIGUE_CALIB_MIN_MATCHS
+    scan_jours = NHL_LIGUE_CALIB_LOOKBACK_JOURS if bootstrap else NHL_LIGUE_CALIB_SCAN_JOURS
+    nouveaux = 0
+
+    for offset in range(1, scan_jours + 1):
+        date_str = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+        try:
+            response = requests.get(
+                f"https://api-web.nhle.com/v1/score/{date_str}",
+                headers=headers,
+                timeout=10,
+            )
+            if response.status_code != 200:
+                continue
+            for game in response.json().get("games", []):
+                if game.get("gameState") not in etats_finaux:
+                    continue
+                gid = str(game["id"])
+                if gid in scanned:
+                    continue
+                home_info = game.get("homeTeam", {}) or {}
+                away_info = game.get("awayTeam", {}) or {}
+                home_abbrev, away_abbrev = home_info.get("abbrev"), away_info.get("abbrev")
+                home_score, away_score = home_info.get("score"), away_info.get("score")
+                if not home_abbrev or not away_abbrev or home_score is None or away_score is None:
+                    continue
+                lam_h, lam_a, hia_ref = _lambda_referentiel_match(teams_data, home_abbrev, away_abbrev)
+                if lam_h is None:
+                    scanned.add(gid)
+                    continue
+                games_db[gid] = {
+                    "date": date_str,
+                    "home": home_abbrev, "away": away_abbrev,
+                    "vrai_score_domicile": int(home_score),
+                    "vrai_score_exterieur": int(away_score),
+                    "lambda_domicile_calcule": lam_h,
+                    "lambda_exterieur_calcule": lam_a,
+                    "hia_ref": hia_ref,
+                }
+                scanned.add(gid)
+                nouveaux += 1
+        except Exception:
+            continue
+
+    if nouveaux <= 0:
+        return
+
+    if len(games_db) > NHL_LIGUE_CALIB_MAX_GAMES:
+        plus_recents = sorted(games_db.items(), key=lambda kv: kv[1].get("date", ""))[-NHL_LIGUE_CALIB_MAX_GAMES:]
+        games_db = dict(plus_recents)
+
+    meta = {
+        "games": games_db,
+        "scanned_game_ids": list(scanned)[-4000:],
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    with open(LEAGUE_CALIB_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    log_nhl(
+        f"📚 Historique ligue mis à jour — +{nouveaux} match(s), "
+        f"{len(games_db)} matchs indexés pour calibration MLE"
+    )
+
+
+def entrainer_ia_dixon_coles():
     historique_unique = {}
-    with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if row["Statut"] in ["GAGNÉ", "PERDU"]:
-                if row["ID_Match"] not in historique_unique:
+
+    if NHL_LIGUE_CALIB_ACTIF:
+        for gid, data in lire_league_calib_meta().get("games", {}).items():
+            historique_unique[gid] = {
+                "vrai_score_domicile": data["vrai_score_domicile"],
+                "vrai_score_exterieur": data["vrai_score_exterieur"],
+                "lambda_domicile_calcule": data["lambda_domicile_calcule"],
+                "lambda_exterieur_calcule": data["lambda_exterieur_calcule"],
+                "hia_ref": data.get("hia_ref", HIA_REF_CALIBRATION),
+            }
+    nb_ligue = len(historique_unique)
+
+    if os.path.exists(FICHIER_JOURNAL):
+        with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row["Statut"] in ["GAGNÉ", "PERDU"]:
+                    game_id_brut = row["ID_Match"].split("_")[0]
                     try:
                         hia_ref = float(row.get("Hia", HIA_REF_CALIBRATION))
                     except (ValueError, TypeError):
                         hia_ref = HIA_REF_CALIBRATION
-                    historique_unique[row["ID_Match"]] = {
+                    # Lambdas pré-match réelles (calculées au moment du pari) :
+                    # priment sur le proxy rétrospectif du scan ligue.
+                    historique_unique[game_id_brut] = {
                         "vrai_score_domicile": int(row["Score_Dom"]),
                         "vrai_score_exterieur": int(row["Score_Ext"]),
                         "lambda_domicile_calcule": float(row["Lam_Dom"]),
                         "lambda_exterieur_calcule": float(row["Lam_Ext"]),
                         "hia_ref": hia_ref,
                     }
+
     dataset = list(historique_unique.values())
     nb = len(dataset)
     if nb < NHL_RHO_MIN_MATCHS:
@@ -2858,7 +2999,11 @@ def entrainer_ia_dixon_coles():
         json.dump(meta, f, indent=2)
     with open("rho_optimal.txt", "w", encoding="utf-8") as f:
         f.write(str(nouveau_rho))
-    log_nhl(f"💾 Rho+HIA+EmptyNet sauvegardés ({nb} matchs, +{nouveaux} depuis dernier run)")
+    nb_paris = nb - nb_ligue
+    log_nhl(
+        f"💾 Rho+HIA+EmptyNet sauvegardés ({nb} matchs = {nb_ligue} ligue + {nb_paris} paris, "
+        f"+{nouveaux} depuis dernier run)"
+    )
 
 
 def rapport_calibration_journal(chemin=None, min_paris=5):
