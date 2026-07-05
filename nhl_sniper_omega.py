@@ -84,6 +84,9 @@ NHL_PP_PK_SHRINK_GP = float(os.environ.get("NHL_PP_PK_SHRINK_GP", "20"))
 # MoneyPuck fournit nativement des CSV "forme récente" (10 ou 20 derniers matchs)
 NHL_GSAX_RECENT_WINDOW = int(os.environ.get("NHL_GSAX_RECENT_WINDOW", "10"))
 NHL_GSAX_RECENT_GP_PLEIN = float(os.environ.get("NHL_GSAX_RECENT_GP_PLEIN", "8"))
+NHL_GSAX_SHRINK_ACTIF = _env_bool("NHL_GSAX_SHRINK_ACTIF", True)
+NHL_GSAX_SHRINK_GP_PLEIN = float(os.environ.get("NHL_GSAX_SHRINK_GP_PLEIN", "20"))
+NHL_GSAX_SHRINK_MIN_GAMES = int(os.environ.get("NHL_GSAX_SHRINK_MIN_GAMES", "1"))
 NHL_TEAM_RECENT_WINDOW = int(os.environ.get("NHL_TEAM_RECENT_WINDOW", "10"))
 NHL_TEAM_RECENT_GP_PLEIN = float(os.environ.get("NHL_TEAM_RECENT_GP_PLEIN", "10"))
 NHL_MARCHE_SHRINK_ACTIF = _env_bool("NHL_MARCHE_SHRINK_ACTIF", True)
@@ -136,6 +139,7 @@ XG_AGAINST_COLONNES = (
 _xg_colonnes_actives = {"for": None, "against": None}
 _pp_pk_shrink_logue = False
 _gsax_recent_logue = False
+_gsax_shrink_logue = False
 _team_recent_logue = False
 _travel_fatigue_logue = False
 _faceoff_adj_logue = False
@@ -468,7 +472,8 @@ def _parser_goalie_season_csv(texte):
     for row in csv_reader:
         if row.get("situation") != "all":
             continue
-        if float(row.get("games_played", 0) or 0) < 5:
+        gp = float(row.get("games_played", 0) or 0)
+        if gp < NHL_GSAX_SHRINK_MIN_GAMES:
             continue
         gsax_per_60 = _gsax_per_60_de_ligne(row)
         if gsax_per_60 is None:
@@ -477,6 +482,7 @@ def _parser_goalie_season_csv(texte):
             "name": row["name"],
             "gsax_per_60": round(gsax_per_60, 3),
             "gsax_saison": round(gsax_per_60, 3),
+            "games_played": int(gp),
         })
     return goalies
 
@@ -534,6 +540,34 @@ def _appliquer_blend_gsax_recent(goalies, recent_map):
     return goalies
 
 
+def _shrink_gsax_echantillon(goalies):
+    """
+    Régularise le GSAx final vers 0 (gardien moyen) selon le nombre total de
+    matchs joués dans la saison — même logique James-Stein que le HIA par
+    équipe (P9.5). Sans ça, un gardien à 5-8 départs peut avoir un GSAx
+    extrême par pure variance d'échantillon, appliqué à 100% sur lambda.
+    """
+    global _gsax_shrink_logue
+    if not NHL_GSAX_SHRINK_ACTIF or not goalies or NHL_GSAX_SHRINK_GP_PLEIN <= 0:
+        return goalies
+
+    nb_shrink = 0
+    for gardien in goalies:
+        gp = gardien.get("games_played", 0)
+        w = min(1.0, gp / NHL_GSAX_SHRINK_GP_PLEIN)
+        if w < 1.0:
+            gardien["gsax_per_60"] = round(gardien["gsax_per_60"] * w, 3)
+            nb_shrink += 1
+
+    if not _gsax_shrink_logue:
+        _gsax_shrink_logue = True
+        log_nhl(
+            f"🥅 Shrinkage GSAx actif — régression vers 0 tant que <{NHL_GSAX_SHRINK_GP_PLEIN:.0f} GP saison "
+            f"({nb_shrink}/{len(goalies)} gardiens partiellement régularisés)"
+        )
+    return goalies
+
+
 def get_goalie_stats(season=None):
     if season is None:
         season = NHL_SEASON
@@ -559,6 +593,7 @@ def get_goalie_stats(season=None):
             else:
                 log_nhl("ℹ️ GSAx forme récente indisponible — saison seule", level="warning")
 
+        goalies = _shrink_gsax_echantillon(goalies)
         return goalies
     except Exception as e:
         print(f"⚠️ Erreur extracteur gardiens: {e}")
@@ -2728,6 +2763,11 @@ def run_sniper():
         log_nhl(
             f"🥅 GSAx gardiens : blend forme récente ({NHL_GSAX_RECENT_WINDOW:.0f} derniers matchs) "
             f"+ saison (plein à {NHL_GSAX_RECENT_GP_PLEIN:.0f} GP)"
+        )
+    if NHL_GSAX_SHRINK_ACTIF:
+        log_nhl(
+            f"🥅 Shrinkage GSAx actif — régression vers 0 (gardien moyen) jusqu'à "
+            f"{NHL_GSAX_SHRINK_GP_PLEIN:.0f} GP saison (min {NHL_GSAX_SHRINK_MIN_GAMES} GP pour être suivi)"
         )
     if NHL_TEAM_RECENT_WINDOW > 0:
         log_nhl(
