@@ -167,8 +167,13 @@ NHL_TRAVEL_SOLO_DEF_PCT = float(os.environ.get("NHL_TRAVEL_SOLO_DEF_PCT", "0.02"
 NHL_TRAVEL_LONG_MILES = float(os.environ.get("NHL_TRAVEL_LONG_MILES", "1000"))
 NHL_FACEOFF_ADJ_ACTIF = _env_bool("NHL_FACEOFF_ADJ_ACTIF", True)
 NHL_FACEOFF_SENSIBILITE = float(os.environ.get("NHL_FACEOFF_SENSIBILITE", "0.25"))
+NHL_FACEOFF_CALIB_ACTIF = _env_bool("NHL_FACEOFF_CALIB_ACTIF", True)
+NHL_FACEOFF_CALIB_MIN_MATCHS = int(os.environ.get("NHL_FACEOFF_CALIB_MIN_MATCHS", "80"))
 NHL_REF_ADJ_ACTIF = _env_bool("NHL_REF_ADJ_ACTIF", True)
 NHL_REF_SENSIBILITE = float(os.environ.get("NHL_REF_SENSIBILITE", "0.20"))
+NHL_REF_CALIB_ACTIF = _env_bool("NHL_REF_CALIB_ACTIF", True)
+NHL_REF_CALIB_MIN_MATCHS = int(os.environ.get("NHL_REF_CALIB_MIN_MATCHS", "80"))
+NHL_PP_LAM_SHARE = float(os.environ.get("NHL_PP_LAM_SHARE", "0.20"))
 NHL_REF_LOOKBACK_JOURS = int(os.environ.get("NHL_REF_LOOKBACK_JOURS", "30"))
 NHL_REF_SCAN_JOURS = int(os.environ.get("NHL_REF_SCAN_JOURS", "3"))
 NHL_REF_MIN_MATCHS = int(os.environ.get("NHL_REF_MIN_MATCHS", "12"))
@@ -1042,56 +1047,34 @@ def compute_referee_pp_multiplier(referee_names):
     if not NHL_REF_ADJ_ACTIF or not referee_names:
         return 1.0, None
 
+    ref_keys = [_normaliser_nom_arbitre(n) for n in referee_names]
+    rel = _compute_crew_penalty_rel(ref_keys)
+    if rel is None:
+        return 1.0, None
+
+    if NHL_REF_SHRINK_ACTIF and not _ref_shrink_logue:
+        _ref_shrink_logue = True
+        log_nhl(
+            f"👨‍⚖️ Shrinkage arbitral progressif — confiance pleine à {NHL_REF_MIN_MATCHS} matchs/arbitre"
+        )
+
     meta = lire_referee_meta()
     league_ppg = float(meta.get("league_penalties_pg", 10.0))
-    if league_ppg <= 0:
-        return 1.0, None
+    sens = lire_ref_sensibilite()
+    mult = round(max(min(1.0 + sens * rel, 1.12), 0.88), 3)
 
-    ppg_samples = []
-    poids_samples = []
     known_refs = []
-    for name in referee_names:
-        key = _normaliser_nom_arbitre(name)
+    crew_ppg = league_ppg * (1.0 + rel)
+    for key in ref_keys:
         ref_data = meta.get("referees", {}).get(key)
-        if not ref_data or ref_data.get("games", 0) < 1:
-            continue
-        games = ref_data["games"]
-        if NHL_REF_SHRINK_ACTIF:
-            if games < NHL_REF_MIN_MATCHS:
-                poids = min(1.0, games / NHL_REF_MIN_MATCHS)
-            else:
-                poids = 1.0
-        else:
-            if games < NHL_REF_MIN_MATCHS:
-                continue
-            poids = 1.0
-        ppg_samples.append(ref_data["penalties"] / games)
-        poids_samples.append(poids)
-        known_refs.append(ref_data.get("name", name))
-
-    if not ppg_samples:
-        return 1.0, None
-
-    if NHL_REF_SHRINK_ACTIF:
-        poids_total = sum(poids_samples)
-        if poids_total < 0.15:
-            return 1.0, None
-        crew_ppg = sum(p * w for p, w in zip(ppg_samples, poids_samples)) / poids_total
-        if not _ref_shrink_logue:
-            _ref_shrink_logue = True
-            log_nhl(
-                f"👨‍⚖️ Shrinkage arbitral progressif — confiance pleine à {NHL_REF_MIN_MATCHS} matchs/arbitre"
-            )
-    else:
-        crew_ppg = sum(ppg_samples) / len(ppg_samples)
-    rel = (crew_ppg - league_ppg) / league_ppg
-    rel = max(min(rel, 0.25), -0.25)
-    mult = round(max(min(1.0 + NHL_REF_SENSIBILITE * rel, 1.12), 0.88), 3)
+        if ref_data:
+            known_refs.append(ref_data.get("name", key))
 
     if not _ref_adj_logue:
         _ref_adj_logue = True
+        calib_label = " (calibrée)" if NHL_REF_CALIB_ACTIF else ""
         log_nhl(
-            f"👨‍⚖️ Ajustement arbitral actif — sensibilité {NHL_REF_SENSIBILITE:.2f}, "
+            f"👨‍⚖️ Ajustement arbitral actif — sensibilité {sens:.2f}{calib_label}, "
             f"min {NHL_REF_MIN_MATCHS} matchs/arbitre, ligue ≈{league_ppg:.1f} pén./match"
         )
 
@@ -1101,6 +1084,50 @@ def compute_referee_pp_multiplier(referee_names):
         "refs": known_refs,
         "mult": mult,
     }
+
+
+def _compute_crew_penalty_rel(referee_keys):
+    """
+    Écart relatif pénalités du crew vs ligue (sans appliquer la sensibilité).
+    Retourne None si historique arbitral insuffisant.
+    """
+    if not referee_keys:
+        return None
+    meta = lire_referee_meta()
+    league_ppg = float(meta.get("league_penalties_pg", 10.0))
+    if league_ppg <= 0:
+        return None
+
+    ppg_samples, poids_samples = [], []
+    for key in referee_keys:
+        ref_data = meta.get("referees", {}).get(key)
+        if not ref_data or ref_data.get("games", 0) < 1:
+            continue
+        games = ref_data["games"]
+        if NHL_REF_SHRINK_ACTIF:
+            poids = min(1.0, games / NHL_REF_MIN_MATCHS) if games < NHL_REF_MIN_MATCHS else 1.0
+        elif games < NHL_REF_MIN_MATCHS:
+            continue
+        else:
+            poids = 1.0
+        ppg_samples.append(ref_data["penalties"] / games)
+        poids_samples.append(poids)
+
+    if not ppg_samples:
+        return None
+    if NHL_REF_SHRINK_ACTIF and sum(poids_samples) < 0.15:
+        return None
+
+    poids_total = sum(poids_samples)
+    crew_ppg = sum(p * w for p, w in zip(ppg_samples, poids_samples)) / poids_total
+    rel = (crew_ppg - league_ppg) / league_ppg
+    return max(min(rel, 0.25), -0.25)
+
+
+def _fo_deltas_equipe(fo_pct, league_fo_pct):
+    """Delta faceoff normalisé (même cap que _apply_faceoff_possession_adj)."""
+    delta = (float(fo_pct) - league_fo_pct) / max(league_fo_pct, 0.01)
+    return max(min(delta, 0.15), -0.15)
 
 # ==========================================
 # 3. UTILITAIRES D'IDENTIFICATION
@@ -1225,14 +1252,15 @@ def _apply_faceoff_possession_adj(xgf, xga, fo_pct, league_fo_pct):
 
     delta = (fo_pct - league_fo_pct) / max(league_fo_pct, 0.01)
     delta = max(min(delta, 0.15), -0.15)
-    sens = NHL_FACEOFF_SENSIBILITE
+    sens = lire_faceoff_sensibilite()
     atk_mult = 1.0 + sens * delta
     def_mult = 1.0 - sens * delta * 0.5
 
     if not _faceoff_adj_logue:
         _faceoff_adj_logue = True
+        calib_label = " (calibrée)" if NHL_FACEOFF_CALIB_ACTIF else ""
         log_nhl(
-            f"🏒 Ajustement faceoffs actif — sensibilité {sens:.2f} "
+            f"🏒 Ajustement faceoffs actif — sensibilité {sens:.2f}{calib_label} "
             f"(ligue FO≈{league_fo_pct:.1%})"
         )
     return round(xgf * atk_mult, 3), round(xga * def_mult, 3)
@@ -1361,6 +1389,108 @@ def lire_ot_home_advantage():
     if not NHL_OT_CALIB_ACTIF:
         return NHL_OT_HOME_ADVANTAGE
     return float(lire_rho_meta().get("ot_home_adv", NHL_OT_HOME_ADVANTAGE))
+
+
+def lire_ref_sensibilite():
+    if not NHL_REF_CALIB_ACTIF:
+        return NHL_REF_SENSIBILITE
+    return float(lire_rho_meta().get("ref_sensibilite", NHL_REF_SENSIBILITE))
+
+
+def lire_faceoff_sensibilite():
+    if not NHL_FACEOFF_CALIB_ACTIF:
+        return NHL_FACEOFF_SENSIBILITE
+    return float(lire_rho_meta().get("faceoff_sensibilite", NHL_FACEOFF_SENSIBILITE))
+
+
+def _mse_ref_sensibilite(sens, historique_matchs):
+    """MSE totaux buts : modèle simplifié PP (part fixe des lambdas) × mult arbitral."""
+    sse, n = 0.0, 0
+    for match in historique_matchs:
+        rel = match.get("ref_rel")
+        if rel is None:
+            continue
+        try:
+            lam_h = float(match["lambda_domicile_calcule"])
+            lam_a = float(match["lambda_exterieur_calcule"])
+            total = int(match["vrai_score_domicile"]) + int(match["vrai_score_exterieur"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        mu = lam_h + lam_a
+        mult = max(min(1.0 + sens * rel, 1.12), 0.88)
+        mu_pred = mu * (1.0 + NHL_PP_LAM_SHARE * (mult - 1.0))
+        w = _poids_recency_mle(match)
+        sse += w * (total - mu_pred) ** 2
+        n += 1
+    return sse / max(n, 1)
+
+
+def calibrer_ref_sensibilite(historique_matchs):
+    """Grille sur sensibilité arbitrale pour minimiser l'erreur sur les totaux buts."""
+    candidats = [i / 100.0 for i in range(5, 46)]
+    meilleur_sens, meilleur_mse = NHL_REF_SENSIBILITE, float("inf")
+    for sens in candidats:
+        mse = _mse_ref_sensibilite(sens, historique_matchs)
+        if mse < meilleur_mse:
+            meilleur_mse, meilleur_sens = mse, sens
+    n_ref = sum(1 for m in historique_matchs if m.get("ref_rel") is not None)
+    log_nhl(
+        f"🔬 Calibrage sensibilité arbitrale sur {n_ref} matchs avec crew connu "
+        f"(init {NHL_REF_SENSIBILITE:.2f}, MSE {meilleur_mse:.3f})..."
+    )
+    opt = round(meilleur_sens, 3)
+    log_nhl(f"✅ Calibrage arbitral terminé — sensibilité {opt:.2f} (défaut {NHL_REF_SENSIBILITE:.2f})")
+    return opt, n_ref
+
+
+def _mse_faceoff_sensibilite(sens, historique_matchs, league_fo_pct):
+    """MSE sur l'écart de buts dom-ext vs signal faceoff (dh - da)."""
+    sse, n = 0.0, 0
+    for match in historique_matchs:
+        if match.get("home_fo_pct") is None or match.get("away_fo_pct") is None:
+            continue
+        try:
+            lam_h = float(match["lambda_domicile_calcule"])
+            lam_a = float(match["lambda_exterieur_calcule"])
+            diff = int(match["vrai_score_domicile"]) - int(match["vrai_score_exterieur"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        dh = _fo_deltas_equipe(match["home_fo_pct"], league_fo_pct)
+        da = _fo_deltas_equipe(match["away_fo_pct"], league_fo_pct)
+        signal = dh - da
+        diff_pred = (lam_h - lam_a) + sens * signal * (lam_h + lam_a) * 0.35
+        w = _poids_recency_mle(match)
+        sse += w * (diff - diff_pred) ** 2
+        n += 1
+    return sse / max(n, 1)
+
+
+def calibrer_faceoff_sensibilite(historique_matchs):
+    """Grille sur sensibilité faceoffs pour minimiser l'erreur sur l'écart de buts."""
+    fo_vals = [
+        float(m["home_fo_pct"]) for m in historique_matchs if m.get("home_fo_pct") is not None
+    ] + [
+        float(m["away_fo_pct"]) for m in historique_matchs if m.get("away_fo_pct") is not None
+    ]
+    league_fo = sum(fo_vals) / len(fo_vals) if fo_vals else 0.5
+
+    candidats = [i / 100.0 for i in range(5, 51)]
+    meilleur_sens, meilleur_mse = NHL_FACEOFF_SENSIBILITE, float("inf")
+    for sens in candidats:
+        mse = _mse_faceoff_sensibilite(sens, historique_matchs, league_fo)
+        if mse < meilleur_mse:
+            meilleur_mse, meilleur_sens = mse, sens
+    n_fo = sum(
+        1 for m in historique_matchs
+        if m.get("home_fo_pct") is not None and m.get("away_fo_pct") is not None
+    )
+    log_nhl(
+        f"🔬 Calibrage sensibilité faceoffs sur {n_fo} matchs (FO ligue ≈{league_fo:.1%}, "
+        f"init {NHL_FACEOFF_SENSIBILITE:.2f}, MSE {meilleur_mse:.3f})..."
+    )
+    opt = round(meilleur_sens, 3)
+    log_nhl(f"✅ Calibrage faceoffs terminé — sensibilité {opt:.2f} (défaut {NHL_FACEOFF_SENSIBILITE:.2f})")
+    return opt, n_fo
 
 
 def _ajuster_lambdas_pour_hia(lam_h, lam_a, hia, hia_ref=HIA_REF_CALIBRATION):
@@ -2862,11 +2992,17 @@ def run_sniper():
             f"+ fuseau/B2B (long solo ≥ {NHL_TRAVEL_LONG_MILES:.0f} mi)"
         )
     if NHL_FACEOFF_ADJ_ACTIF:
-        log_nhl(f"🏒 Ajustement faceoffs actif — sensibilité {NHL_FACEOFF_SENSIBILITE:.2f}")
-    if NHL_REF_ADJ_ACTIF:
+        fo_sens = lire_faceoff_sensibilite()
         log_nhl(
-            f"👨‍⚖️ Ajustement arbitral actif — sensibilité {NHL_REF_SENSIBILITE:.2f}, "
-            f"scan {NHL_REF_SCAN_JOURS}j/cycle, min {NHL_REF_MIN_MATCHS} matchs/arbitre"
+            f"🏒 Ajustement faceoffs actif — sensibilité {fo_sens:.2f}"
+            + (" (calibrée)" if NHL_FACEOFF_CALIB_ACTIF else " (fixe)")
+        )
+    if NHL_REF_ADJ_ACTIF:
+        ref_sens = lire_ref_sensibilite()
+        log_nhl(
+            f"👨‍⚖️ Ajustement arbitral actif — sensibilité {ref_sens:.2f}"
+            + (" (calibrée)" if NHL_REF_CALIB_ACTIF else " (fixe)")
+            + f", scan {NHL_REF_SCAN_JOURS}j/cycle, min {NHL_REF_MIN_MATCHS} matchs/arbitre"
         )
     if NHL_LIGUE_CALIB_ACTIF:
         log_nhl(
@@ -3171,6 +3307,8 @@ def lire_rho_meta():
         "prob_tie": 0.12, "prob_en": 0.22,
         "nb_ou_dispersion": NHL_NB_OU_DISPERSION_DEFAULT,
         "ot_home_adv": NHL_OT_HOME_ADVANTAGE,
+        "ref_sensibilite": NHL_REF_SENSIBILITE,
+        "faceoff_sensibilite": NHL_FACEOFF_SENSIBILITE,
         "nb_matchs": 0,
     }
     resultat = default
@@ -3398,6 +3536,12 @@ def actualiser_historique_ligue(teams_data):
                     scanned.add(gid)
                     continue
                 last_period = (game.get("gameOutcome", {}) or {}).get("lastPeriodType", "REG")
+                home_base = next((t for t in teams_data if t.get("team") == home_abbrev), None)
+                away_base = next((t for t in teams_data if t.get("team") == away_abbrev), None)
+                home_fo = home_base.get("fo_pct", 0.5) if home_base else 0.5
+                away_fo = away_base.get("fo_pct", 0.5) if away_base else 0.5
+                ref_names = get_game_referees(game["id"])
+                ref_keys = [_normaliser_nom_arbitre(n) for n in ref_names] if ref_names else []
                 games_db[gid] = {
                     "date": date_str,
                     "home": home_abbrev, "away": away_abbrev,
@@ -3407,6 +3551,9 @@ def actualiser_historique_ligue(teams_data):
                     "lambda_exterieur_calcule": lam_a,
                     "hia_ref": hia_ref,
                     "last_period_type": last_period,
+                    "referee_keys": ref_keys,
+                    "home_fo_pct": round(float(home_fo), 4),
+                    "away_fo_pct": round(float(away_fo), 4),
                 }
                 scanned.add(gid)
                 nouveaux += 1
@@ -3438,6 +3585,7 @@ def entrainer_ia_dixon_coles():
 
     if NHL_LIGUE_CALIB_ACTIF:
         for gid, data in lire_league_calib_meta().get("games", {}).items():
+            ref_keys = data.get("referee_keys", [])
             historique_unique[gid] = {
                 "date": data.get("date"),
                 "vrai_score_domicile": data["vrai_score_domicile"],
@@ -3446,6 +3594,10 @@ def entrainer_ia_dixon_coles():
                 "lambda_exterieur_calcule": data["lambda_exterieur_calcule"],
                 "hia_ref": data.get("hia_ref", HIA_REF_CALIBRATION),
                 "last_period_type": data.get("last_period_type", "REG"),
+                "referee_keys": ref_keys,
+                "ref_rel": _compute_crew_penalty_rel(ref_keys) if ref_keys else None,
+                "home_fo_pct": data.get("home_fo_pct"),
+                "away_fo_pct": data.get("away_fo_pct"),
             }
     nb_ligue = len(historique_unique)
 
@@ -3462,6 +3614,9 @@ def entrainer_ia_dixon_coles():
                     # priment sur le proxy rétrospectif du scan ligue. On conserve
                     # last_period_type du scan ligue s'il existe (journal ne l'a pas).
                     last_period = historique_unique.get(game_id_brut, {}).get("last_period_type", "REG")
+                    ref_keys = historique_unique.get(game_id_brut, {}).get("referee_keys", [])
+                    home_fo = historique_unique.get(game_id_brut, {}).get("home_fo_pct")
+                    away_fo = historique_unique.get(game_id_brut, {}).get("away_fo_pct")
                     historique_unique[game_id_brut] = {
                         "date": row.get("Date", "").split()[0] or None,
                         "vrai_score_domicile": int(row["Score_Dom"]),
@@ -3470,6 +3625,10 @@ def entrainer_ia_dixon_coles():
                         "lambda_exterieur_calcule": float(row["Lam_Ext"]),
                         "hia_ref": hia_ref,
                         "last_period_type": last_period,
+                        "referee_keys": ref_keys,
+                        "ref_rel": _compute_crew_penalty_rel(ref_keys) if ref_keys else None,
+                        "home_fo_pct": home_fo,
+                        "away_fo_pct": away_fo,
                     }
 
     dataset = list(historique_unique.values())
@@ -3494,6 +3653,10 @@ def entrainer_ia_dixon_coles():
             meta_precedent.get("nb_ou_dispersion", NHL_NB_OU_DISPERSION_DEFAULT)
         ),
         "ot_home_adv": float(meta_precedent.get("ot_home_adv", NHL_OT_HOME_ADVANTAGE)),
+        "ref_sensibilite": float(meta_precedent.get("ref_sensibilite", NHL_REF_SENSIBILITE)),
+        "faceoff_sensibilite": float(
+            meta_precedent.get("faceoff_sensibilite", NHL_FACEOFF_SENSIBILITE)
+        ),
         "nb_matchs": nb,
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
@@ -3514,6 +3677,17 @@ def entrainer_ia_dixon_coles():
                 f"🏒 OT home advantage calibré — {meta['ot_home_adv']:.1%} domicile "
                 f"sur {n_ot} matchs OT/SO (défaut {NHL_OT_HOME_ADVANTAGE:.0%})"
             )
+
+    n_ref_calib = sum(1 for m in dataset if m.get("ref_rel") is not None)
+    if NHL_REF_CALIB_ACTIF and n_ref_calib >= NHL_REF_CALIB_MIN_MATCHS:
+        meta["ref_sensibilite"], _ = calibrer_ref_sensibilite(dataset)
+
+    n_fo_calib = sum(
+        1 for m in dataset
+        if m.get("home_fo_pct") is not None and m.get("away_fo_pct") is not None
+    )
+    if NHL_FACEOFF_CALIB_ACTIF and n_fo_calib >= NHL_FACEOFF_CALIB_MIN_MATCHS:
+        meta["faceoff_sensibilite"], _ = calibrer_faceoff_sensibilite(dataset)
 
     with open(RHO_META_FILE, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
