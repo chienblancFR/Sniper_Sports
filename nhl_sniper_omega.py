@@ -112,6 +112,9 @@ NHL_NB_OU_DISPERSION_DEFAULT = float(os.environ.get("NHL_NB_OU_DISPERSION_DEFAUL
 NHL_NB_OU_MIN_MATCHS = int(os.environ.get("NHL_NB_OU_MIN_MATCHS", "100"))
 NHL_REF_SHRINK_ACTIF = _env_bool("NHL_REF_SHRINK_ACTIF", True)
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
+NHL_OT_CALIB_ACTIF = _env_bool("NHL_OT_CALIB_ACTIF", True)
+NHL_OT_CALIB_MIN_MATCHS = int(os.environ.get("NHL_OT_CALIB_MIN_MATCHS", "40"))
+NHL_OT_CALIB_PRIOR_FORCE = float(os.environ.get("NHL_OT_CALIB_PRIOR_FORCE", "40"))
 NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
 NHL_HIA_PAR_EQUIPE_ACTIF = _env_bool("NHL_HIA_PAR_EQUIPE_ACTIF", True)
 NHL_HIA_TEAM_GP_PLEIN = float(os.environ.get("NHL_HIA_TEAM_GP_PLEIN", "15"))
@@ -1317,6 +1320,49 @@ def lire_nb_ou_dispersion():
     return float(lire_rho_meta().get("nb_ou_dispersion", NHL_NB_OU_DISPERSION_DEFAULT))
 
 
+def calibrer_ot_home_advantage(historique_matchs):
+    """
+    Estime la part de victoires domicile parmi les matchs allés en prolongation/
+    tirs au but (à égalité après 60 min), par ratio bayésien pondéré recency avec
+    shrinkage vers 0.5 (prior neutre de force NHL_OT_CALIB_PRIOR_FORCE).
+
+    Un match OT/SO est détecté via last_period_type ; le vainqueur est celui qui
+    a le score final le plus élevé (le but gagnant d'OT/SO est inclus au score).
+    Retourne None si l'échantillon est trop faible.
+    """
+    poids_dom, poids_total = 0.0, 0.0
+    n_ot = 0
+    for match in historique_matchs:
+        if str(match.get("last_period_type", "REG")).upper() == "REG":
+            continue
+        try:
+            h = int(match["vrai_score_domicile"])
+            a = int(match["vrai_score_exterieur"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if h == a:  # nul final impossible en NHL, garde-fou
+            continue
+        w = _poids_recency_mle(match)
+        poids_total += w
+        if h > a:
+            poids_dom += w
+        n_ot += 1
+
+    if n_ot < NHL_OT_CALIB_MIN_MATCHS or poids_total <= 0:
+        return None
+
+    # Ratio bayésien : (victoires_dom + prior*0.5) / (total + prior)
+    prior = max(NHL_OT_CALIB_PRIOR_FORCE, 0.0)
+    ot_home = (poids_dom + prior * 0.5) / (poids_total + prior)
+    return round(min(max(ot_home, 0.45), 0.55), 4), n_ot
+
+
+def lire_ot_home_advantage():
+    if not NHL_OT_CALIB_ACTIF:
+        return NHL_OT_HOME_ADVANTAGE
+    return float(lire_rho_meta().get("ot_home_adv", NHL_OT_HOME_ADVANTAGE))
+
+
 def _ajuster_lambdas_pour_hia(lam_h, lam_a, hia, hia_ref=HIA_REF_CALIBRATION):
     """
     Approximation : les lambdas journalisés intègrent (1+hia_ref) attaque / (1-hia_ref) défense domicile.
@@ -1609,7 +1655,7 @@ def calculate_master_odds_v4(
         return None
 
     # ML Pinnacle = 2-way incluant prolongation/tir au but
-    ot_home = min(max(NHL_OT_HOME_ADVANTAGE, 0.45), 0.55)
+    ot_home = min(max(lire_ot_home_advantage(), 0.45), 0.55)
     prob_ml_home = prob_1 + prob_X * ot_home
     prob_ml_away = prob_2 + prob_X * (1 - ot_home)
 
@@ -2745,7 +2791,9 @@ def run_sniper():
     log_nhl(f"📊 Alerte quota Odds API si ≤ {NHL_ODDS_QUOTA_ALERT} requêtes restantes")
     log_nhl(
         f"🎯 Marchés actifs : {', '.join(sorted(NHL_MARCHES_ACTIFS)) or 'aucun'} | "
-        f"OT home adv ML : {NHL_OT_HOME_ADVANTAGE:.0%} | "
+        f"OT home adv ML : {lire_ot_home_advantage():.0%}"
+        + (" (calibré)" if NHL_OT_CALIB_ACTIF else " (fixe)")
+        + " | "
         f"edge min {EDGE_MINIMUM:.0%} (confirmés) / {NHL_EDGE_MIN_PROBABLE:.0%} (probables)"
         + (
             f" + dynamique +{NHL_EDGE_DYNAMIQUE_EXTRA:.0%} à 0 GP → base à {NHL_EDGE_DYNAMIQUE_GP_PLEIN:.0f} GP"
@@ -3122,6 +3170,7 @@ def lire_rho_meta():
         "rho": -0.12, "hia": NHL_HIA_DEFAULT,
         "prob_tie": 0.12, "prob_en": 0.22,
         "nb_ou_dispersion": NHL_NB_OU_DISPERSION_DEFAULT,
+        "ot_home_adv": NHL_OT_HOME_ADVANTAGE,
         "nb_matchs": 0,
     }
     resultat = default
@@ -3348,6 +3397,7 @@ def actualiser_historique_ligue(teams_data):
                 if lam_h is None:
                     scanned.add(gid)
                     continue
+                last_period = (game.get("gameOutcome", {}) or {}).get("lastPeriodType", "REG")
                 games_db[gid] = {
                     "date": date_str,
                     "home": home_abbrev, "away": away_abbrev,
@@ -3356,6 +3406,7 @@ def actualiser_historique_ligue(teams_data):
                     "lambda_domicile_calcule": lam_h,
                     "lambda_exterieur_calcule": lam_a,
                     "hia_ref": hia_ref,
+                    "last_period_type": last_period,
                 }
                 scanned.add(gid)
                 nouveaux += 1
@@ -3394,6 +3445,7 @@ def entrainer_ia_dixon_coles():
                 "lambda_domicile_calcule": data["lambda_domicile_calcule"],
                 "lambda_exterieur_calcule": data["lambda_exterieur_calcule"],
                 "hia_ref": data.get("hia_ref", HIA_REF_CALIBRATION),
+                "last_period_type": data.get("last_period_type", "REG"),
             }
     nb_ligue = len(historique_unique)
 
@@ -3407,7 +3459,9 @@ def entrainer_ia_dixon_coles():
                     except (ValueError, TypeError):
                         hia_ref = HIA_REF_CALIBRATION
                     # Lambdas pré-match réelles (calculées au moment du pari) :
-                    # priment sur le proxy rétrospectif du scan ligue.
+                    # priment sur le proxy rétrospectif du scan ligue. On conserve
+                    # last_period_type du scan ligue s'il existe (journal ne l'a pas).
+                    last_period = historique_unique.get(game_id_brut, {}).get("last_period_type", "REG")
                     historique_unique[game_id_brut] = {
                         "date": row.get("Date", "").split()[0] or None,
                         "vrai_score_domicile": int(row["Score_Dom"]),
@@ -3415,6 +3469,7 @@ def entrainer_ia_dixon_coles():
                         "lambda_domicile_calcule": float(row["Lam_Dom"]),
                         "lambda_exterieur_calcule": float(row["Lam_Ext"]),
                         "hia_ref": hia_ref,
+                        "last_period_type": last_period,
                     }
 
     dataset = list(historique_unique.values())
@@ -3438,6 +3493,7 @@ def entrainer_ia_dixon_coles():
         "nb_ou_dispersion": float(
             meta_precedent.get("nb_ou_dispersion", NHL_NB_OU_DISPERSION_DEFAULT)
         ),
+        "ot_home_adv": float(meta_precedent.get("ot_home_adv", NHL_OT_HOME_ADVANTAGE)),
         "nb_matchs": nb,
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
@@ -3449,6 +3505,15 @@ def entrainer_ia_dixon_coles():
 
     if NHL_NB_OU_CALIB_ACTIF and NHL_NB_OU_ACTIF and nb >= NHL_NB_OU_MIN_MATCHS:
         meta["nb_ou_dispersion"] = optimiser_nb_ou_dispersion(dataset)
+
+    if NHL_OT_CALIB_ACTIF:
+        ot_res = calibrer_ot_home_advantage(dataset)
+        if ot_res is not None:
+            meta["ot_home_adv"], n_ot = ot_res
+            log_nhl(
+                f"🏒 OT home advantage calibré — {meta['ot_home_adv']:.1%} domicile "
+                f"sur {n_ot} matchs OT/SO (défaut {NHL_OT_HOME_ADVANTAGE:.0%})"
+            )
 
     with open(RHO_META_FILE, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
