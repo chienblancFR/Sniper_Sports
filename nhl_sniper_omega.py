@@ -105,7 +105,6 @@ NHL_KELLY_PORTFOLIO_ACTIF = _env_bool("NHL_KELLY_PORTFOLIO_ACTIF", True)
 NHL_KELLY_PORTFOLIO_RHO_LIGUE = float(os.environ.get("NHL_KELLY_PORTFOLIO_RHO_LIGUE", "0.05"))
 NHL_KELLY_PORTFOLIO_RHO_REF = float(os.environ.get("NHL_KELLY_PORTFOLIO_RHO_REF", "0.12"))
 NHL_KELLY_PORTFOLIO_RHO_MEME_MATCH = float(os.environ.get("NHL_KELLY_PORTFOLIO_RHO_MEME_MATCH", "0.70"))
-NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT = float(os.environ.get("NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT", "4.0"))
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_HIA_DEFAULT = float(os.environ.get("NHL_HIA_DEFAULT", "0.05"))
 NHL_HIA_PAR_EQUIPE_ACTIF = _env_bool("NHL_HIA_PAR_EQUIPE_ACTIF", True)
@@ -2443,8 +2442,9 @@ def _estimer_correlation_pari(pari_a, pari_b):
 
 def _ajuster_opportunites_portefeuille(opportunites, bankroll):
     """
-    Réduit les mises Kelly quand plusieurs paris partagent du risque corrélé
-    la même soirée (paris déjà en journal + nouvelles opportunités du scan).
+    Réduit légèrement les mises Kelly quand plusieurs paris partagent du risque
+    corrélé la même soirée (ρ ligue / arbitres communs). Pas de plafond d'exposition
+    global : chaque value garde sa mise Kelly (capée par NHL_MISE_MAX_PCT si configuré).
     """
     global _kelly_portfolio_logue
     if not NHL_KELLY_PORTFOLIO_ACTIF or not opportunites or bankroll <= 0:
@@ -2454,14 +2454,12 @@ def _ajuster_opportunites_portefeuille(opportunites, bankroll):
         _kelly_portfolio_logue = True
         log_nhl(
             f"📊 Kelly portefeuille actif — ρ ligue {NHL_KELLY_PORTFOLIO_RHO_LIGUE:.2f}, "
-            f"ρ arbitres {NHL_KELLY_PORTFOLIO_RHO_REF:.2f}, "
-            f"exposition max soir {NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT:.1f}% bankroll"
+            f"ρ arbitres {NHL_KELLY_PORTFOLIO_RHO_REF:.2f} "
+            f"(ajustement corrélations uniquement, pas de cap global)"
         )
 
     existants = _lire_paris_en_cours_soiree()
     selected = list(existants)
-    exposure = sum(p["mise"] for p in existants)
-    max_exposure = bankroll * (NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT / 100.0)
 
     triees = sorted(
         opportunites,
@@ -2480,25 +2478,15 @@ def _ajuster_opportunites_portefeuille(opportunites, bankroll):
             if rho > 0:
                 penalty += rho * (other["mise"] / bankroll)
 
-        mise_adj = mise / max(penalty, 1.0)
-
-        if exposure + mise_adj > max_exposure:
-            mise_adj = max(0.0, max_exposure - exposure)
-
-        mise_adj = round(mise_adj, 2)
+        mise_adj = round(mise / max(penalty, 1.0), 2)
         if mise_adj <= 0:
-            log_nhl(
-                f"📊 Kelly portefeuille — mise annulée (exposition soir saturée) : "
-                f"{opp['best_pari']['type']} ({opp['m']['away_team']} @ {opp['m']['home_team']})",
-                level="warning",
-            )
             continue
 
         if mise_adj + 0.009 < mise:
             log_nhl(
                 f"📊 Kelly portefeuille — {opp['best_pari']['type']} "
                 f"({opp['m']['away_team']} @ {opp['m']['home_team']}) : "
-                f"{mise} € → {mise_adj} € (pénalité x{penalty:.2f})"
+                f"{mise} € → {mise_adj} € (ρ cumulé, x{penalty:.2f})"
             )
 
         inv["mise"] = mise_adj
@@ -2510,7 +2498,6 @@ def _ajuster_opportunites_portefeuille(opportunites, bankroll):
         resultat.append(opp_ajust)
 
         selected.append(_meta_correlation_pari(opp_ajust))
-        exposure += mise_adj
 
     return resultat
 
@@ -2846,7 +2833,7 @@ def run_sniper():
     if NHL_KELLY_PORTFOLIO_ACTIF:
         log_nhl(
             f"📊 Kelly portefeuille actif — ρ ligue {NHL_KELLY_PORTFOLIO_RHO_LIGUE:.2f}, "
-            f"exposition max soir {NHL_KELLY_PORTFOLIO_MAX_EXPOSURE_PCT:.1f}% bankroll"
+            f"ρ arbitres {NHL_KELLY_PORTFOLIO_RHO_REF:.2f} (corrélations seulement)"
         )
     if NHL_LINE_MOVE_ACTIF:
         log_nhl(
