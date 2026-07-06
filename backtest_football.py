@@ -1,5 +1,5 @@
 """
-backtest_football.py — Back-test complet du modèle Dixon-Coles sur 2 saisons
+backtest_football.py — Back-test complet du modèle Dixon-Coles (multi-saisons)
 =============================================================================
 Usage :
   python backtest_football.py --collect    # Phase 1 : télécharge les données
@@ -24,10 +24,22 @@ Reset (avant de relancer le backtest / dashboard) :
   python backtest_football.py --collect --ligue Championship --odds-only
       → Recollecte cotes historiques pour une seule ligue (fixtures/xG déjà en base)
 
+  python backtest_football.py --collect --saisons 2025 --europe-only
+      → Ajoute saison 2025-26 (API season=2025) : fixtures + xG + cotes, ligues EU only
+
+  python backtest_football.py --collect --saisons 2025 --europe-only --odds-only
+      → Cotes 2025-26 uniquement (fixtures/xG déjà en base)
+
   python backtest_football.py --tune --tune-metric clv
       → Calibration walk-forward orientee CLV AH (H-24 vs cloture Pinnacle)
 
   python backtest_football.py --tune --tune-metric blend --tune-clv-weight 0.6
+
+  python backtest_football.py --explore-ev
+      → Compare volume / CLV / ROI par seuil ev_max (post-hoc sur signaux en base)
+
+  python backtest_football.py --simulate --ev-max-spreads 0.09 --report
+      → Backtest avec plafond EV AH 9% (totaux inchanges)
       → Mix 60% CLV + 40% log P(score)
 
 Dashboard Streamlit : après --report, menu ⋮ → Clear cache → Rerun
@@ -62,6 +74,7 @@ from foot_params import (
     xg_decay_rate,
 )
 from odds_devig import cote_fair_2way
+from utils import construire_tableau_objectifs_clv_ah, formater_objectifs_clv_ah_texte
 
 load_project_env("foot")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
@@ -122,7 +135,16 @@ def verifier_fichier_db(path=DB_PATH):
 # ─────────────────────────────────────────────────────────────
 # ⚙️  CONFIGURATION
 # ─────────────────────────────────────────────────────────────
-SAISONS_BACKTEST = [2023, 2024]  # 2023 = saison 2023-24 pour ligues hivernales
+SAISONS_BACKTEST = [2023, 2024]   # 2023 = 2023-24 (ligues hivernales)
+SAISONS_EUROPE_EXTRA = [2025]       # 2025 = 2025-26 — collectée en plus pour l'Europe
+
+# Ligues calendrier estival (saison = année civile) — hors lot EU 2025-26 par défaut
+LIGUES_ESTIVALES = {71, 113, 253, 103}  # Brésil, Allsvenskan, MLS, Eliteserien
+
+# Championnats européens (calendrier hivernal) — reçoivent SAISONS_EUROPE_EXTRA
+LIGUES_EUROPEENNES = {
+    140, 78, 88, 135, 94, 203, 61, 141, 39, 40, 144, 136,
+}
 
 CHAMPIONNATS = [
     {"nom": "La Liga",          "id": 140, "key": "soccer_spain_la_liga",            "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15},
@@ -304,17 +326,58 @@ NAME_MAPPING = {
     "Stabæk Fotball": "Stabek", "Strømsgodset IF": "Stromsgodset",
     "FK Haugesund": "Haugesund", "Odd BK": "Odd",
     "Sandefjord Fotball": "Sandefjord", "Lillestrøm SK": "Lillestrom",
-    # 🇧🇪 JUPILER PRO LEAGUE
-    "RSC Anderlecht": "Anderlecht", "Club Brugge KV": "Club Brugge",
-    "KAA Gent": "Gent", "Standard Liège": "Standard Liege",
-    "Standard de Liège": "Standard Liege", "KRC Genk": "Genk",
-    "Royal Antwerp FC": "Antwerp",
-    "Royale Union Saint-Gilloise": "Union Saint Gilloise",
-    "R. Charleroi SC": "Charleroi", "Cercle Brugge KSV": "Cercle Brugge",
-    "Sint-Truidense VV": "Sint-Truiden", "KV Mechelen": "Mechelen",
-    "KV Kortrijk": "Kortrijk", "K. Beerschot VA": "Beerschot",
-    "KAS Eupen": "Eupen", "OH Leuven": "OHL Leuven",
-    "Westerlo": "Westerlo", "RWDM Brussels FC": "RWDM",
+    # 🇧🇪 JUPILER PRO LEAGUE — canonique = libellés Odds API / Pinnacle
+    # Noms API-Football (bt_fixtures)
+    "Antwerp": "Royal Antwerp",
+    "Union St. Gilloise": "Union Saint-Gilloise",
+    "OH Leuven": "Leuven",
+    "Cercle Brugge": "Cercle Brugge KSV",
+    "Zulte Waregem": "SV Zulte-Waregem",
+    "St. Truiden": "Sint Truiden",
+    "KVC Westerlo": "Westerlo",
+    "Club Brugge KV": "Club Brugge",
+    "KV Mechelen": "KV Mechelen",
+    "Anderlecht": "Anderlecht",
+    "Genk": "Genk",
+    "Gent": "Gent",
+    "Charleroi": "Charleroi",
+    "Standard Liege": "Standard Liege",
+    "Standard Liège": "Standard Liege",
+    "Dender": "Dender",
+    "AS Eupen": "Eupen",
+    "Kortrijk": "Kortrijk",
+    "Beerschot VA": "Beerschot",
+    "RWDM": "RWDM",
+    "RAAL La Louvière": "RAAL La Louvière",
+    "RAAL La Louviere": "RAAL La Louvière",
+    "Liège": "RFC Liege",
+    "Liege": "RFC Liege",
+    # Variantes Odds API / bookmakers
+    "RSC Anderlecht": "Anderlecht",
+    "KAA Gent": "Gent",
+    "Standard de Liège": "Standard Liege",
+    "KRC Genk": "Genk",
+    "Royal Antwerp FC": "Royal Antwerp",
+    "Royale Union Saint-Gilloise": "Union Saint-Gilloise",
+    "Union Saint Gilloise": "Union Saint-Gilloise",
+    "R. Charleroi SC": "Charleroi",
+    "Sporting Charleroi": "Charleroi",
+    "Cercle Brugge KSV": "Cercle Brugge KSV",
+    "Sint-Truidense VV": "Sint Truiden",
+    "KV Kortrijk": "Kortrijk",
+    "K. Beerschot VA": "Beerschot",
+    "KAS Eupen": "Eupen",
+    "Oud-Heverlee Leuven": "Leuven",
+    "OHL Leuven": "Leuven",
+    "Westerlo": "Westerlo",
+    "RWDM Brussels FC": "RWDM",
+    "SV Zulte-Waregem": "SV Zulte-Waregem",
+    "Sint Truiden": "Sint Truiden",
+    "FC Verbroedering Dender Eendracht Halle": "Dender",
+    "FCV Dender EH": "Dender",
+    "K. Beerschot AC": "Beerschot",
+    "Lommel United": "Lommel United",
+    "Patro Eisden": "Patro Eisden",
     # 🇺🇸 MLS
     "Inter Miami CF": "Inter Miami", "LA Galaxy": "Los Angeles Galaxy",
     "LAFC": "Los Angeles FC", "New York Red Bulls": "NY Red Bulls",
@@ -488,8 +551,41 @@ def filtrer_ligues(nom: str | None):
 
 def saison_pour_ligue(ligue_id, annee):
     """Ligues estivales : saison = année civile. Ligues hivernales : saison = année de début."""
-    estivales = {71, 113, 253, 103}
-    return annee if ligue_id in estivales else annee
+    return annee
+
+
+def saisons_pour_ligue(ligue_id, saisons_override=None):
+    """Saisons à collecter / simuler pour une ligue."""
+    if saisons_override is not None:
+        return sorted({int(s) for s in saisons_override})
+    saisons = list(SAISONS_BACKTEST)
+    if ligue_id in LIGUES_EUROPEENNES:
+        for y in SAISONS_EUROPE_EXTRA:
+            if y not in saisons:
+                saisons.append(y)
+    return sorted(saisons)
+
+
+def filtrer_ligues_europe(ligues=None):
+    """Restreint aux championnats européens (calendrier hivernal)."""
+    src = ligues or CHAMPIONNATS
+    return [l for l in src if l['id'] in LIGUES_EUROPEENNES]
+
+
+def parser_saisons_cli(texte: str) -> list[int]:
+    """Parse --saisons 2023,2024,2025"""
+    out = []
+    for part in texte.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        y = int(part)
+        if y < 2000 or y > 2100:
+            raise ValueError(f"saison invalide : {y}")
+        out.append(y)
+    if not out:
+        raise ValueError("aucune saison dans --saisons")
+    return sorted(set(out))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -757,6 +853,19 @@ async def collecter_odds_ligue_saison(conn, session, ligue, saison):
         print(f"  ⚠️ Aucun fixture en base pour {ligue['nom']} {saison}")
         return 0
 
+    # Ré-association propre (évite cotes orphelines après fix mapping / date)
+    await conn.execute(
+        "DELETE FROM bt_odds_h24 WHERE fixture_id IN "
+        "(SELECT id FROM bt_fixtures WHERE ligue_id=? AND saison=?)",
+        (ligue['id'], saison),
+    )
+    await conn.execute(
+        "DELETE FROM bt_odds_cloture WHERE fixture_id IN "
+        "(SELECT id FROM bt_fixtures WHERE ligue_id=? AND saison=?)",
+        (ligue['id'], saison),
+    )
+    await conn.commit()
+
     par_date = defaultdict(dict)
     for fid, hid, aid, date_str in fixtures:
         try:
@@ -773,7 +882,8 @@ async def collecter_odds_ligue_saison(conn, session, ligue, saison):
         ) as cur:
             row = await cur.fetchone()
         if row:
-            fixture_name_map[(row[0], row[1])] = fid
+            jour = date_str[:10]
+            fixture_name_map[(row[0], row[1], jour)] = fid
 
     print(f"  📈 Collecte cotes ({ligue['key']}) — {len(par_date)} journées, {len(fixtures)} matchs…")
     total = 0
@@ -801,41 +911,77 @@ async def collecter_odds_ligue_saison(conn, session, ligue, saison):
     return n_fix_odds
 
 
+def _canonical_equipe(name: str) -> str:
+    """Normalise un nom d'équipe (API-Football ou Odds API) vers libellé canonique."""
+    return NAME_MAPPING.get(name, name)
+
+
 def trouver_fixture(home_odds, away_odds, commence_time, fixture_map):
     """
     Trouve l'ID du fixture API-Football correspondant à un event Odds API.
-    fixture_map : {(home_name, away_name, date_str): fixture_id}
+    fixture_map : {(home_name, away_name, date_YYYY-MM-DD): fixture_id}
     """
+    event_day = commence_time[:10] if commence_time else None
+    h_odds = _canonical_equipe(home_odds)
+    a_odds = _canonical_equipe(away_odds)
     best_id, best_score = None, 0
-    for (h_name, a_name), fid in fixture_map.items():
-        h_mapped = NAME_MAPPING.get(h_name, h_name)
-        a_mapped = NAME_MAPPING.get(a_name, a_name)
-        score_h = process.extractOne(home_odds, [h_mapped])[1]
-        score_a = process.extractOne(away_odds, [a_mapped])[1]
+    for key, fid in fixture_map.items():
+        h_name, a_name, fix_day = key
+        if event_day and fix_day != event_day:
+            continue
+        h_mapped = _canonical_equipe(h_name)
+        a_mapped = _canonical_equipe(a_name)
+        score_h = process.extractOne(h_odds, [h_mapped])[1]
+        score_a = process.extractOne(a_odds, [a_mapped])[1]
         score = (score_h + score_a) / 2
         if score > best_score and score > 75:
             best_score = score
             best_id = fid
+        # même paire inversée (rare)
+        score_h2 = process.extractOne(h_odds, [a_mapped])[1]
+        score_a2 = process.extractOne(a_odds, [h_mapped])[1]
+        score2 = (score_h2 + score_a2) / 2
+        if score2 > best_score and score2 > 75:
+            best_score = score2
+            best_id = fid
     return best_id
 
 
-async def phase_collecte(conn, session, ligues=None, odds_only=False):
+def _libelle_saison(ligue_id: int, saison: int) -> str:
+    """Libellé lisible (ex. 2025 → 2025-26 pour ligues hivernales)."""
+    if ligue_id in LIGUES_ESTIVALES:
+        return str(saison)
+    return f"{saison}-{str(saison + 1)[-2:]}"
+
+
+async def phase_collecte(conn, session, ligues=None, odds_only=False,
+                         saisons_override=None, europe_only=False):
     print("\n" + "="*60)
     print("📥  PHASE 1 — COLLECTE DES DONNÉES HISTORIQUES")
     if odds_only:
         print("  (mode --odds-only : fixtures/xG ignorés, cotes uniquement)")
+    if europe_only:
+        print("  (filtre : championnats européens uniquement)")
+    if saisons_override:
+        print(f"  (saisons : {', '.join(str(s) for s in saisons_override)})")
     if ligues and len(ligues) < len(CHAMPIONNATS):
-        print(f"  (filtre : {', '.join(l['nom'] for l in ligues)})")
+        print(f"  (ligues : {', '.join(l['nom'] for l in ligues)})")
     print("="*60)
 
     if not verifier_cles_api():
         return
 
     ligues = ligues or CHAMPIONNATS
+    if europe_only:
+        ligues = filtrer_ligues_europe(ligues)
+        if not ligues:
+            print("\n❌ Aucune ligue européenne dans le filtre.")
+            return
 
     for ligue in ligues:
-        for saison in SAISONS_BACKTEST:
-            print(f"\n🔄 {ligue['nom']} — Saison {saison}")
+        saisons_l = saisons_pour_ligue(ligue['id'], saisons_override)
+        for saison in saisons_l:
+            print(f"\n🔄 {ligue['nom']} — Saison {saison} ({_libelle_saison(ligue['id'], saison)})")
 
             if not odds_only:
                 # 1. Fixtures
@@ -1369,7 +1515,8 @@ async def _lambdas_pour_match(conn, ligue, saison, date_utc, h_id, a_id,
 
 
 def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
-                          markets=('spreads', 'totals'), poids_dyn=None):
+                          markets=('spreads', 'totals'), poids_dyn=None,
+                          ev_max_by_market=None):
     """
     Candidats EV/Kelly pour un match — logique alignée simuler_paris() / bot live.
     Retourne [(ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag), ...]
@@ -1419,7 +1566,8 @@ def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
             side_flag = is_over
 
         ev_final = ev_modele * poids_dyn + ev_pinnacle * (1.0 - poids_dyn)
-        if not (ev_min_l <= ev_final <= ev_max_l):
+        ev_cap = (ev_max_by_market or {}).get(market, ev_max_l)
+        if not (ev_min_l <= ev_final <= ev_cap):
             continue
         mise = min(round(k * 100 * KELLY_FRAC, 2), 5.0)
         if mise < 0.1:
@@ -1665,7 +1813,7 @@ async def tune_hyperparams_walkforward(conn, ligues=None, metric='loglik', clv_w
     print("   Bot live + backtest : rechargement auto via foot_params.py")
 
 
-async def simuler_paris(conn, ligues=None):
+async def simuler_paris(conn, ligues=None, ev_max_by_market=None):
     print("\n" + "="*60)
     print("🔬  PHASE 2 — SIMULATION DU MODÈLE")
     print("="*60)
@@ -1685,6 +1833,9 @@ async def simuler_paris(conn, ligues=None):
     if n_old:
         print(f"  📦 Signaux existants      : {n_old} (seront remplacés si écriture OK)")
     print("  🧮 Modèle : blend 50/50 DC + xG, poids_dyn dynamique (formule bot live)")
+    if ev_max_by_market:
+        parts = [f"{mk}≤{cap:.0%}" for mk, cap in sorted(ev_max_by_market.items())]
+        print(f"  🎚️  Plafonds EV backtest : {', '.join(parts)}")
 
     if n_odds == 0:
         print("\n  ⚠️  AUCUNE cote H-24 trouvée — la collecte d'odds a échoué.")
@@ -1795,6 +1946,7 @@ async def simuler_paris(conn, ligues=None):
             ev_max_l = ligue.get('ev_max', 0.15)
             candidats = _candidats_pour_match(
                 mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
+                ev_max_by_market=ev_max_by_market,
             )
 
             if not candidats:
@@ -1888,16 +2040,143 @@ def _print_ligne_marche(label: str, st: dict | None, indent: str = "  "):
     )
 
 
+TRANCHES_EV = [(0.05, 0.07), (0.07, 0.09), (0.09, 0.12), (0.12, 0.20)]
+
+
+def _print_clv_ah_par_ev(signaux, tranches=None):
+    """Segmente CLV / ROI AH par tranche d'EV modèle (filtre spreads uniquement)."""
+    tranches = tranches or TRANCHES_EV
+    ah = [s for s in signaux if s[3] == 'spreads']
+    print(f"\n{'─'*50}")
+    print(f"  CLV AH PAR TRANCHE EV (Handicap Asiatique)")
+    print(f"{'─'*50}")
+    print(
+        f"  {'EV':<14} {'N':>5} {'CLV':>8} {'t':>6} {'ROI':>8} "
+        f"{'P&L':>8} {'WR':>6} {'EV_moy':>8}"
+    )
+    print(f"  {'─'*14} {'─'*5} {'─'*8} {'─'*6} {'─'*8} {'─'*8} {'─'*6} {'─'*8}")
+    for lo, hi in tranches:
+        rows = [s for s in ah if lo <= s[8] < hi]
+        st = _resume_signaux(rows)
+        if not st:
+            continue
+        t_s = f"{st['t_clv']:+.1f}" if st['n_clv'] >= 2 and not np.isnan(st['t_clv']) else "n/a"
+        ev_moy = float(np.mean([s[8] for s in rows]))
+        print(
+            f"  [{lo:.0%}-{hi:.0%}]{'':<4} {st['n']:>5} "
+            f"{st['clv']:>+7.2%} {t_s:>6} {st['roi']:>+7.1%} "
+            f"{st['pnl']:>+7.1f}u {st['win_rate']:>5.1%} {ev_moy:>+7.2%}"
+        )
+    st_all = _resume_signaux(ah)
+    if st_all:
+        t_s = f"{st_all['t_clv']:+.1f}" if st_all['n_clv'] >= 2 and not np.isnan(st_all['t_clv']) else "n/a"
+        ev_moy = float(np.mean([s[8] for s in ah]))
+        print(f"  {'─'*14} {'─'*5} {'─'*8} {'─'*6} {'─'*8} {'─'*8} {'─'*6} {'─'*8}")
+        print(
+            f"  {'TOTAL AH':<14} {st_all['n']:>5} "
+            f"{st_all['clv']:>+7.2%} {t_s:>6} {st_all['roi']:>+7.1%} "
+            f"{st_all['pnl']:>+7.1f}u {st_all['win_rate']:>5.1%} {ev_moy:>+7.2%}"
+        )
+        best = max(
+            ((lo, hi, _resume_signaux([s for s in ah if lo <= s[8] < hi]))
+             for lo, hi in tranches),
+            key=lambda x: x[2]['clv'] if x[2] else float('-inf'),
+        )
+        if best[2] and best[2]['clv'] > st_all['clv']:
+            print(
+                f"  → Meilleure tranche CLV : [{best[0]:.0%}-{best[1]:.0%}] "
+                f"({best[2]['clv']:+.2%}, n={best[2]['n']})"
+            )
+
+
+def _filtrer_signaux_ev(signaux, ev_max_spreads=None, ev_max_totals=None, ev_max_all=None):
+    """Sous-ensemble post-hoc ou pré-sim selon les plafonds EV par marché."""
+    out = []
+    for s in signaux:
+        mk, ev = s[3], s[8]
+        if ev_max_all is not None and ev > ev_max_all:
+            continue
+        if mk == 'spreads' and ev_max_spreads is not None and ev > ev_max_spreads:
+            continue
+        if mk == 'totals' and ev_max_totals is not None and ev > ev_max_totals:
+            continue
+        out.append(s)
+    return out
+
+
+def explore_ev_filtres(signaux):
+    """Compare volume / CLV / ROI pour plusieurs plafonds ev_max (backtest only)."""
+    if not signaux:
+        print("\n⚠️  Aucun signal — lancez --simulate d'abord.")
+        return
+    n_lig = len({s[1] for s in signaux})
+    n_saisons = len({s[2] for s in signaux})
+    n_tot = len(signaux)
+    per_base = n_tot / max(n_lig * n_saisons, 1)
+
+    print(f"\n{'='*60}")
+    print(f"  EXPLORATION EV — {n_tot} signaux actuels ({per_base:.0f}/ligue/saison)")
+    print(f"  Ligues: {n_lig} | Saisons: {n_saisons} | AH: {sum(1 for s in signaux if s[3]=='spreads')}")
+    print(f"{'='*60}")
+
+    def _ligne(label, sub):
+        if not sub:
+            print(f"  {label:<28} — aucun signal")
+            return
+        st = _resume_signaux(sub)
+        st_ah = _resume_signaux([s for s in sub if s[3] == 'spreads'])
+        per = len(sub) / max(n_lig * n_saisons, 1)
+        clv_ah = st_ah['clv'] if st_ah else float('nan')
+        print(
+            f"  {label:<28} n={st['n']:>5} ({per:.0f}/lig/s)  "
+            f"AH={st_ah['n'] if st_ah else 0:>4}  CLV_AH={clv_ah:+.2%}  "
+            f"ROI={st['roi']:+.2%}  P&L={st['pnl']:+.1f}u"
+        )
+
+    print("\n  ev_max AH seulement (totaux inchangés) :")
+    for cap in (0.15, 0.12, 0.10, 0.09, 0.07):
+        sub = _filtrer_signaux_ev(signaux, ev_max_spreads=cap)
+        _ligne(f"AH ≤ {cap:.0%}", sub)
+
+    print("\n  ev_max global (AH + totaux) :")
+    for cap in (0.15, 0.12, 0.10, 0.09):
+        sub = _filtrer_signaux_ev(signaux, ev_max_all=cap)
+        _ligne(f"tous ≤ {cap:.0%}", sub)
+
+    print("\n  AH seulement (qualité vs volume) :")
+    for cap in (0.15, 0.12, 0.10, 0.09, 0.07):
+        ah = _filtrer_signaux_ev(signaux, ev_max_spreads=cap)
+        ah = [s for s in ah if s[3] == 'spreads']
+        st = _resume_signaux(ah)
+        if not st:
+            continue
+        per = len(ah) / max(n_lig * n_saisons, 1)
+        print(
+            f"  AH ≤ {cap:.0%}  n={st['n']:>4} ({per:.0f}/lig/s)  "
+            f"CLV={st['clv']:+.2%}  ROI={st['roi']:+.2%}  P&L={st['pnl']:+.1f}u"
+        )
+
+    # Recommandation synthétique
+    best_ah = max(
+        ((cap, _resume_signaux(_filtrer_signaux_ev(
+            [s for s in signaux if s[3] == 'spreads'], ev_max_spreads=cap)))
+         for cap in (0.12, 0.10, 0.09)),
+        key=lambda x: x[1]['pnl'] if x[1] else float('-inf'),
+    )
+    if best_ah[1]:
+        print(
+            f"\n  → Piste backtest AH : --ev-max-spreads {best_ah[0]:.2f} "
+            f"(P&L AH {best_ah[1]['pnl']:+.1f}u, ROI {best_ah[1]['roi']:+.2%}, "
+            f"n={best_ah[1]['n']}, ~{best_ah[1]['n']/(n_lig*n_saisons):.0f}/lig/s)"
+        )
+        print("     Live inchangé — tester d'abord en --simulate --report")
+
+
 # ─────────────────────────────────────────────────────────────
 # 📊  PHASE 3 — RAPPORT D'ANALYSE
 # ─────────────────────────────────────────────────────────────
-async def generer_rapport(conn):
-    print("\n" + "="*60)
-    print("📊  PHASE 3 — RAPPORT D'ANALYSE")
-    print("="*60)
-
+async def charger_signaux(conn):
     nom_par_id = {c['id']: c['nom'] for c in CHAMPIONNATS}
-
     async with conn.execute("""
         SELECT s.fixture_id, s.ligue_id, s.saison, s.market, s.outcome,
                s.h_val, s.cote_h24, s.cote_cloture, s.ev_modele, s.kelly,
@@ -1908,9 +2187,15 @@ async def generer_rapport(conn):
         ORDER BY f.date_utc
     """) as cur:
         rows = await cur.fetchall()
+    return [(*r, nom_par_id.get(r[1], str(r[1]))) for r in rows]
 
-    # Ajouter le nom de la ligue en fin de tuple (compatible avec toutes versions SQLite)
-    signaux = [(*r, nom_par_id.get(r[1], str(r[1]))) for r in rows]
+
+async def generer_rapport(conn):
+    print("\n" + "="*60)
+    print("📊  PHASE 3 — RAPPORT D'ANALYSE")
+    print("="*60)
+
+    signaux = await charger_signaux(conn)
 
     if not signaux:
         print("⚠️  Aucun signal trouvé. Lancez d'abord --collect et --simulate.")
@@ -1948,6 +2233,8 @@ async def generer_rapport(conn):
         print(f"\n  Écart CLV AH − Totaux : {delta_clv:+.2%}")
         if st_ah['clv'] > 0 and st_tot['clv'] <= 0:
             print("  → Edge vs Pinnacle sur l'AH ; totaux sans CLV structurel dans ce backtest.")
+
+    _print_clv_ah_par_ev(signaux)
 
     # Drawdown maximum
     bankroll = 100.0
@@ -2040,12 +2327,30 @@ async def generer_rapport(conn):
                 f"{st_lm['clv']:>+7.2%} {t_s:>6} {st_lm['roi']:>+7.1%}"
             )
 
+    # ── Objectifs CLV AH par ligue (vs Pinnacle) ─────────────
+    nom_par_id = {c['id']: c['nom'] for c in CHAMPIONNATS}
+    df_obj_clv = construire_tableau_objectifs_clv_ah(signaux=signaux, noms_ligue=nom_par_id)
+    print(f"\n{'─'*50}")
+    print(f"  OBJECTIFS CLV AH PAR LIGUE — battre Pinnacle (long terme)")
+    print(f"{'─'*50}")
+    print("  Critère ✅ : CLV ≥ cible ligue, t ≥ 2.0, n ≥ min paris AH")
+    print(formater_objectifs_clv_ah_texte(df_obj_clv))
+    if not df_obj_clv.empty:
+        obj_csv = "clv_objectifs_ligue.csv"
+        df_obj_clv.assign(
+            clv_ah_pct=(df_obj_clv["clv_ah"] * 100).round(2),
+            cible_clv_pct=(df_obj_clv["cible_clv"] * 100).round(2),
+            clv_min_sig_pct=(df_obj_clv["clv_min_sig"] * 100).round(2),
+            t_stat=df_obj_clv["t_stat"].round(2),
+        ).to_csv(obj_csv, index=False, encoding="utf-8")
+        print(f"\n  📄 Objectifs exportés : {obj_csv}")
+
     # ── Courbe de calibration ───────────────────────────────
     print(f"\n{'─'*50}")
     print(f"  CALIBRATION DU MODÈLE (P_modèle vs fréquence réelle)")
     print(f"{'─'*50}")
     # Discrétiser les EV en tranches
-    tranches = [(0.05, 0.07), (0.07, 0.09), (0.09, 0.12), (0.12, 0.20)]
+    tranches = TRANCHES_EV
     for lo, hi in tranches:
         rows_t = [s for s in signaux if lo <= s[8] < hi and s[13] is not None]
         if not rows_t:
@@ -2150,6 +2455,16 @@ async def main():
                         help='Filtrer une ligue (nom partiel, ex: Championship, "Ligue 1")')
     parser.add_argument('--odds-only',  action='store_true',
                         help='Avec --collect : recollecte uniquement les cotes (fixtures/xG déjà en base)')
+    parser.add_argument('--explore-ev',  action='store_true',
+                        help='Compare scénarios ev_max (volume / CLV / ROI) sur signaux en base')
+    parser.add_argument('--ev-max-spreads', type=float, default=None,
+                        help='Plafond EV AH en simulation (ex: 0.09). Live inchangé.')
+    parser.add_argument('--ev-max-totals', type=float, default=None,
+                        help='Plafond EV totaux en simulation (ex: 0.12). Live inchangé.')
+    parser.add_argument('--saisons', type=str, default=None,
+                        help='Saisons API à collecter (ex: 2025 ou 2023,2024,2025). Défaut : config ligue.')
+    parser.add_argument('--europe-only', action='store_true',
+                        help='Avec --collect : ligues européennes uniquement (12 championnats)')
     args = parser.parse_args()
 
     if args.tune_metric not in TUNE_METRICS:
@@ -2163,20 +2478,40 @@ async def main():
         print("\n❌ --odds-only requiert --collect")
         return
 
+    saisons_override = None
+    if args.saisons:
+        try:
+            saisons_override = parser_saisons_cli(args.saisons)
+        except ValueError as e:
+            print(f"\n❌ --saisons : {e}")
+            return
+
     ligues_filtrees = filtrer_ligues(args.ligue) if args.ligue else None
+    if args.europe_only and ligues_filtrees is not None:
+        ligues_filtrees = filtrer_ligues_europe(ligues_filtrees)
+        if not ligues_filtrees:
+            print("\n❌ Aucune ligue européenne ne correspond au filtre --ligue")
+            return
+
+    ev_max_by_market = {}
+    if args.ev_max_spreads is not None:
+        ev_max_by_market['spreads'] = args.ev_max_spreads
+    if args.ev_max_totals is not None:
+        ev_max_by_market['totals'] = args.ev_max_totals
+    ev_max_by_market = ev_max_by_market or None
 
     if args.reset_full:
         await reset_backtest(full=True)
     elif args.reset:
         await reset_backtest(full=False)
 
-    run_phases = args.collect or args.simulate or args.report or args.tune
+    run_phases = args.collect or args.simulate or args.report or args.tune or args.explore_ev
     all_phases = not run_phases and not args.reset and not args.reset_full
 
     if not run_phases and not all_phases:
         return
 
-    needs_db = args.simulate or args.report or args.tune or all_phases
+    needs_db = args.simulate or args.report or args.tune or args.explore_ev or all_phases
     if needs_db and os.path.exists(DB_PATH) and not verifier_fichier_db():
         return
 
@@ -2191,6 +2526,8 @@ async def main():
                     conn, session,
                     ligues=ligues_filtrees,
                     odds_only=args.odds_only,
+                    saisons_override=saisons_override,
+                    europe_only=args.europe_only,
                 )
             if args.tune:
                 await tune_hyperparams_walkforward(
@@ -2201,7 +2538,12 @@ async def main():
                 async with aiosqlite.connect(
                     f"file:{DB_PATH}?mode=ro", uri=True, timeout=120.0
                 ) as conn_ro:
-                    sim_ok = (await simuler_paris(conn_ro, ligues=ligues_filtrees)) >= 0
+                    sim_ok = (await simuler_paris(
+                        conn_ro, ligues=ligues_filtrees, ev_max_by_market=ev_max_by_market,
+                    )) >= 0
+            if args.explore_ev:
+                signaux = await charger_signaux(conn)
+                explore_ev_filtres(signaux)
             if args.report or all_phases:
                 if (args.simulate or all_phases) and not sim_ok:
                     print("\n⚠️  Rapport ignoré — la simulation n'a pas pu écrire en base.")

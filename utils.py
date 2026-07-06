@@ -204,6 +204,188 @@ def calculer_drawdown_serie(profits, capital_initial: float = 100.0) -> float:
 
 
 # ──────────────────────────────────────────────────────────────
+# 🎯  OBJECTIFS CLV vs PINNACLE (AH — long terme)
+# ──────────────────────────────────────────────────────────────
+# « Battre Pinnacle significativement » = CLV ≥ cible ligue ET t ≥ 2 ET n ≥ min_n
+CLV_CIBLE_PORTFOLIO_AH = 0.0050       # +0.50% portfolio AH multi-ligues
+CLV_T_STAT_SIGNIFICATIF = 2.0
+CLV_T_STAT_CONSERVATEUR = 2.5
+CLV_MIN_N_LIGUE_AH = 120
+CLV_MIN_N_PORTFOLIO_AH = 1500
+
+# ligue_id → (cible CLV, n min AH, tier marché)
+# Top = Big 5 + PL (marchés très efficient, cible plus basse)
+# Mid = ligues secondaires européennes à volume correct
+# Niche = ligues plus petites / volatiles
+CIBLES_CLV_AH = {
+    39:  (0.0035, 150, "Top"),     # Premier League
+    140: (0.0035, 150, "Top"),     # La Liga
+    78:  (0.0035, 150, "Top"),     # Bundesliga
+    135: (0.0035, 150, "Top"),     # Serie A
+    61:  (0.0035, 150, "Top"),     # Ligue 1
+    88:  (0.0050, 120, "Mid"),     # Eredivisie
+    94:  (0.0050, 120, "Mid"),     # Primeira Liga
+    40:  (0.0045, 150, "Mid"),     # Championship
+    136: (0.0050, 120, "Mid"),     # Serie B
+    141: (0.0050, 120, "Mid"),     # LaLiga 2
+    253: (0.0045, 100, "Niche"),   # MLS
+    203: (0.0050, 100, "Niche"),   # Süper Lig
+    113: (0.0050, 80,  "Niche"),   # Allsvenskan
+    71:  (0.0050, 100, "Niche"),   # Série A Brésil
+    103: (0.0050, 80,  "Niche"),   # Eliteserien
+    144: (0.0050, 100, "Niche"),   # Jupiler Pro
+}
+CIBLE_CLV_AH_DEFAULT = (0.0050, 120, "Mid")
+
+
+def get_cible_clv_ligue(ligue_id) -> tuple[float, int, str]:
+    """Retourne (cible_clv, min_n_ah, tier) pour une ligue."""
+    return CIBLES_CLV_AH.get(int(ligue_id), CIBLE_CLV_AH_DEFAULT)
+
+
+def t_stat_clv(clv_vals) -> float:
+    """t-stat CLV moyen (H-24 vs clôture Pinnacle)."""
+    import numpy as np
+    vals = [float(x) for x in clv_vals if x is not None]
+    if len(vals) < 2:
+        return float("nan")
+    m = float(np.mean(vals))
+    s = float(np.std(vals, ddof=1))
+    if s == 0:
+        return float("nan")
+    return m / (s / np.sqrt(len(vals)))
+
+
+def clv_min_detectable(clv_vals, t_crit: float = CLV_T_STAT_SIGNIFICATIF) -> float:
+    """CLV minimum détectable à n actuel (seuil statistique local)."""
+    import numpy as np
+    vals = [float(x) for x in clv_vals if x is not None]
+    n = len(vals)
+    if n < 2:
+        return float("nan")
+    std = float(np.std(vals, ddof=1))
+    return t_crit * std / np.sqrt(n)
+
+
+def evaluer_statut_clv_ligue(
+    clv: float,
+    t: float,
+    n: int,
+    ligue_id: int,
+    t_min: float = CLV_T_STAT_SIGNIFICATIF,
+) -> tuple[str, str]:
+    """
+    Statut long terme vs Pinnacle pour une ligue (AH).
+    Retourne (emoji, libellé court).
+    """
+    import math
+    cible, min_n, _tier = get_cible_clv_ligue(ligue_id)
+    t_ok = t is not None and not (isinstance(t, float) and math.isnan(t))
+    if n < max(30, min_n // 3):
+        return "⏳", f"échantillon faible ({n}/{min_n})"
+    if clv >= cible and t_ok and t >= t_min - 1e-6 and n >= min_n:
+        return "✅", "bat Pinnacle (significatif)"
+    if clv >= cible and n < min_n:
+        return "🔄", f"CLV ok ({n}/{min_n} paris)"
+    if clv >= cible * 0.7 and clv > 0 and t_ok and t >= 1.65:
+        if n < min_n:
+            return "🔄", f"edge probable ({n}/{min_n} paris)"
+        return "🔄", "CLV ok, t sous seuil — confirmer"
+    if clv > 0 and n >= min_n:
+        return "⚠️", f"sous cible {cible:.2%}"
+    if clv <= 0 and n >= max(50, min_n // 2):
+        return "❌", "pas d'edge CLV"
+    return "⏳", "en cours"
+
+
+def construire_tableau_objectifs_clv_ah(
+    signaux=None,
+    df: pd.DataFrame | None = None,
+    noms_ligue: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Tableau objectifs CLV AH par ligue (backtest tuples ou DataFrame CSV).
+    Colonnes : ligue_id, ligue, tier, n_ah, clv_ah, t_stat, cible_clv,
+               min_n, clv_min_sig, statut, libelle.
+    """
+    import numpy as np
+
+    rows_raw: dict[int, dict] = {}
+    if signaux is not None:
+        for s in signaux:
+            if s[3] != "spreads":
+                continue
+            lid = int(s[1])
+            bucket = rows_raw.setdefault(lid, {"n": 0, "clvs": []})
+            bucket["n"] += 1
+            if s[14] is not None:
+                bucket["clvs"].append(float(s[14]))
+    elif df is not None and not df.empty:
+        sub = df[df["market"] == "spreads"] if "market" in df.columns else df
+        for lid, g in sub.groupby("ligue_id"):
+            clvs = [float(c) for c in g["clv"].dropna().tolist()]
+            rows_raw[int(lid)] = {"n": len(g), "clvs": clvs}
+    else:
+        return pd.DataFrame()
+
+    noms_ligue = noms_ligue or {}
+    out = []
+    for lid in sorted(set(CIBLES_CLV_AH.keys()) | set(rows_raw.keys())):
+        bucket = rows_raw.get(lid, {"n": 0, "clvs": []})
+        clvs = bucket["clvs"]
+        n = bucket["n"]
+        cible, min_n, tier = get_cible_clv_ligue(lid)
+        clv_m = float(np.mean(clvs)) if clvs else float("nan")
+        t = t_stat_clv(clvs) if clvs else float("nan")
+        clv_sig = clv_min_detectable(clvs) if clvs else float("nan")
+        statut, lib = evaluer_statut_clv_ligue(
+            clv_m if clvs else 0.0, t, n, lid,
+        )
+        nom = noms_ligue.get(lid, str(lid))
+        out.append({
+            "ligue_id": lid,
+            "ligue": nom,
+            "tier": tier,
+            "n_ah": n,
+            "clv_ah": clv_m,
+            "t_stat": t,
+            "cible_clv": cible,
+            "min_n": min_n,
+            "clv_min_sig": clv_sig,
+            "statut": statut,
+            "libelle": lib,
+        })
+    return pd.DataFrame(out)
+
+
+def formater_objectifs_clv_ah_texte(df_obj: pd.DataFrame) -> str:
+    """Bloc texte pour le rapport CLI backtest."""
+    if df_obj.empty:
+        return "  (aucune donnée AH)"
+    lines = [
+        f"  {'Ligue':<18} {'Tier':<6} {'N':>5} {'CLV':>7} {'t':>5} "
+        f"{'Cible':>7} {'Min_n':>5}  {'Statut':<4} Détail",
+        f"  {'─'*18} {'─'*6} {'─'*5} {'─'*7} {'─'*5} {'─'*7} {'─'*5}  {'─'*4} {'─'*20}",
+    ]
+    for _, r in df_obj.sort_values(["statut", "ligue"]).iterrows():
+        clv_s = f"{r['clv_ah']:+.2%}" if r["n_ah"] else "  n/a"
+        t_s = f"{r['t_stat']:+.1f}" if r["n_ah"] >= 2 and not pd.isna(r["t_stat"]) else " n/a"
+        lines.append(
+            f"  {str(r['ligue']):<18} {r['tier']:<6} {int(r['n_ah']):>5} "
+            f"{clv_s:>7} {t_s:>5} {r['cible_clv']:>+6.2%} {int(r['min_n']):>5}  "
+            f"{r['statut']:<4} {r['libelle']}"
+        )
+    n_ok = (df_obj["statut"] == "✅").sum()
+    n_tot = len(df_obj)
+    lines.append(
+        f"\n  Portfolio cible : CLV AH ≥ {CLV_CIBLE_PORTFOLIO_AH:.2%}, "
+        f"t ≥ {CLV_T_STAT_SIGNIFICATIF:.1f}, n ≥ {CLV_MIN_N_PORTFOLIO_AH}"
+    )
+    lines.append(f"  Ligues validées : {n_ok}/{n_tot}")
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────────────────────
 # 🎯  CALIBRATION & BRIER (journal live / backtest)
 # ──────────────────────────────────────────────────────────────
 TRANCHES_EDGE_CALIBRATION = [

@@ -16,6 +16,10 @@ from utils import (
     creer_graphique_bankroll,
     creer_graphique_clv_cumule,
     creer_graphique_pl_marche,
+    construire_tableau_objectifs_clv_ah,
+    CLV_CIBLE_PORTFOLIO_AH,
+    CLV_MIN_N_PORTFOLIO_AH,
+    CLV_T_STAT_SIGNIFICATIF,
     filtre_ligue_sidebar,
     filtre_marche_sidebar,
     filtre_temporel_sidebar,
@@ -676,3 +680,41 @@ elif section == "🔬 Back-test Historique":
                                  .style.map(color_roi, subset=['ROI (%)', 'CLV moy (%)']),
                 use_container_width=True
             )
+
+        st.markdown("---")
+        st.subheader("🎯 Objectifs CLV AH vs Pinnacle (long terme)")
+        st.caption(
+            f"Battre Pinnacle **significativement** par ligue : CLV AH ≥ cible, "
+            f"t ≥ {CLV_T_STAT_SIGNIFICATIF:.1f}, n ≥ min paris. "
+            f"Portfolio : ≥ {CLV_CIBLE_PORTFOLIO_AH:.2%} sur {CLV_MIN_N_PORTFOLIO_AH}+ paris AH."
+        )
+        if not df_bt.empty:
+            df_obj = construire_tableau_objectifs_clv_ah(df=df_bt)
+            if not df_obj.empty:
+                df_show = df_obj.copy()
+                df_show["CLV actuel (%)"] = (df_show["clv_ah"] * 100).round(2)
+                df_show["Cible CLV (%)"] = (df_show["cible_clv"] * 100).round(2)
+                df_show["CLV min sig. (%)"] = (df_show["clv_min_sig"] * 100).round(2)
+                df_show["t-stat"] = df_show["t_stat"].round(2)
+                cols_obj = [
+                    "statut", "ligue", "tier", "n_ah", "CLV actuel (%)",
+                    "Cible CLV (%)", "t-stat", "min_n", "CLV min sig. (%)", "libelle",
+                ]
+
+                def _style_statut(val):
+                    colors = {"✅": "#00FF00", "🔄": "#FFD700", "⚠️": "#FFA500", "❌": "#FF4500", "⏳": "#AAAAAA"}
+                    return f"color: {colors.get(str(val), '#FFFFFF')}"
+
+                st.dataframe(
+                    df_show[cols_obj].sort_values(["statut", "ligue"])
+                    .style.map(_style_statut, subset=["statut"])
+                    .map(color_roi, subset=["CLV actuel (%)", "Cible CLV (%)"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                n_ok = int((df_obj["statut"] == "✅").sum())
+                st.metric("Ligues validées (✅)", f"{n_ok} / {len(df_obj)}")
+            else:
+                st.info("Pas de paris AH dans le backtest.")
+        else:
+            st.info("Backtest vide.")
