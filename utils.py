@@ -237,6 +237,19 @@ CIBLES_CLV_AH = {
 }
 CIBLE_CLV_AH_DEFAULT = (0.0050, 120, "Mid")
 
+# Seuils EV minimum AH en backtest (P1 volume) — Top = marchés sharp
+EV_MIN_SPREADS_TIER = {
+    "Top": 0.07,
+    "Mid": 0.06,
+    "Niche": 0.05,
+}
+
+
+def get_ev_min_spreads_ligue(ligue_id, default: float = 0.05) -> float:
+    """EV min AH selon tier ligue (backtest / réduction volume)."""
+    _, _, tier = get_cible_clv_ligue(ligue_id)
+    return EV_MIN_SPREADS_TIER.get(tier, default)
+
 
 def get_cible_clv_ligue(ligue_id) -> tuple[float, int, str]:
     """Retourne (cible_clv, min_n_ah, tier) pour une ligue."""

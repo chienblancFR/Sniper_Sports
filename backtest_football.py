@@ -40,7 +40,10 @@ Reset (avant de relancer le backtest / dashboard) :
 
   python backtest_football.py --simulate --ev-max-spreads 0.09 --report
       → Backtest avec plafond EV AH 9% (totaux inchanges)
-      → Mix 60% CLV + 40% log P(score)
+
+  python backtest_football.py --simulate --p1-ah --report
+      → P1 volume AH : EV max 9%%, EV min par tier (Top 7%% / Mid 6%% / Niche 5%%),
+        cap 45 signaux AH / ligue / saison (meilleurs EV)
 
 Dashboard Streamlit : après --report, menu ⋮ → Clear cache → Rerun
 Si le CSV distant PythonAnywhere est utilisé, uploader le nouveau backtest_results.csv.
@@ -74,7 +77,12 @@ from foot_params import (
     xg_decay_rate,
 )
 from odds_devig import cote_fair_2way
-from utils import construire_tableau_objectifs_clv_ah, formater_objectifs_clv_ah_texte
+from utils import (
+    construire_tableau_objectifs_clv_ah,
+    formater_objectifs_clv_ah_texte,
+    get_ev_min_spreads_ligue,
+    EV_MIN_SPREADS_TIER,
+)
 
 load_project_env("foot")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
@@ -145,6 +153,10 @@ LIGUES_ESTIVALES = {71, 113, 253, 103}  # Brésil, Allsvenskan, MLS, Eliteserien
 LIGUES_EUROPEENNES = {
     140, 78, 88, 135, 94, 203, 61, 141, 39, 40, 144, 136,
 }
+
+# Preset P1 — réduction volume AH (backtest only, live inchangé)
+P1_AH_EV_MAX_SPREADS = 0.09
+P1_AH_MAX_LIGUE_SAISON = 45
 
 CHAMPIONNATS = [
     {"nom": "La Liga",          "id": 140, "key": "soccer_spain_la_liga",            "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15},
@@ -1514,9 +1526,19 @@ async def _lambdas_pour_match(conn, ligue, saison, date_utc, h_id, a_id,
     )
 
 
+def _ev_min_pour_marche(market, ligue_id, ev_min_l, ev_min_by_market=None,
+                        ev_min_spreads_tier=False):
+    if ev_min_by_market and market in ev_min_by_market:
+        return ev_min_by_market[market]
+    if market == 'spreads' and ev_min_spreads_tier and ligue_id is not None:
+        return get_ev_min_spreads_ligue(ligue_id, ev_min_l)
+    return ev_min_l
+
+
 def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
                           markets=('spreads', 'totals'), poids_dyn=None,
-                          ev_max_by_market=None):
+                          ev_max_by_market=None, ev_min_by_market=None,
+                          ev_min_spreads_tier=False, ligue_id=None):
     """
     Candidats EV/Kelly pour un match — logique alignée simuler_paris() / bot live.
     Retourne [(ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag), ...]
@@ -1567,7 +1589,10 @@ def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
 
         ev_final = ev_modele * poids_dyn + ev_pinnacle * (1.0 - poids_dyn)
         ev_cap = (ev_max_by_market or {}).get(market, ev_max_l)
-        if not (ev_min_l <= ev_final <= ev_cap):
+        ev_floor = _ev_min_pour_marche(
+            market, ligue_id, ev_min_l, ev_min_by_market, ev_min_spreads_tier,
+        )
+        if not (ev_floor <= ev_final <= ev_cap):
             continue
         mise = min(round(k * 100 * KELLY_FRAC, 2), 5.0)
         if mise < 0.1:
@@ -1813,7 +1838,8 @@ async def tune_hyperparams_walkforward(conn, ligues=None, metric='loglik', clv_w
     print("   Bot live + backtest : rechargement auto via foot_params.py")
 
 
-async def simuler_paris(conn, ligues=None, ev_max_by_market=None):
+async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_market=None,
+                        ev_min_spreads_tier=False, max_ah_ligue_saison=None):
     print("\n" + "="*60)
     print("🔬  PHASE 2 — SIMULATION DU MODÈLE")
     print("="*60)
@@ -1836,6 +1862,14 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None):
     if ev_max_by_market:
         parts = [f"{mk}≤{cap:.0%}" for mk, cap in sorted(ev_max_by_market.items())]
         print(f"  🎚️  Plafonds EV backtest : {', '.join(parts)}")
+    if ev_min_by_market:
+        parts = [f"{mk}≥{floor:.0%}" for mk, floor in sorted(ev_min_by_market.items())]
+        print(f"  🎚️  Seuils EV min backtest : {', '.join(parts)}")
+    if ev_min_spreads_tier:
+        tiers = ", ".join(f"{t}={v:.0%}" for t, v in sorted(EV_MIN_SPREADS_TIER.items()))
+        print(f"  🎚️  EV min AH par tier : {tiers}")
+    if max_ah_ligue_saison:
+        print(f"  🎚️  Cap volume AH : {max_ah_ligue_saison} signaux max / ligue / saison (meilleurs EV)")
 
     if n_odds == 0:
         print("\n  ⚠️  AUCUNE cote H-24 trouvée — la collecte d'odds a échoué.")
@@ -1947,6 +1981,9 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None):
             candidats = _candidats_pour_match(
                 mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
                 ev_max_by_market=ev_max_by_market,
+                ev_min_by_market=ev_min_by_market,
+                ev_min_spreads_tier=ev_min_spreads_tier,
+                ligue_id=ligue['id'],
             )
 
             if not candidats:
@@ -1983,6 +2020,11 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None):
                     mise, gh, ga, res, clv,
                 ))
                 signaux += 1
+
+        if max_ah_ligue_saison:
+            n_avant = len(pending)
+            pending = _cap_signaux_ah_ligue_saison(pending, max_ah_ligue_saison)
+            signaux -= n_avant - len(pending)
 
         all_pending.extend(pending)
         print(f"  {ligue['nom']} : {signaux} signaux générés")
@@ -2089,17 +2131,55 @@ def _print_clv_ah_par_ev(signaux, tranches=None):
             )
 
 
-def _filtrer_signaux_ev(signaux, ev_max_spreads=None, ev_max_totals=None, ev_max_all=None):
-    """Sous-ensemble post-hoc ou pré-sim selon les plafonds EV par marché."""
+def _cap_signaux_ah_ligue_saison(rows, max_per):
+    """Garde les max_per meilleurs signaux AH par (ligue_id, saison) — tri EV décroissant."""
+    if not max_per or max_per <= 0:
+        return rows
+    others = [r for r in rows if r[3] != 'spreads']
+    by_key = defaultdict(list)
+    for r in rows:
+        if r[3] == 'spreads':
+            by_key[(r[1], r[2])].append(r)
+    capped = []
+    for ah_rows in by_key.values():
+        ah_rows.sort(key=lambda x: x[8], reverse=True)
+        capped.extend(ah_rows[:max_per])
+    return others + capped
+
+
+def _cap_signaux_posthoc(signaux, max_ah_ligue_saison):
+    """Applique le cap AH sur signaux chargés (explore-ev post-hoc)."""
+    if not max_ah_ligue_saison:
+        return signaux
+    others = [s for s in signaux if s[3] != 'spreads']
+    by_key = defaultdict(list)
+    for s in signaux:
+        if s[3] == 'spreads':
+            by_key[(s[1], s[2])].append(s)
+    capped = []
+    for ah_rows in by_key.values():
+        ah_rows.sort(key=lambda x: x[8], reverse=True)
+        capped.extend(ah_rows[:max_ah_ligue_saison])
+    return others + capped
+
+
+def _filtrer_signaux_ev(signaux, ev_max_spreads=None, ev_max_totals=None, ev_max_all=None,
+                        ev_min_spreads=None, ev_min_spreads_tier=False):
+    """Sous-ensemble post-hoc selon plafonds / seuils EV par marché."""
     out = []
     for s in signaux:
-        mk, ev = s[3], s[8]
+        mk, ev, lid = s[3], s[8], s[1]
         if ev_max_all is not None and ev > ev_max_all:
             continue
         if mk == 'spreads' and ev_max_spreads is not None and ev > ev_max_spreads:
             continue
         if mk == 'totals' and ev_max_totals is not None and ev > ev_max_totals:
             continue
+        if mk == 'spreads':
+            if ev_min_spreads is not None and ev < ev_min_spreads:
+                continue
+            if ev_min_spreads_tier and ev < get_ev_min_spreads_ligue(lid):
+                continue
         out.append(s)
     return out
 
@@ -2154,6 +2234,37 @@ def explore_ev_filtres(signaux):
         print(
             f"  AH ≤ {cap:.0%}  n={st['n']:>4} ({per:.0f}/lig/s)  "
             f"CLV={st['clv']:+.2%}  ROI={st['roi']:+.2%}  P&L={st['pnl']:+.1f}u"
+        )
+
+    print("\n  P1 volume AH — EV min par tier (post-hoc, totaux inchangés) :")
+    for label, kwargs in (
+        ("tier Top7/Mid6/Niche5", {"ev_max_spreads": 0.09, "ev_min_spreads_tier": True}),
+        ("EV min 6% flat", {"ev_max_spreads": 0.09, "ev_min_spreads": 0.06}),
+        ("EV min 7% flat", {"ev_max_spreads": 0.09, "ev_min_spreads": 0.07}),
+    ):
+        sub = _filtrer_signaux_ev(signaux, **kwargs)
+        _ligne(label, sub)
+
+    print("\n  P1 volume AH — cap / ligue / saison (post-hoc, EV AH ≤ 9%) :")
+    base_ah_cap = _filtrer_signaux_ev(signaux, ev_max_spreads=0.09)
+    for cap in (60, 45, 30, 20):
+        sub = _cap_signaux_posthoc(base_ah_cap, cap)
+        _ligne(f"cap {cap} AH/lig/s", sub)
+
+    print("\n  Preset --p1-ah (tier + cap 45 + EV AH ≤ 9%) :")
+    p1_sub = _filtrer_signaux_ev(
+        signaux, ev_max_spreads=0.09, ev_min_spreads_tier=True,
+    )
+    p1_sub = _cap_signaux_posthoc(p1_sub, P1_AH_MAX_LIGUE_SAISON)
+    _ligne("p1-ah", p1_sub)
+    st_p1_ah = _resume_signaux([s for s in p1_sub if s[3] == 'spreads'])
+    if st_p1_ah:
+        per_ah = st_p1_ah['n'] / max(n_lig * n_saisons, 1)
+        print(
+            f"\n  → Commande : python backtest_football.py --simulate --p1-ah --report"
+            f"\n     AH seul : n={st_p1_ah['n']} (~{per_ah:.0f}/lig/s), "
+            f"CLV={st_p1_ah['clv']:+.2%}, ROI={st_p1_ah['roi']:+.2%}, "
+            f"P&L={st_p1_ah['pnl']:+.1f}u"
         )
 
     # Recommandation synthétique
@@ -2219,6 +2330,11 @@ async def generer_rapport(conn):
     print(f"  ROI                 : {pnl_total/mises_tot:+.2%}" if mises_tot else "  ROI : N/A")
     print(f"  Win rate            : {win_rate:.1%}")
     print(f"  Signaux avec CLV    : {len(clv_vals)}/{total}")
+    n_lig_r = len({s[1] for s in signaux})
+    n_sais_r = len({s[2] for s in signaux})
+    n_ah_r = sum(1 for s in signaux if s[3] == 'spreads')
+    if n_lig_r and n_sais_r:
+        print(f"  Densité AH            : {n_ah_r} (~{n_ah_r / (n_lig_r * n_sais_r):.0f}/ligue/saison)")
 
     # ── AH vs Totaux (CLV + ROI séparés) ─────────────────────
     print(f"\n{'─'*50}")
@@ -2461,6 +2577,14 @@ async def main():
                         help='Plafond EV AH en simulation (ex: 0.09). Live inchangé.')
     parser.add_argument('--ev-max-totals', type=float, default=None,
                         help='Plafond EV totaux en simulation (ex: 0.12). Live inchangé.')
+    parser.add_argument('--ev-min-spreads', type=float, default=None,
+                        help='Seuil EV min AH en simulation (ex: 0.06). Live inchangé.')
+    parser.add_argument('--ev-min-spreads-tier', action='store_true',
+                        help='EV min AH par tier ligue (Top 7%%, Mid 6%%, Niche 5%%). Backtest only.')
+    parser.add_argument('--max-ah-ligue-saison', type=int, default=None,
+                        help='Cap signaux AH / ligue / saison (meilleurs EV). Backtest only.')
+    parser.add_argument('--p1-ah', action='store_true',
+                        help='Preset volume AH : ev-max-spreads 9%%, ev-min tier, cap 45 AH/ligue/saison')
     parser.add_argument('--saisons', type=str, default=None,
                         help='Saisons API à collecter (ex: 2025 ou 2023,2024,2025). Défaut : config ligue.')
     parser.add_argument('--europe-only', action='store_true',
@@ -2498,7 +2622,24 @@ async def main():
         ev_max_by_market['spreads'] = args.ev_max_spreads
     if args.ev_max_totals is not None:
         ev_max_by_market['totals'] = args.ev_max_totals
+
+    ev_min_by_market = {}
+    ev_min_spreads_tier = args.ev_min_spreads_tier
+    max_ah_ligue_saison = args.max_ah_ligue_saison
+
+    if args.p1_ah:
+        if args.ev_max_spreads is None:
+            ev_max_by_market['spreads'] = P1_AH_EV_MAX_SPREADS
+        if args.ev_min_spreads is None and not args.ev_min_spreads_tier:
+            ev_min_spreads_tier = True
+        if max_ah_ligue_saison is None:
+            max_ah_ligue_saison = P1_AH_MAX_LIGUE_SAISON
+
+    if args.ev_min_spreads is not None:
+        ev_min_by_market['spreads'] = args.ev_min_spreads
+
     ev_max_by_market = ev_max_by_market or None
+    ev_min_by_market = ev_min_by_market or None
 
     if args.reset_full:
         await reset_backtest(full=True)
@@ -2540,6 +2681,9 @@ async def main():
                 ) as conn_ro:
                     sim_ok = (await simuler_paris(
                         conn_ro, ligues=ligues_filtrees, ev_max_by_market=ev_max_by_market,
+                        ev_min_by_market=ev_min_by_market,
+                        ev_min_spreads_tier=ev_min_spreads_tier,
+                        max_ah_ligue_saison=max_ah_ligue_saison,
                     )) >= 0
             if args.explore_ev:
                 signaux = await charger_signaux(conn)
