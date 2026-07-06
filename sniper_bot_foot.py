@@ -1711,6 +1711,28 @@ async def evaluer_force_lineup(session, fixture_id, team_id, saison_correcte, de
 # ==========================================
 # 🎯 4. ANALYSEUR HYBRIDE
 # ==========================================
+async def _marches_pending_sur_match(db_conn, id_match):
+    """Marchés déjà couverts par un pari PENDING sur ce match (max 1 AH + 1 total)."""
+    async with db_conn.execute(
+        "SELECT ligue, equipe FROM paris_log WHERE id_match=? AND statut='PENDING'",
+        (id_match,),
+    ) as cur:
+        rows = await cur.fetchall()
+    bloques = set()
+    for ligue_tag, equipe in rows:
+        tag = ligue_tag or ""
+        eq = (equipe or "").strip()
+        if "[spreads]" in tag:
+            bloques.add("spreads")
+        elif "[totals]" in tag:
+            bloques.add("totals")
+        elif eq in ("Over", "Under"):
+            bloques.add("totals")
+        else:
+            bloques.add("spreads")
+    return bloques
+
+
 async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_attack_map, mot_map, luck_map, m_dom_l, m_ext_l, cotes_data):
     n_d, n_e = m['teams']['home']['name'], m['teams']['away']['name']
     id_d, id_e, id_m = m['teams']['home']['id'], m['teams']['away']['id'], m['fixture']['id']
@@ -1897,10 +1919,15 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
         ev_min_rotation = ev_min_effectif
 
     # Collecte candidats AH + totaux → meilleur EV par marché (max 2 paris/match)
+    async with db_lock:
+        marches_bloques = await _marches_pending_sur_match(db_conn, id_m)
+
     candidats = []
     for market in pinnacle['markets']:
         market_key = market['key']
         if market_key not in ('spreads', 'totals'):
+            continue
+        if market_key in marches_bloques:
             continue
         outcomes = market['outcomes']
 
@@ -1917,6 +1944,8 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                 ) as cursor:
                     if await cursor.fetchone():
                         continue
+                if market_key in await _marches_pending_sur_match(db_conn, id_m):
+                    continue
 
             if market_key == 'spreads':
                 is_h_odds = (nom == home_team_odds)
@@ -1981,10 +2010,36 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
     paris_pris = 0
 
     for best in par_marche.values():
+        if best['market_key'] in marches_bloques:
+            log_info(
+                f"Skip {best['market_key']} {n_d}-{n_e}: pari {best['market_key']} déjà PENDING"
+            )
+            continue
+
         h, cote, nom = best['h'], best['cote'], best['nom']
         ev_final = best['ev_final']
         ev_modele, ev_pinnacle = best['ev_modele'], best['ev_pinnacle']
         mise_u, p_modele = best['mise_u'], best['p_modele']
+
+        async with db_lock:
+            if best['market_key'] in await _marches_pending_sur_match(db_conn, id_m):
+                log_info(
+                    f"Skip {best['market_key']} {n_d}-{n_e}: pari {best['market_key']} déjà PENDING"
+                )
+                continue
+            ligue_tag = f"{ligue['nom']} [{best['market_key']}]"
+            cur = await db_conn.execute("""INSERT OR IGNORE INTO paris_log
+                (id_match, equipe, handicap, cote_prise, mise, edge_detecte, p_modele, ligue,
+                 is_lineup_official, timestamp, equipe_dom, equipe_ext, kickoff)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (id_m, nom, h, cote, mise_u, round(ev_final, 4), round(p_modele, 4), ligue_tag,
+                 int(lineup_ok), datetime.now().isoformat(),
+                 home_team_odds, away_team_odds, m['fixture']['date']))
+            await db_conn.commit()
+            if cur.rowcount == 0:
+                log_info(f"Skip {best['market_key']} {n_d}-{n_e}: doublon DB ignoré")
+                continue
+            marches_bloques.add(best['market_key'])
 
         msg = (f"🎯 *SIGNAL [{ligue['nom']}] {best['market_label']}*\n"
                f"🏟️ {n_d} - {n_e}\n{badge} | {hko_label}{rotation_note}\n"
@@ -1993,17 +2048,6 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                f"📊 Prob. modèle : *{p_modele:.1%}* (fair @ {1/p_modele:.2f})\n"
                f"📏 Mise Kelly : *{mise_u} u*")
         await envoyer_telegram_async(session, msg)
-
-        async with db_lock:
-            ligue_tag = f"{ligue['nom']} [{best['market_key']}]"
-            await db_conn.execute("""INSERT OR IGNORE INTO paris_log
-                (id_match, equipe, handicap, cote_prise, mise, edge_detecte, p_modele, ligue,
-                 is_lineup_official, timestamp, equipe_dom, equipe_ext, kickoff)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (id_m, nom, h, cote, mise_u, round(ev_final, 4), round(p_modele, 4), ligue_tag,
-                 int(lineup_ok), datetime.now().isoformat(),
-                 home_team_odds, away_team_odds, m['fixture']['date']))
-            await db_conn.commit()
 
         pari_market = next((mkt for mkt in pinnacle['markets'] if mkt['key'] == best['market_key']), None)
         if pari_market and not _trouver_outcome_clv(
