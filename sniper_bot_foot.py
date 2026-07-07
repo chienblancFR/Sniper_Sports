@@ -10,6 +10,12 @@ from config_env import load_project_env
 load_project_env("foot")
 from odds_devig import cote_fair_2way
 from foot_params import RHO_DEFAULT, get_dc_half_life_days, get_n_prior, get_rho_fallback, xg_decay_rate
+from utils import (
+    appliquer_calibrateur_ah,
+    ajuster_ev_proportionnel,
+    load_calibration_ah,
+    FOOT_CALIB_AH_FILE_DEFAULT,
+)
 import asyncio
 import aiohttp
 import aiosqlite
@@ -120,6 +126,17 @@ FOOT_CLV_SCORE_MIN = int(os.environ.get("FOOT_CLV_SCORE_MIN", "80"))
 FOOT_CLV_SCORE_MIN_RELAX = int(os.environ.get("FOOT_CLV_SCORE_MIN_RELAX", "75"))
 FOOT_CLV_ALERT_ECHEC = _env_bool("FOOT_CLV_ALERT_ECHEC", True)
 FOOT_CLV_DOUBLE_PASS = _env_bool("FOOT_CLV_DOUBLE_PASS", True)
+
+# Calibration P(couverture) AH — foot_calibration_ah.json (--fit-calibration platt)
+FOOT_CALIB_AH = _env_bool("FOOT_CALIB_AH", False)
+FOOT_CALIB_AH_FILE = os.environ.get("FOOT_CALIB_AH_FILE", FOOT_CALIB_AH_FILE_DEFAULT)
+_CALIB_AH_STORE: dict = {}
+
+
+def _recharger_calib_ah():
+    global _CALIB_AH_STORE
+    _CALIB_AH_STORE = load_calibration_ah(FOOT_CALIB_AH_FILE) if FOOT_CALIB_AH else {}
+    return _CALIB_AH_STORE
 
 # n_prior / ρ fallback / demi-vies : foot_params.py (+ foot_params_tuned.json via backtest --tune)
 
@@ -1962,6 +1979,11 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                 ev_pinnacle = calculer_ev_ah(mat_actif, h, is_h_odds, cote_novig)
                 kelly_theorique = calculer_kelly_ah(mat_actif, h, is_h_odds, cote)
                 p_modele = calculer_prob_modele_pari(mat_actif, 'spreads', h, is_h_odds=is_h_odds)
+                if FOOT_CALIB_AH and p_modele is not None:
+                    p_cal = appliquer_calibrateur_ah(ligue['id'], p_modele, _CALIB_AH_STORE)
+                    if p_cal != p_modele:
+                        ev_modele = ajuster_ev_proportionnel(ev_modele, p_modele, p_cal)
+                        p_modele = p_cal
                 market_label = "🏆 HANDICAP"
                 pari_display = f"{nom} ({h:+g})"
             else:
@@ -2969,6 +2991,10 @@ async def main_loop():
     db_lock = asyncio.Lock()
 
     await init_db()
+    store = _recharger_calib_ah()
+    if FOOT_CALIB_AH:
+        n_l = len(store.get("ligues") or {})
+        log_info(f"📐 Calibration AH live : {n_l} ligue(s) ({FOOT_CALIB_AH_FILE})")
 
     log_info("🚀 Démarrage du Superviseur Sniper Football V25 Gold (aiosqlite)...")
 

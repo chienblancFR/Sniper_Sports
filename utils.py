@@ -399,6 +399,264 @@ def formater_objectifs_clv_ah_texte(df_obj: pd.DataFrame) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
+# 🎯  CALIBRATION P(couverture) AH — Platt / isotonic par ligue
+# ──────────────────────────────────────────────────────────────
+import os
+import numpy as np
+
+_EPS_AH_CAL = 1e-6
+FOOT_CALIB_AH_FILE_DEFAULT = "foot_calibration_ah.json"
+CALIB_AH_MIN_SAMPLES_PLATT = 80
+CALIB_AH_MIN_SAMPLES_ISOTONIC = 100
+
+
+def _logit(p: float) -> float:
+    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+    return float(np.log(p / (1.0 - p)))
+
+
+def _sigmoid(x: float) -> float:
+    x = float(np.clip(x, -30.0, 30.0))
+    return float(1.0 / (1.0 + np.exp(-x)))
+
+
+def _ev_ah_matrice(matrice, h, is_home, cote):
+    esp = 0.0
+    n = matrice.shape[0]
+    for i in range(n):
+        for j in range(n):
+            prob = float(matrice[i, j])
+            if prob < 0.0001:
+                continue
+            diff = (i - j) if is_home else (j - i)
+            res_net = diff + h
+            if res_net > 0.25 + _EPS_AH_CAL:
+                payout = cote
+            elif abs(res_net - 0.25) < _EPS_AH_CAL:
+                payout = 1.0 + (cote - 1.0) / 2.0
+            elif abs(res_net) < _EPS_AH_CAL:
+                payout = 1.0
+            elif abs(res_net + 0.25) < _EPS_AH_CAL:
+                payout = 0.5
+            else:
+                payout = 0.0
+            esp += prob * payout
+    return esp - 1.0
+
+
+def prob_implicite_ah(matrice, h, is_home, cote_max: float = 500.0) -> float:
+    """P implicite 1/cote_fair (EV=0) — aligné bot live."""
+    def ev_at(c):
+        return _ev_ah_matrice(matrice, h, is_home, max(c, 1.001))
+
+    lo = 1.01
+    if ev_at(lo) >= 0:
+        return float(np.clip(1.0 / lo, 0.001, 0.999))
+    hi = 2.0
+    while ev_at(hi) < 0 and hi < cote_max:
+        hi *= 1.5
+    if ev_at(hi) < 0:
+        return 0.001
+    for _ in range(64):
+        mid = (lo + hi) / 2.0
+        if ev_at(mid) >= 0:
+            hi = mid
+        else:
+            lo = mid
+    return float(np.clip(1.0 / hi, 0.001, 0.999))
+
+
+def ajuster_ev_proportionnel(ev_raw: float, p_raw: float, p_cal: float) -> float:
+    if p_raw is None or p_cal is None or p_raw <= 1e-6:
+        return ev_raw
+    ratio = float(np.clip(p_cal / p_raw, 0.05, 3.0))
+    return (1.0 + ev_raw) * ratio - 1.0
+
+
+def outcome_binaire_ah(resultat: float) -> float:
+    if resultat is None:
+        return float("nan")
+    return 1.0 if float(resultat) > 0 else 0.0
+
+
+def fit_platt_scaling(p, y):
+    from scipy.optimize import minimize
+
+    p_arr = np.clip(np.asarray(p, dtype=float), 1e-6, 1.0 - 1e-6)
+    y_arr = np.asarray(y, dtype=float)
+    x = np.log(p_arr / (1.0 - p_arr))
+
+    def nll(params):
+        a, b = params
+        prob = 1.0 / (1.0 + np.exp(-(a * x + b)))
+        prob = np.clip(prob, 1e-9, 1.0 - 1e-9)
+        return -float(np.sum(y_arr * np.log(prob) + (1.0 - y_arr) * np.log(1.0 - prob)))
+
+    res = minimize(nll, [1.0, 0.0], method="L-BFGS-B")
+    a, b = float(res.x[0]), float(res.x[1])
+    p_fit = 1.0 / (1.0 + np.exp(-(a * x + b)))
+    brier = float(np.mean((p_fit - y_arr) ** 2))
+    return a, b, brier
+
+
+def fit_isotonic_regression(p, y):
+    p_arr = np.clip(np.asarray(p, dtype=float), 1e-6, 1.0 - 1e-6)
+    y_arr = np.asarray(y, dtype=float)
+    order = np.argsort(p_arr)
+    x = p_arr[order]
+    y = y_arr[order]
+    n = len(x)
+    if n == 0:
+        return [], [], float("nan")
+
+    blocks = [[float(y[i]), 1.0, float(x[i]), float(x[i])] for i in range(n)]
+    i = 0
+    while i < len(blocks) - 1:
+        if blocks[i][0] <= blocks[i + 1][0] + 1e-12:
+            i += 1
+            continue
+        while i < len(blocks) - 1 and blocks[i][0] > blocks[i + 1][0] + 1e-12:
+            y1, w1, xa, xb = blocks[i]
+            y2, w2, x2a, x2b = blocks[i + 1]
+            w_sum = w1 + w2
+            y_avg = (y1 * w1 + y2 * w2) / w_sum
+            blocks[i] = [y_avg, w_sum, xa, x2b]
+            del blocks[i + 1]
+        i = max(i - 1, 0)
+
+    xs = [float(b[2]) for b in blocks]
+    ys = [float(np.clip(b[0], 1e-6, 1.0 - 1e-6)) for b in blocks]
+    p_fit = np.interp(p_arr, xs, ys)
+    brier = float(np.mean((p_fit - y_arr) ** 2))
+    return xs, ys, brier
+
+
+def appliquer_platt(p_raw: float, a: float, b: float) -> float:
+    return float(np.clip(_sigmoid(a * _logit(p_raw) + b), 0.001, 0.999))
+
+
+def appliquer_isotonic(p_raw: float, xs, ys) -> float:
+    if not xs or not ys:
+        return p_raw
+    p = float(np.clip(p_raw, 1e-6, 1.0 - 1e-6))
+    return float(np.clip(np.interp(p, np.asarray(xs), np.asarray(ys)), 0.001, 0.999))
+
+
+class CalibrateurWalkForwardAH:
+    def __init__(self, method: str = "platt", min_samples: int | None = None):
+        self.method = method if method in ("platt", "isotonic") else "platt"
+        if min_samples is None:
+            min_samples = (
+                CALIB_AH_MIN_SAMPLES_ISOTONIC if self.method == "isotonic"
+                else CALIB_AH_MIN_SAMPLES_PLATT
+            )
+        self.min_samples = int(min_samples)
+        self._history: dict[int, list[tuple[float, float]]] = {}
+        self._models: dict[int, dict] = {}
+
+    def observe(self, ligue_id: int, p_raw: float, outcome: float):
+        if p_raw is None or outcome != outcome:
+            return
+        self._history.setdefault(int(ligue_id), []).append((float(p_raw), float(outcome)))
+
+    def refit_ligue(self, ligue_id: int) -> dict | None:
+        lid = int(ligue_id)
+        rows = self._history.get(lid, [])
+        if len(rows) < self.min_samples:
+            self._models.pop(lid, None)
+            return None
+        p, y = zip(*rows)
+        if self.method == "isotonic":
+            xs, ys, brier = fit_isotonic_regression(p, y)
+            model = {"method": "isotonic", "xs": xs, "ys": ys, "n_fit": len(rows), "brier": brier}
+        else:
+            a, b, brier = fit_platt_scaling(p, y)
+            model = {"method": "platt", "a": a, "b": b, "n_fit": len(rows), "brier": brier}
+        self._models[lid] = model
+        return model
+
+    def apply(self, ligue_id: int, p_raw: float) -> float:
+        model = self._models.get(int(ligue_id))
+        if not model or p_raw is None:
+            return p_raw
+        if model["method"] == "isotonic":
+            return appliquer_isotonic(p_raw, model["xs"], model["ys"])
+        return appliquer_platt(p_raw, model["a"], model["b"])
+
+
+def fit_calibration_ah_par_ligue(rows, method: str = "platt", min_samples: int = 80):
+    from collections import defaultdict
+
+    by_lig = defaultdict(list)
+    for lid, p, y in rows:
+        if p is None or y != y:
+            continue
+        by_lig[int(lid)].append((float(p), float(y)))
+
+    out = {"version": 1, "method": method, "min_samples": min_samples, "ligues": {}}
+    for lid, pairs in sorted(by_lig.items()):
+        if len(pairs) < min_samples:
+            continue
+        p, y = zip(*pairs)
+        if method == "isotonic":
+            xs, ys, brier = fit_isotonic_regression(p, y)
+            out["ligues"][str(lid)] = {
+                "method": "isotonic", "xs": xs, "ys": ys, "n_fit": len(pairs), "brier": brier,
+            }
+        else:
+            a, b, brier = fit_platt_scaling(p, y)
+            out["ligues"][str(lid)] = {
+                "method": "platt", "a": a, "b": b, "n_fit": len(pairs), "brier": brier,
+            }
+    return out
+
+
+def save_calibration_ah(data: dict, path: str | None = None) -> str:
+    import json
+    from datetime import datetime, timezone
+
+    path = path or FOOT_CALIB_AH_FILE_DEFAULT
+    payload = dict(data)
+    payload["computed_at"] = datetime.now(timezone.utc).isoformat()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return path
+
+
+def load_calibration_ah(path: str | None = None) -> dict:
+    import json
+
+    path = path or FOOT_CALIB_AH_FILE_DEFAULT
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def appliquer_calibrateur_ah(ligue_id, p_raw: float, store: dict | None = None) -> float:
+    if p_raw is None:
+        return p_raw
+    store = store if store is not None else load_calibration_ah()
+    model = (store.get("ligues") or {}).get(str(int(ligue_id)))
+    if not model:
+        return p_raw
+    if model.get("method") == "isotonic":
+        return appliquer_isotonic(p_raw, model.get("xs", []), model.get("ys", []))
+    return appliquer_platt(p_raw, model.get("a", 1.0), model.get("b", 0.0))
+
+
+def brier_score_prob(p_pred, outcomes) -> float | None:
+    p = np.asarray(p_pred, dtype=float)
+    y = np.asarray(outcomes, dtype=float)
+    if len(p) == 0:
+        return None
+    return float(np.mean((p - y) ** 2))
+
+
+# ──────────────────────────────────────────────────────────────
 # 🎯  CALIBRATION & BRIER (journal live / backtest)
 # ──────────────────────────────────────────────────────────────
 TRANCHES_EDGE_CALIBRATION = [

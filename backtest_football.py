@@ -41,9 +41,11 @@ Reset (avant de relancer le backtest / dashboard) :
   python backtest_football.py --simulate --ev-max-spreads 0.09 --report
       → Backtest avec plafond EV AH 9% (totaux inchanges)
 
-  python backtest_football.py --simulate --p1-ah --report
-      → P1 volume AH : EV max 9%%, EV min par tier (Top 7%% / Mid 6%% / Niche 5%%),
-        cap 45 signaux AH / ligue / saison (meilleurs EV)
+  python backtest_football.py --simulate --p1-ah --ev-max-totals 0.12 --calibrer-ah platt --report
+      → P1 + plafond totaux + calibration walk-forward AH
+
+  python backtest_football.py --fit-calibration platt
+      → Fit offline bt_signaux → foot_calibration_ah.json (live : FOOT_CALIB_AH=true)
 
 Dashboard Streamlit : après --report, menu ⋮ → Clear cache → Rerun
 Si le CSV distant PythonAnywhere est utilisé, uploader le nouveau backtest_results.csv.
@@ -82,6 +84,15 @@ from utils import (
     formater_objectifs_clv_ah_texte,
     get_ev_min_spreads_ligue,
     EV_MIN_SPREADS_TIER,
+    CalibrateurWalkForwardAH,
+    prob_implicite_ah,
+    ajuster_ev_proportionnel,
+    outcome_binaire_ah,
+    fit_calibration_ah_par_ligue,
+    save_calibration_ah,
+    brier_score_prob,
+    CALIB_AH_MIN_SAMPLES_PLATT,
+    CALIB_AH_MIN_SAMPLES_ISOTONIC,
 )
 
 load_project_env("foot")
@@ -424,7 +435,7 @@ async def persister_signaux(pending):
         print("\n  💾 bt_signaux vidée (0 signaux)")
         return 0
 
-    sql = "INSERT OR REPLACE INTO bt_signaux VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    sql = "INSERT OR REPLACE INTO bt_signaux VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     for attempt in range(8):
         try:
             async with aiosqlite.connect(DB_PATH, timeout=120.0) as conn:
@@ -519,9 +530,19 @@ async def init_db(conn):
             ga          INTEGER,
             resultat    REAL,
             clv         REAL,
+            p_modele    REAL,
+            p_cal       REAL,
             PRIMARY KEY (fixture_id, market, outcome, h_val)
         );
     """)
+    for migration in (
+        "ALTER TABLE bt_signaux ADD COLUMN p_modele REAL DEFAULT NULL",
+        "ALTER TABLE bt_signaux ADD COLUMN p_cal REAL DEFAULT NULL",
+    ):
+        try:
+            await conn.execute(migration)
+        except Exception:
+            pass
     await conn.commit()
 
 
@@ -1538,7 +1559,8 @@ def _ev_min_pour_marche(market, ligue_id, ev_min_l, ev_min_by_market=None,
 def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
                           markets=('spreads', 'totals'), poids_dyn=None,
                           ev_max_by_market=None, ev_min_by_market=None,
-                          ev_min_spreads_tier=False, ligue_id=None):
+                          ev_min_spreads_tier=False, ligue_id=None,
+                          calibrateur=None):
     """
     Candidats EV/Kelly pour un match — logique alignée simuler_paris() / bot live.
     Retourne [(ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag), ...]
@@ -1587,6 +1609,14 @@ def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
                 ev_pinnacle = ev_modele
             side_flag = is_over
 
+        p_modele, p_cal = None, None
+        if market == 'spreads':
+            p_modele = prob_implicite_ah(mat, h_val, is_home)
+            p_cal = p_modele
+            if calibrateur is not None and ligue_id is not None:
+                p_cal = calibrateur.apply(ligue_id, p_modele)
+                ev_modele = ajuster_ev_proportionnel(ev_modele, p_modele, p_cal)
+
         ev_final = ev_modele * poids_dyn + ev_pinnacle * (1.0 - poids_dyn)
         ev_cap = (ev_max_by_market or {}).get(market, ev_max_l)
         ev_floor = _ev_min_pour_marche(
@@ -1597,7 +1627,9 @@ def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
         mise = min(round(k * 100 * KELLY_FRAC, 2), 5.0)
         if mise < 0.1:
             continue
-        candidats.append((ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag))
+        candidats.append(
+            (ev_final, market, outcome, h_val, cote_h24, k, mise, side_flag, p_modele, p_cal)
+        )
     return candidats
 
 
@@ -1839,7 +1871,8 @@ async def tune_hyperparams_walkforward(conn, ligues=None, metric='loglik', clv_w
 
 
 async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_market=None,
-                        ev_min_spreads_tier=False, max_ah_ligue_saison=None):
+                        ev_min_spreads_tier=False, max_ah_ligue_saison=None,
+                        calibrer_ah=None):
     print("\n" + "="*60)
     print("🔬  PHASE 2 — SIMULATION DU MODÈLE")
     print("="*60)
@@ -1870,6 +1903,9 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
         print(f"  🎚️  EV min AH par tier : {tiers}")
     if max_ah_ligue_saison:
         print(f"  🎚️  Cap volume AH : {max_ah_ligue_saison} signaux max / ligue / saison (meilleurs EV)")
+    if calibrer_ah:
+        min_c = CALIB_AH_MIN_SAMPLES_ISOTONIC if calibrer_ah == "isotonic" else CALIB_AH_MIN_SAMPLES_PLATT
+        print(f"  📐 Calibration AH walk-forward : {calibrer_ah} (min {min_c} paris/ligue)")
 
     if n_odds == 0:
         print("\n  ⚠️  AUCUNE cote H-24 trouvée — la collecte d'odds a échoué.")
@@ -1905,6 +1941,7 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
 
         signaux = 0
         pending = []
+        calibrateur = CalibrateurWalkForwardAH(calibrer_ah) if calibrer_ah else None
         dc_cache = {}
         venue_cache = {}
         sos_cache = {}
@@ -1917,6 +1954,9 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
 
             if gh is None or ga is None:
                 continue
+
+            if calibrateur:
+                calibrateur.refit_ligue(ligue['id'])
 
             odds_h24 = odds_by_fid.get(fid)
             if not odds_h24:
@@ -1984,6 +2024,7 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
                 ev_min_by_market=ev_min_by_market,
                 ev_min_spreads_tier=ev_min_spreads_tier,
                 ligue_id=ligue['id'],
+                calibrateur=calibrateur,
             )
 
             if not candidats:
@@ -1997,7 +2038,10 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
                 if mk not in by_market:
                     by_market[mk] = row
 
-            for ev_final, market, outcome, h_val, cote_h24, k, mise, flag in by_market.values():
+            for row in by_market.values():
+                ev_final, market, outcome, h_val, cote_h24, k, mise, flag = row[:8]
+                p_modele = row[8] if len(row) > 8 else None
+                p_cal = row[9] if len(row) > 9 else None
                 # Cote de clôture
                 async with conn.execute(
                     "SELECT cote FROM bt_odds_cloture WHERE fixture_id=? AND market=? AND outcome=? AND h_val=?",
@@ -2018,8 +2062,15 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
                     fid, ligue['id'], saison, market, outcome, h_val,
                     cote_h24, cote_cloture, round(ev_final, 4), round(k, 4),
                     mise, gh, ga, res, clv,
+                    round(p_modele, 4) if p_modele is not None else None,
+                    round(p_cal, 4) if p_cal is not None else None,
                 ))
                 signaux += 1
+
+                if calibrateur and market == 'spreads' and p_modele is not None and res not in (None, 0.0):
+                    calibrateur.observe(
+                        ligue['id'], p_modele, outcome_binaire_ah(res),
+                    )
 
         if max_ah_ligue_saison:
             n_avant = len(pending)
@@ -2291,7 +2342,8 @@ async def charger_signaux(conn):
     async with conn.execute("""
         SELECT s.fixture_id, s.ligue_id, s.saison, s.market, s.outcome,
                s.h_val, s.cote_h24, s.cote_cloture, s.ev_modele, s.kelly,
-               s.mise, s.gh, s.ga, s.resultat, s.clv, f.date_utc
+               s.mise, s.gh, s.ga, s.resultat, s.clv, f.date_utc,
+               s.p_modele, s.p_cal
         FROM bt_signaux s
         JOIN bt_fixtures f ON f.id = s.fixture_id
         WHERE s.resultat IS NOT NULL
@@ -2299,6 +2351,49 @@ async def charger_signaux(conn):
     """) as cur:
         rows = await cur.fetchall()
     return [(*r, nom_par_id.get(r[1], str(r[1]))) for r in rows]
+
+
+async def fit_calibration_ah_db(conn, method='platt', min_samples=None, out_path=None):
+    """Fit Platt/isotonic par ligue sur bt_signaux (AH) → foot_calibration_ah.json."""
+    if min_samples is None:
+        min_samples = (
+            CALIB_AH_MIN_SAMPLES_ISOTONIC if method == "isotonic"
+            else CALIB_AH_MIN_SAMPLES_PLATT
+        )
+    try:
+        async with conn.execute(
+            "SELECT ligue_id, market, p_modele, resultat FROM bt_signaux "
+            "WHERE p_modele IS NOT NULL AND resultat IS NOT NULL"
+        ) as cur:
+            rows = await cur.fetchall()
+    except Exception:
+        print("\n  ❌ Colonne p_modele absente — relancez d'abord :")
+        print("     python backtest_football.py --simulate --p1-ah --report")
+        return None
+
+    if not rows:
+        print("\n  ❌ Aucun p_modele en base — relancez --simulate (stocke p_modele sur chaque AH).")
+        return None
+
+    fit_rows = []
+    for lid, mk, p_mod, res in rows:
+        if mk != 'spreads' or p_mod is None or res in (None, 0.0):
+            continue
+        fit_rows.append((lid, p_mod, outcome_binaire_ah(res)))
+
+    if not fit_rows:
+        print("\n  ❌ Aucun pari AH avec p_modele exploitable.")
+        return None
+
+    data = fit_calibration_ah_par_ligue(fit_rows, method=method, min_samples=min_samples)
+    path = save_calibration_ah(data, path=out_path)
+    n_lig = len(data.get("ligues", {}))
+    print(f"\n  📐 Calibration AH ({method}) : {n_lig} ligue(s) fitées → {path}")
+    for lid_s, m in sorted(data.get("ligues", {}).items(), key=lambda x: int(x[0])):
+        nom = next((c['nom'] for c in CHAMPIONNATS if c['id'] == int(lid_s)), lid_s)
+        brier = m.get("brier", float('nan'))
+        print(f"     {nom:<18} n={m.get('n_fit', 0):>4}  Brier={brier:.4f}")
+    return path
 
 
 async def generer_rapport(conn):
@@ -2478,12 +2573,33 @@ async def generer_rapport(conn):
         ev_moy = np.mean([s[8] for s in rows_t])
         print(f"  EV [{lo:.0%}-{hi:.0%}]  n={n_t:>4}  Win={wr:.1%}  EV_moy={ev_moy:+.2%}")
 
+    ah_cal = [
+        s for s in signaux
+        if s[3] == 'spreads' and len(s) > 16 and s[16] is not None and s[13] not in (None, 0.0)
+    ]
+    if ah_cal:
+        y = [outcome_binaire_ah(s[13]) for s in ah_cal]
+        p_raw = [s[16] for s in ah_cal]
+        p_cal = [s[17] if len(s) > 17 and s[17] is not None else s[16] for s in ah_cal]
+        b_raw = brier_score_prob(p_raw, y)
+        b_cal = brier_score_prob(p_cal, y)
+        print(f"\n{'─'*50}")
+        print(f"  CALIBRATION P(couverture) AH — Brier (n={len(ah_cal)})")
+        print(f"{'─'*50}")
+        if b_raw is not None:
+            print(f"  Brier P brut (p_modele)     : {b_raw:.4f}")
+        if b_cal is not None and any(len(s) > 17 and s[17] is not None for s in ah_cal):
+            print(f"  Brier P calibré (p_cal)     : {b_cal:.4f}")
+            if b_raw is not None and b_cal < b_raw:
+                print(f"  → Gain Brier : {b_raw - b_cal:+.4f}")
+
     # ── Export CSV ──────────────────────────────────────────
     csv_path = "backtest_results.csv"
     async with conn.execute("""
         SELECT s.fixture_id, s.ligue_id, s.saison, s.market, s.outcome,
                s.h_val, s.cote_h24, s.cote_cloture, s.ev_modele, s.kelly,
-               s.mise, s.gh, s.ga, s.resultat, s.clv, f.date_utc
+               s.mise, s.gh, s.ga, s.resultat, s.clv, f.date_utc,
+               s.p_modele, s.p_cal
         FROM bt_signaux s
         JOIN bt_fixtures f ON f.id = s.fixture_id
         WHERE s.resultat IS NOT NULL
@@ -2495,7 +2611,8 @@ async def generer_rapport(conn):
         w = csv.writer(f)
         w.writerow(['fixture_id', 'ligue_id', 'saison', 'market', 'outcome',
                     'h_val', 'cote_h24', 'cote_cloture', 'ev_modele', 'kelly',
-                    'mise', 'gh', 'ga', 'resultat', 'clv', 'date_utc'])
+                    'mise', 'gh', 'ga', 'resultat', 'clv', 'date_utc',
+                    'p_modele', 'p_cal'])
         w.writerows(rows_csv)
 
     print(f"\n📄 Résultats détaillés exportés dans {csv_path}")
@@ -2585,6 +2702,12 @@ async def main():
                         help='Cap signaux AH / ligue / saison (meilleurs EV). Backtest only.')
     parser.add_argument('--p1-ah', action='store_true',
                         help='Preset volume AH : ev-max-spreads 9%%, ev-min tier, cap 45 AH/ligue/saison')
+    parser.add_argument('--calibrer-ah', type=str, default=None, choices=('platt', 'isotonic'),
+                        help='Calibration walk-forward P(couverture) AH par ligue (backtest only)')
+    parser.add_argument('--fit-calibration', type=str, default=None, choices=('platt', 'isotonic'),
+                        help='Fit offline bt_signaux → foot_calibration_ah.json')
+    parser.add_argument('--fit-cal-min', type=int, default=None,
+                        help='Min paris AH/ligue pour --fit-calibration (defaut 80 platt / 100 isotonic)')
     parser.add_argument('--saisons', type=str, default=None,
                         help='Saisons API à collecter (ex: 2025 ou 2023,2024,2025). Défaut : config ligue.')
     parser.add_argument('--europe-only', action='store_true',
@@ -2646,13 +2769,19 @@ async def main():
     elif args.reset:
         await reset_backtest(full=False)
 
-    run_phases = args.collect or args.simulate or args.report or args.tune or args.explore_ev
+    run_phases = (
+        args.collect or args.simulate or args.report or args.tune or args.explore_ev
+        or args.fit_calibration
+    )
     all_phases = not run_phases and not args.reset and not args.reset_full
 
     if not run_phases and not all_phases:
         return
 
-    needs_db = args.simulate or args.report or args.tune or args.explore_ev or all_phases
+    needs_db = (
+        args.simulate or args.report or args.tune or args.explore_ev
+        or args.fit_calibration or all_phases
+    )
     if needs_db and os.path.exists(DB_PATH) and not verifier_fichier_db():
         return
 
@@ -2684,7 +2813,18 @@ async def main():
                         ev_min_by_market=ev_min_by_market,
                         ev_min_spreads_tier=ev_min_spreads_tier,
                         max_ah_ligue_saison=max_ah_ligue_saison,
+                        calibrer_ah=args.calibrer_ah,
                     )) >= 0
+            if args.fit_calibration:
+                min_fit = args.fit_cal_min
+                if min_fit is None:
+                    min_fit = (
+                        CALIB_AH_MIN_SAMPLES_ISOTONIC if args.fit_calibration == "isotonic"
+                        else CALIB_AH_MIN_SAMPLES_PLATT
+                    )
+                await fit_calibration_ah_db(
+                    conn, method=args.fit_calibration, min_samples=min_fit,
+                )
             if args.explore_ev:
                 signaux = await charger_signaux(conn)
                 explore_ev_filtres(signaux)
