@@ -32,6 +32,7 @@ Reset (avant de relancer le backtest / dashboard) :
 
   python backtest_football.py --tune --tune-metric clv
       → Calibration walk-forward orientee CLV AH (H-24 vs cloture Pinnacle)
+      → Grille inclut dc_xg_blend (poids DC vs xG, plus le 50/50 fixe)
 
   python backtest_football.py --tune --tune-metric blend --tune-clv-weight 0.6
 
@@ -72,6 +73,7 @@ from foot_params import (
     N_PRIOR_DEFAULT,
     RHO_DEFAULT,
     get_dc_half_life_days,
+    get_dc_xg_blend,
     get_n_prior,
     get_rho_fallback,
     get_xg_half_life_days,
@@ -1331,13 +1333,14 @@ async def estimer_parametres_dc_bt(conn, ligue_id, saison, avant_date, mu_h, mu_
 
 
 def calculer_lambda_blend(dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e, m_dom_l, m_ext_l,
-                          ligue_id=None, mot_map=None, luck_map=None, rho_fallback=None):
+                          ligue_id=None, mot_map=None, luck_map=None, rho_fallback=None,
+                          dc_weight=None):
     """
     Calcule L_A / L_B avec la même logique que analyser_un_match() du bot live :
       λ_xg : formule venue-normalisée (xg_off × xg_def_adverse / moyenne ligue)
       motivation + PDO (mot_map / luck_map) appliqués sur l'attaque
       λ_dc : attack × defense × γ
-      blend 50/50 si DC disponible pour les deux équipes, sinon xG pur.
+      blend DC/xG (dc_weight depuis foot_params_tuned, défaut 0.50).
     """
     if not m_dom_l or not m_ext_l:
         m_dom_l, m_ext_l = max(m_dom_l or 1.4, 0.1), max(m_ext_l or 1.1, 0.1)
@@ -1361,8 +1364,12 @@ def calculer_lambda_blend(dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e
         te = dc['teams'][a_id]
         L_A_dc = td['attack'] * te['defense'] * dc['gamma']
         L_B_dc = te['attack'] * td['defense']
-        L_A = 0.50 * L_A_dc + 0.50 * L_A_xg
-        L_B = 0.50 * L_B_dc + 0.50 * L_B_xg
+        if dc_weight is None:
+            dc_weight = get_dc_xg_blend(ligue_id) if ligue_id is not None else 0.50
+        w_dc = max(0.0, min(1.0, float(dc_weight)))
+        w_xg = 1.0 - w_dc
+        L_A = w_dc * L_A_dc + w_xg * L_A_xg
+        L_B = w_dc * L_B_dc + w_xg * L_B_xg
         rho = dc['rho']
     else:
         L_A, L_B = L_A_xg, L_B_xg
@@ -1494,13 +1501,15 @@ TUNE_GRID_N_PRIOR = [6, 8, 11]
 TUNE_GRID_RHO = [-0.14, -0.11, -0.08]
 TUNE_GRID_XG_HL = [35, 46, 58]
 TUNE_GRID_DC_HL = [75, 90, 120]
+TUNE_GRID_DC_XG_BLEND = [0.30, 0.40, 0.50, 0.60, 0.70]
 TUNE_MIN_MATCHS = 80
 TUNE_MIN_CLV_SIGNALS = 30
 TUNE_METRICS = ('loglik', 'clv', 'blend')
 
 
 async def _lambdas_pour_match(conn, ligue, saison, date_utc, h_id, a_id,
-                              n_prior, xg_half_life, dc_half_life, rho_fallback, caches):
+                              n_prior, xg_half_life, dc_half_life, rho_fallback, caches,
+                              dc_xg_blend=None):
     """λ_home / λ_away / rho — données strictement avant date_utc."""
     ligue_id = ligue['id']
     jour = _jour_cache(date_utc)
@@ -1544,6 +1553,7 @@ async def _lambdas_pour_match(conn, ligue, saison, date_utc, h_id, a_id,
     return calculer_lambda_blend(
         dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e, m_dom_l, m_ext_l, ligue_id,
         mot_map=mot_map, luck_map=luck_map, rho_fallback=rho_fallback,
+        dc_weight=dc_xg_blend,
     )
 
 
@@ -1691,6 +1701,7 @@ async def _eval_params_tune(
             conn, ligue, saison, date_utc, h_id, a_id,
             params['n_prior'], params['xg_half_life_days'], params['dc_half_life_days'],
             params['rho'], caches,
+            dc_xg_blend=params.get('dc_xg_blend'),
         )
         mat = generer_matrice(L_A, L_B, rho)
 
@@ -1711,7 +1722,7 @@ async def _eval_params_tune(
             if not candidats:
                 continue
             candidats.sort(key=lambda x: x[0], reverse=True)
-            _, market, outcome, h_val, cote_h24, _, _, _ = candidats[0]
+            _, market, outcome, h_val, cote_h24, *_ = candidats[0]
             sig_n += 1
             cote_cloture = close_by_key.get((fid, market, outcome, h_val))
             if cote_cloture and cote_cloture > 1.0:
@@ -1767,7 +1778,11 @@ async def tune_ligue_walkforward(conn, ligue, fixtures, metric='loglik', clv_wei
             print(f"  ⚠️ {ligue['nom']} : pas de cotes H-24 — tuning CLV impossible", flush=True)
             return None
 
-    n_eval = len(TUNE_GRID_N_PRIOR) * len(TUNE_GRID_XG_HL) + len(TUNE_GRID_RHO) * len(TUNE_GRID_DC_HL)
+    n_eval = (
+        len(TUNE_GRID_N_PRIOR) * len(TUNE_GRID_XG_HL)
+        + len(TUNE_GRID_RHO) * len(TUNE_GRID_DC_HL)
+        + len(TUNE_GRID_DC_XG_BLEND)
+    )
     start = max(TUNE_MIN_MATCHS // 2, len(fixtures) // 4)
     n_scored = len(fixtures) - start
     metric_label = {'loglik': 'log P(score)', 'clv': 'CLV AH moyen', 'blend': f'blend CLV/logP ({clv_weight:.0%} CLV)'}
@@ -1782,6 +1797,7 @@ async def tune_ligue_walkforward(conn, ligue, fixtures, metric='loglik', clv_wei
         'rho': get_rho_fallback(ligue['id']),
         'xg_half_life_days': get_xg_half_life_days(ligue['id']),
         'dc_half_life_days': get_dc_half_life_days(ligue['id']),
+        'dc_xg_blend': get_dc_xg_blend(ligue['id']),
     }
     best_score = float('-inf')
     best_stats: dict = {}
@@ -1810,6 +1826,11 @@ async def tune_ligue_walkforward(conn, ligue, fixtures, metric='loglik', clv_wei
             p = {**best, 'rho': rho, 'dc_half_life_days': dc_hl}
             await _try_params(p, f"[{step}/{n_eval}] rho={rho:.2f} dc_hl={dc_hl}j")
 
+    for dc_w in TUNE_GRID_DC_XG_BLEND:
+        step += 1
+        p = {**best, 'dc_xg_blend': dc_w}
+        await _try_params(p, f"[{step}/{n_eval}] dc_xg_blend={dc_w:.2f}")
+
     if best_stats.get('mean_log_score') is not None:
         best['mean_log_score'] = best_stats['mean_log_score']
     if best_stats.get('mean_clv') is not None:
@@ -1820,6 +1841,7 @@ async def tune_ligue_walkforward(conn, ligue, fixtures, metric='loglik', clv_wei
     print(
         f"  ✅ {ligue['nom']} : n_prior={best['n_prior']} rho={best['rho']:.2f} "
         f"xg_hl={best['xg_half_life_days']:.0f}j dc_hl={best['dc_half_life_days']:.0f}j "
+        f"dc_blend={best['dc_xg_blend']:.2f} "
         f"({_format_tune_score(metric, best_score, best_stats)})",
         flush=True,
     )
@@ -1838,7 +1860,8 @@ async def tune_hyperparams_walkforward(conn, ligues=None, metric='loglik', clv_w
     else:
         print(f"  Metrique : blend {clv_weight:.0%} CLV + {1-clv_weight:.0%} log P(score)", flush=True)
     print(f"  Grilles : n_prior{TUNE_GRID_N_PRIOR}, rho{TUNE_GRID_RHO}, "
-          f"xg_hl{TUNE_GRID_XG_HL}, dc_hl{TUNE_GRID_DC_HL}", flush=True)
+          f"xg_hl{TUNE_GRID_XG_HL}, dc_hl{TUNE_GRID_DC_HL}, "
+          f"dc_blend{TUNE_GRID_DC_XG_BLEND}", flush=True)
     print("  (1ere combinaison lente : DC MLE + xG par match — ~5–15 min/ligue)", flush=True)
 
     ligues = ligues or CHAMPIONNATS
@@ -1891,7 +1914,7 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
     print(f"  🎯 Entrées xG en base     : {n_xg}")
     if n_old:
         print(f"  📦 Signaux existants      : {n_old} (seront remplacés si écriture OK)")
-    print("  🧮 Modèle : blend 50/50 DC + xG, poids_dyn dynamique (formule bot live)")
+    print("  🧮 Modèle : blend DC + xG (poids/ligue via foot_params_tuned), poids_dyn dynamique (formule bot live)")
     if ev_max_by_market:
         parts = [f"{mk}≤{cap:.0%}" for mk, cap in sorted(ev_max_by_market.items())]
         print(f"  🎚️  Plafonds EV backtest : {', '.join(parts)}")
@@ -2007,10 +2030,11 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
                 )
             dc = dc_cache[dc_key]
 
-            # λ blend 50/50 DC + xG + motivation/PDO — aligné sur analyser_un_match() du bot live
+            # λ blend DC + xG + motivation/PDO — aligné sur analyser_un_match() du bot live
             L_A, L_B, rho = calculer_lambda_blend(
                 dc, h_id, a_id, xg_off_d, xg_def_d, xg_off_e, xg_def_e, m_dom_l, m_ext_l, ligue['id'],
                 mot_map=mot_map, luck_map=luck_map,
+                dc_weight=get_dc_xg_blend(ligue['id']),
             )
 
             mat = generer_matrice(L_A, L_B, rho)

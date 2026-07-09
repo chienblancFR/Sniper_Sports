@@ -9,7 +9,7 @@ from config_env import load_project_env
 
 load_project_env("foot")
 from odds_devig import cote_fair_2way
-from foot_params import RHO_DEFAULT, get_dc_half_life_days, get_n_prior, get_rho_fallback, xg_decay_rate
+from foot_params import RHO_DEFAULT, get_dc_half_life_days, get_dc_xg_blend, get_n_prior, get_rho_fallback, xg_decay_rate
 from utils import (
     appliquer_calibrateur_ah,
     ajuster_ev_proportionnel,
@@ -1846,14 +1846,16 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
     # --- 🧮 ENRICHISSEMENT DIXON-COLES COMPLET ---
     # Si les paramètres α/β/γ/ρ par équipe sont disponibles (MLE quotidien),
     # on blende les λ xG (forme récente) avec les λ DC (structure saison entière).
-    # Blend 50/50 : DC apporte la structure, xG apporte la forme récente.
+    # Poids DC/xG par ligue (foot_params_tuned.json, défaut 50/50).
     dc = DC_PARAMS.get((ligue['id'], saison_correcte))
     if dc and id_d in dc['teams'] and id_e in dc['teams']:
         td, te = dc['teams'][id_d], dc['teams'][id_e]
         L_A_dc = td['attack'] * te['defense'] * dc['gamma']
         L_B_dc = te['attack'] * td['defense']
-        L_A_base = 0.50 * L_A_dc + 0.50 * L_A_base
-        L_B_base = 0.50 * L_B_dc + 0.50 * L_B_base
+        w_dc = get_dc_xg_blend(ligue['id'])
+        w_xg = 1.0 - w_dc
+        L_A_base = w_dc * L_A_dc + w_xg * L_A_base
+        L_B_base = w_dc * L_B_dc + w_xg * L_B_base
         # Propager ρ DC (estimé conjointement, plus fiable)
         RHO_DYNAMIQUE[(ligue['id'], saison_correcte)] = dc['rho']
 

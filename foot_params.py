@@ -20,6 +20,7 @@ N_PRIOR_DEFAULT = 8
 RHO_DEFAULT = -0.12
 XG_HALF_LIFE_DEFAULT = 46.0
 DC_HALF_LIFE_DEFAULT = 90.0
+DC_XG_BLEND_DEFAULT = 0.50  # poids λ_DC (1 - blend = λ_xG)
 
 N_PRIOR_PAR_LIGUE: dict[int, int] = {
     140: 7, 39: 7, 135: 7, 40: 7, 78: 8, 61: 8, 141: 8,
@@ -87,6 +88,14 @@ def get_dc_half_life_days(ligue_id: int) -> float:
     if "dc_half_life_days" in entry:
         return float(entry["dc_half_life_days"])
     return DC_HALF_LIFE_DEFAULT
+
+
+def get_dc_xg_blend(ligue_id: int) -> float:
+    """Poids λ_DC dans le blend (0=xG pur, 1=DC pur). Défaut 0.50."""
+    entry = _ligue_entry(ligue_id)
+    if "dc_xg_blend" in entry:
+        return max(0.0, min(1.0, float(entry["dc_xg_blend"])))
+    return DC_XG_BLEND_DEFAULT
 
 
 def xg_decay_rate(ligue_id: int) -> float:
