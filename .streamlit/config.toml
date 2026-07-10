@@ -2,6 +2,9 @@
 headless = true
 enableCORS = false
 enableXsrfProtection = true
+# Cloud : évite watchdog/inotify → segfault au démarrage
+fileWatcherType = "none"
+folderWatchBlacklist = ["data", "don_ranges", "__pycache__", ".git", "env"]
 
 [browser]
 gatherUsageStats = false
