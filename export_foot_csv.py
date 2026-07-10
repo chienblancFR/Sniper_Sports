@@ -108,7 +108,7 @@ def export_csv(db_path: str, csv_path: str) -> int:
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(headers)
         writer.writerows(rows)

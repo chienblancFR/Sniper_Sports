@@ -65,6 +65,33 @@ def convertir_dates(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def reparer_mojibake_utf8(val):
+    """Corrige UTF-8 lu à tort en Latin-1 (MjÃ¤llby → Mjällby, drapeaux 🇸🇪)."""
+    if val is None:
+        return val
+    try:
+        if pd.isna(val):
+            return val
+    except (TypeError, ValueError):
+        pass
+    text = str(val)
+    if "Ã" not in text and "ðŸ" not in text:
+        return val
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return val
+
+
+def reparer_mojibake_dataframe(df: pd.DataFrame, colonnes: list | None = None) -> pd.DataFrame:
+    """Applique reparer_mojibake_utf8 sur les colonnes texte du journal live."""
+    cols = colonnes or [c for c in df.columns if df[c].dtype == object]
+    for col in cols:
+        if col in df.columns:
+            df[col] = df[col].apply(reparer_mojibake_utf8)
+    return df
+
+
 # ──────────────────────────────────────────────────────────────
 # 🛑  ALERTES DE CHARGEMENT
 # ──────────────────────────────────────────────────────────────

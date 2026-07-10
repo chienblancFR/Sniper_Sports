@@ -25,6 +25,7 @@ from utils import (
     filtre_temporel_sidebar,
     nettoyer_colonnes_numeriques,
     preparer_df_backtest,
+    reparer_mojibake_dataframe,
     verifier_authentification,
 )
 
@@ -90,6 +91,10 @@ def _score_csv(df: pd.DataFrame, mtime: float) -> tuple:
     return (n_pending, mtime)
 
 
+def _sur_pythonanywhere() -> bool:
+    return os.path.isdir(PA_DATA_DIR)
+
+
 def _lire_csv_utf8(source) -> pd.DataFrame:
     """CSV UTF-8 (fichier ou bytes) — évite mojibake MjÃ¤llby / drapeaux sur URL PA."""
     if isinstance(source, (bytes, bytearray)):
@@ -98,10 +103,31 @@ def _lire_csv_utf8(source) -> pd.DataFrame:
     return pd.read_csv(source, encoding="utf-8-sig")
 
 
+def _charger_csv_url(url: str, fichier_local: str):
+    """Télécharge le CSV PA (source de vérité hors PythonAnywhere)."""
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code == 200:
+            df = _lire_csv_utf8(r.content)
+            if not df.empty:
+                n_p = _score_csv(df, 0)[0]
+                return df, "ok", f"URL PA · {fichier_local} ({n_p} PENDING / {len(df)} lignes)"
+            return df, "empty", f"URL PA · {fichier_local} (vide)"
+        return pd.DataFrame(), "missing", f"URL HTTP {r.status_code}"
+    except Exception as e:
+        return pd.DataFrame(), "missing", f"URL: {e}"
+
+
 def _charger_csv(url: str, fichier_local: str):
-    """Fichier local le plus récent / avec le plus de PENDING → URL PA → absent."""
+    """Cloud : URL PA d'abord. PA : fichiers locaux puis URL."""
     erreurs = []
     best_df, best_src, best_score = None, None, (-1, -1.0)
+
+    if not _sur_pythonanywhere():
+        df_url, stat_url, src_url = _charger_csv_url(url, fichier_local)
+        if stat_url == "ok":
+            return df_url, stat_url, src_url
+        erreurs.append(src_url)
 
     for path in _candidats_fichiers(fichier_local):
         if not os.path.isfile(path):
@@ -125,17 +151,10 @@ def _charger_csv(url: str, fichier_local: str):
     if best_df is not None:
         return best_df, "ok", best_src
 
-    try:
-        r = requests.get(url, timeout=20)
-        if r.status_code == 200:
-            df = _lire_csv_utf8(r.content)
-            if not df.empty:
-                n_p = _score_csv(df, 0)[0]
-                return df, "ok", f"URL PA · {fichier_local} ({n_p} PENDING / {len(df)} lignes)"
-            return df, "empty", f"URL PA · {fichier_local} (vide)"
-        erreurs.append(f"URL HTTP {r.status_code}")
-    except Exception as e:
-        erreurs.append(f"URL: {e}")
+    df_url, stat_url, src_url = _charger_csv_url(url, fichier_local)
+    if stat_url == "ok":
+        return df_url, stat_url, src_url
+    erreurs.append(src_url)
 
     return pd.DataFrame(), "missing", " | ".join(erreurs) if erreurs else "introuvable"
 
@@ -184,6 +203,7 @@ def _charger_foot_depuis_db(db_path: str | None = None):
 
 
 def _enrichir_df_live(df: pd.DataFrame) -> pd.DataFrame:
+    df = reparer_mojibake_dataframe(df)
     colonnes_numeriques = ["Cote_Prise", "Mise", "Cote_Cloture", "Edge", "Prob_Modele", "CLV", "Profit_Unites"]
     df = nettoyer_colonnes_numeriques(df, colonnes_numeriques)
     df = convertir_dates(df)
@@ -219,7 +239,10 @@ def _enrichir_df_live(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(ttl=60)
 def load_football_data():
     df_csv, stat_csv, src_csv = _charger_csv(URL_FOOT, "historique_sniper.csv")
-    df_db, stat_db, src_db = _charger_foot_depuis_db()
+    if _sur_pythonanywhere() or os.environ.get("FOOT_SNIPER_DB"):
+        df_db, stat_db, src_db = _charger_foot_depuis_db()
+    else:
+        df_db, stat_db, src_db = pd.DataFrame(), "missing", "SQLite ignoré (Streamlit Cloud)"
 
     def _n_pending(d: pd.DataFrame) -> int:
         if d is None or d.empty or "Statut" not in d.columns:
