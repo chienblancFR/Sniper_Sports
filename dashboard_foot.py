@@ -90,6 +90,14 @@ def _score_csv(df: pd.DataFrame, mtime: float) -> tuple:
     return (n_pending, mtime)
 
 
+def _lire_csv_utf8(source) -> pd.DataFrame:
+    """CSV UTF-8 (fichier ou bytes) — évite mojibake MjÃ¤llby / drapeaux sur URL PA."""
+    if isinstance(source, (bytes, bytearray)):
+        text = bytes(source).decode("utf-8-sig")
+        return pd.read_csv(StringIO(text))
+    return pd.read_csv(source, encoding="utf-8-sig")
+
+
 def _charger_csv(url: str, fichier_local: str):
     """Fichier local le plus récent / avec le plus de PENDING → URL PA → absent."""
     erreurs = []
@@ -99,7 +107,7 @@ def _charger_csv(url: str, fichier_local: str):
         if not os.path.isfile(path):
             continue
         try:
-            df = pd.read_csv(path)
+            df = _lire_csv_utf8(path)
             if df.empty:
                 erreurs.append(f"{path}: vide")
                 continue
@@ -120,7 +128,7 @@ def _charger_csv(url: str, fichier_local: str):
     try:
         r = requests.get(url, timeout=20)
         if r.status_code == 200:
-            df = pd.read_csv(StringIO(r.text))
+            df = _lire_csv_utf8(r.content)
             if not df.empty:
                 n_p = _score_csv(df, 0)[0]
                 return df, "ok", f"URL PA · {fichier_local} ({n_p} PENDING / {len(df)} lignes)"
@@ -407,7 +415,7 @@ if section == "📡 Live Performance":
     st.subheader("📡 Radar Football : Signaux Actifs / En attente de dénouement")
     if not df_attente.empty:
         df_att_display = df_attente.copy()
-        colonnes_attente = ["Date", "Nom_Ligue", "Match", "Cote_Prise", "Mise", "Edge"]
+        colonnes_attente = ["Date", "Nom_Ligue", "Type_Marche", "Match", "Cote_Prise", "Mise", "Edge"]
         if "CLV" in df_att_display.columns:
             colonnes_attente.append("CLV")
             df_att_display["CLV"] = (df_att_display["CLV"] * 100).round(2)
@@ -438,7 +446,7 @@ if section == "📡 Live Performance":
     st.subheader("📰 Journal de bord : 10 dernières rencontres clôturées")
     if not df_termines.empty:
         df_derniers = df_termines.sort_values("Date", ascending=False).head(10)
-        colonnes_hist = ["Date", "Nom_Ligue", "Match", "Cote_Prise", "Mise", "Statut", "Profit_Unites"]
+        colonnes_hist = ["Date", "Nom_Ligue", "Type_Marche", "Match", "Cote_Prise", "Mise", "Statut", "Profit_Unites"]
 
         def style_statut(val):
             if val in ['WON', 'HALF-WON']:   return 'color: #00FF00; font-weight: bold'

@@ -1311,7 +1311,7 @@ async def exporter_historique_csv():
     csv_path = _chemin_historique_csv()
     os.makedirs(os.path.dirname(csv_path), exist_ok=True) if os.path.dirname(csv_path) else None
 
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
         writer = csv.writer(f)
         writer.writerow(colonnes)
         writer.writerows(rows)
