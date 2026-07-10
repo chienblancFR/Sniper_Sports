@@ -1,0 +1,4 @@
+# Bots locaux / PythonAnywhere — installer en plus du requirements.txt
+-r requirements.txt
+scipy==1.11.4
+python-dotenv==1.0.1

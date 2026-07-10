@@ -6,7 +6,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from utils import (
+from utils_mlb_dashboard import (
     afficher_alertes_chargement,
     calculer_max_drawdown,
     convertir_dates,
