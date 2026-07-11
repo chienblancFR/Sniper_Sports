@@ -120,7 +120,8 @@ FOOT_KELLY_BRIER_MIN_PARIS = int(os.environ.get("FOOT_KELLY_BRIER_MIN_PARIS", "2
 FOOT_KELLY_BSS_SENSIBILITE = float(os.environ.get("FOOT_KELLY_BSS_SENSIBILITE", "0.30"))
 FOOT_KELLY_BSS_MULT_MIN = float(os.environ.get("FOOT_KELLY_BSS_MULT_MIN", "0.4"))
 
-# Tracker CLV (Telegram H-1h / H-5min) — cote Pinnacle sur la ligne exacte du pari
+# Tracker CLV (Telegram H-1h / H-5min) — ligne exacte, repli proche si retirée de l'API
+FOOT_CLV_LIGNE_TOL = float(os.environ.get("FOOT_CLV_LIGNE_TOL", "0.26"))
 FOOT_CLV_SCORE_MIN = int(os.environ.get("FOOT_CLV_SCORE_MIN", "80"))
 FOOT_CLV_SCORE_MIN_RELAX = int(os.environ.get("FOOT_CLV_SCORE_MIN_RELAX", "75"))
 FOOT_CLV_ALERT_ECHEC = _env_bool("FOOT_CLV_ALERT_ECHEC", True)
@@ -2553,6 +2554,15 @@ def _ligne_clv_exacte(h_pari: float, h_api: float) -> bool:
     return a == b
 
 
+def _equipe_clv_match(equipe: str, nom_api: str, eq_dom: str = "", eq_ext: str = "") -> bool:
+    """Même côté — NAME_MAPPING + accents (Mjällby AIF / Mjallby)."""
+    cibles = {_normaliser_equipe_clv(equipe)}
+    for ref in (eq_dom, eq_ext):
+        if ref:
+            cibles.add(_normaliser_equipe_clv(ref))
+    return _normaliser_equipe_clv(nom_api) in cibles
+
+
 def _formater_pari_clv(equipe: str, handicap: float, market_key: str) -> str:
     """Libellé Telegram CLV — totaux sans signe +, AH avec (+/-)."""
     h = float(handicap)
@@ -2562,7 +2572,8 @@ def _formater_pari_clv(equipe: str, handicap: float, market_key: str) -> str:
     return f"{sel} ({h:+g})"
 
 
-def _lignes_pin_disponibles(market, equipe: str, market_key: str) -> list[float]:
+def _lignes_pin_disponibles(market, equipe: str, market_key: str,
+                            eq_dom: str = "", eq_ext: str = "") -> list[float]:
     """Lignes Pinnacle proposées pour le même côté (diagnostic CLV)."""
     if market_key == 'totals':
         return sorted({
@@ -2570,14 +2581,46 @@ def _lignes_pin_disponibles(market, equipe: str, market_key: str) -> list[float]
             for o in market.get('outcomes', [])
             if o['name'].lower() == str(equipe).lower()
         })
-    lignes = []
+    return sorted({
+        round(float(o.get('point', 0)), 2)
+        for o in market.get('outcomes', [])
+        if o['name'].lower() not in ('over', 'under')
+        and _equipe_clv_match(equipe, o['name'], eq_dom, eq_ext)
+    })
+
+
+def _outcome_clv_fallback(market, equipe, handicap, market_key, eq_dom="", eq_ext=""):
+    """
+    Repli : même côté, ligne la plus proche (foot AH = 1 ligne principale sur l'API).
+    Les totaux gardent toutes les lignes quand elles sont exposées.
+    """
+    tol = FOOT_CLV_LIGNE_TOL
+    h_pari = float(handicap)
+    candidats = []
     for o in market.get('outcomes', []):
-        if o['name'].lower() in ('over', 'under'):
+        if market_key == 'totals':
+            if o['name'].lower() != str(equipe).lower():
+                continue
+        else:
+            if o['name'].lower() in ('over', 'under'):
+                continue
+            if not _equipe_clv_match(equipe, o['name'], eq_dom, eq_ext):
+                continue
+        h_api = float(o.get('point', 0))
+        if _ligne_clv_exacte(h_pari, h_api):
             continue
-        score = process.extractOne(equipe, [o['name']])[1]
-        if score >= FOOT_CLV_SCORE_MIN_RELAX:
-            lignes.append(round(float(o.get('point', 0)), 2))
-    return sorted(set(lignes))
+        dist = abs(h_api - h_pari)
+        if dist <= tol:
+            candidats.append((dist, o))
+    if not candidats:
+        return None
+    _, best = min(candidats, key=lambda x: x[0])
+    h_ref = float(best.get('point', 0))
+    log_info(
+        f"[CLV] Ligne repli {market_key} : {equipe} {h_pari:g} -> Pinnacle {h_ref:g} "
+        f"({eq_dom} vs {eq_ext})"
+    )
+    return best
 
 
 def _normaliser_equipe_clv(nom: str) -> str:
@@ -2617,60 +2660,116 @@ def _trouver_event_clv(data, eq_dom: str, eq_ext: str):
     return None, f"event_introuvable (best={best_score:.0f})"
 
 
-def _trouver_outcome_clv(market, equipe, handicap, market_key, eq_dom="", eq_ext=""):
-    """Match outcome Pinnacle — ligne exacte du pari parmi toutes les lignes proposées."""
-    if market_key == 'totals':
-        return next(
-            (o for o in market['outcomes']
-             if o['name'].lower() == str(equipe).lower()
-             and _ligne_clv_exacte(handicap, float(o.get('point', 0)))),
-            None,
-        )
+def _marche_clv_alternatif(market_key: str) -> str:
+    return 'alternate_totals' if market_key == 'totals' else 'alternate_spreads'
 
-    best, best_score = None, 0
-    for o in market['outcomes']:
-        if o['name'].lower() in ('over', 'under'):
+
+def _fusionner_marches_pinnacle(pinnacle: dict, market_key: str) -> dict | None:
+    """Fusionne ligne principale + alternate_* (toutes les lignes Pinnacle foot)."""
+    alt_key = _marche_clv_alternatif(market_key)
+    cles = {market_key, alt_key}
+    fusion: dict[tuple, dict] = {}
+    for mkt in pinnacle.get('markets', []):
+        if mkt.get('key') not in cles:
             continue
-        if not _ligne_clv_exacte(handicap, float(o.get('point', 0))):
-            continue
-        score = process.extractOne(equipe, [o['name']])[1]
-        if score > best_score:
-            best_score, best = score, o
-    if best_score >= FOOT_CLV_SCORE_MIN:
-        return best
-    for o in market['outcomes']:
-        if o['name'].lower() in ('over', 'under'):
-            continue
-        if not _ligne_clv_exacte(handicap, float(o.get('point', 0))):
-            continue
-        if o['name'] in (eq_dom, eq_ext):
-            return o
-        if _normaliser_equipe_clv(o['name']) == _normaliser_equipe_clv(equipe):
-            return o
-    return None
+        for o in mkt.get('outcomes', []):
+            nom = str(o.get('name', ''))
+            pt = round(float(o.get('point', 0)), 2)
+            fusion[(nom.lower(), pt)] = o
+    if not fusion:
+        return None
+    return {'key': market_key, 'outcomes': list(fusion.values())}
+
+
+async def _fetch_marche_clv_event(session, sport_key: str, event_id: str, market_key: str):
+    """Cotes Pinnacle par event — totals/spreads + lignes alternatives."""
+    alt_key = _marche_clv_alternatif(market_key)
+    url = (
+        f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event_id}/odds/"
+        f"?apiKey={API_ODDS_KEY}&regions=eu&bookmakers=pinnacle"
+        f"&markets={market_key},{alt_key}&oddsFormat=decimal"
+    )
+    data = await fetch_async(session, url, {})
+    if not data or not isinstance(data, dict):
+        return None
+    pinnacle = next((b for b in data.get('bookmakers', []) if b['key'] == 'pinnacle'), None)
+    if not pinnacle:
+        return None
+    return _fusionner_marches_pinnacle(pinnacle, market_key)
+
+
+async def _resoudre_pari_clv_async(session, sport_key, data, eq_dom, eq_ext, equipe, handicap,
+                                   market_key, cache_event_marche: dict):
+    """
+    Résout event + outcome Pinnacle pour un pari (lignes principales + alternate_*).
+    Retourne (outcome, market, event, err) — err=None si OK.
+    """
+    event, err = _trouver_event_clv(data, eq_dom, eq_ext)
+    if err:
+        return None, None, None, err
+    event_id = event.get('id')
+    market = None
+    if event_id:
+        if event_id not in cache_event_marche:
+            cache_event_marche[event_id] = await _fetch_marche_clv_event(
+                session, sport_key, event_id, market_key,
+            )
+        market = cache_event_marche.get(event_id)
+    if not market:
+        pinnacle = next((b for b in event.get('bookmakers', []) if b['key'] == 'pinnacle'), None)
+        if pinnacle:
+            market = _fusionner_marches_pinnacle(pinnacle, market_key)
+            if not market:
+                market = next((mkt for mkt in pinnacle['markets'] if mkt['key'] == market_key), None)
+    if not market:
+        return None, None, event, f"marche_{market_key}_absent"
+    outcome = _trouver_outcome_clv(market, equipe, handicap, market_key, eq_dom, eq_ext)
+    if not outcome:
+        pari_txt = _formater_pari_clv(equipe, handicap, market_key)
+        dispo = _lignes_pin_disponibles(market, equipe, market_key, eq_dom, eq_ext)
+        dispo_txt = ", ".join(f"{x:+g}" if market_key == 'spreads' else f"{x:g}" for x in dispo)
+        dispo_txt = dispo_txt or "aucune"
+        return None, market, event, f"ligne_absente ({pari_txt}) pin=[{dispo_txt}]"
+    return outcome, market, event, None
 
 
 def _resoudre_pari_clv(data, eq_dom, eq_ext, equipe, handicap, market_key):
-    """
-    Résout event + outcome Pinnacle pour un pari.
-    Retourne (outcome, market, event, err) — err=None si OK.
-    """
+    """Sync — bulk odds uniquement (tests / pré-check signal). Préférer _resoudre_pari_clv_async."""
     event, err = _trouver_event_clv(data, eq_dom, eq_ext)
     if err:
         return None, None, None, err
     pinnacle = next((b for b in event.get('bookmakers', []) if b['key'] == 'pinnacle'), None)
     if not pinnacle:
         return None, None, event, "pinnacle_absent"
-    market = next((mkt for mkt in pinnacle['markets'] if mkt['key'] == market_key), None)
+    market = _fusionner_marches_pinnacle(pinnacle, market_key)
+    if not market:
+        market = next((mkt for mkt in pinnacle['markets'] if mkt['key'] == market_key), None)
     if not market:
         return None, None, event, f"marche_{market_key}_absent"
     outcome = _trouver_outcome_clv(market, equipe, handicap, market_key, eq_dom, eq_ext)
     if not outcome:
         pari_txt = _formater_pari_clv(equipe, handicap, market_key)
-        dispo = _lignes_pin_disponibles(market, equipe, market_key)
-        dispo_txt = ", ".join(f"{x:g}" for x in dispo) if dispo else "aucune"
+        dispo = _lignes_pin_disponibles(market, equipe, market_key, eq_dom, eq_ext)
+        dispo_txt = ", ".join(f"{x:+g}" if market_key == 'spreads' else f"{x:g}" for x in dispo)
+        dispo_txt = dispo_txt or "aucune"
         return None, market, event, f"ligne_absente ({pari_txt}) pin=[{dispo_txt}]"
     return outcome, market, event, None
+
+
+def _trouver_outcome_clv(market, equipe, handicap, market_key, eq_dom="", eq_ext=""):
+    """Ligne exacte du pari, sinon repli proche (même côté, tol FOOT_CLV_LIGNE_TOL)."""
+    for o in market.get('outcomes', []):
+        if market_key == 'totals':
+            if o['name'].lower() != str(equipe).lower():
+                continue
+        else:
+            if o['name'].lower() in ('over', 'under'):
+                continue
+            if not _equipe_clv_match(equipe, o['name'], eq_dom, eq_ext):
+                continue
+        if _ligne_clv_exacte(handicap, float(o.get('point', 0))):
+            return o
+    return _outcome_clv_fallback(market, equipe, handicap, market_key, eq_dom, eq_ext)
 
 
 def _fenetre_alerte_clv(clv_notifie: int, mins_avant: float):
@@ -2731,7 +2830,7 @@ async def tracker_clv_async(session):
       3. Telegram ~H-1h puis ~H-5min (clv_notifie 0→1→2)
       4. Si résolution impossible à H-90 : alerte d'échec (clv_fail_notifie) — plus de silence
 
-    CLV = (cote_prise / cote_clôture) - 1 — sur la ligne exacte du pari (toutes lignes Pinnacle).
+    CLV = (cote_prise / cote_clôture) - 1 — event odds + alternate_totals/spreads Pinnacle.
     """
     async with db_lock:
         async with db_conn.execute(
@@ -2803,6 +2902,8 @@ async def tracker_clv_async(session):
                 )
                 await db_conn.commit()
 
+    cache_event_marche: dict = {}
+
     for (sport_key, market_key), info in par_ligue.items():
         ligue_cfg = info['cfg']
         url_odds = (f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
@@ -2825,8 +2926,8 @@ async def tracker_clv_async(session):
             mins_avant = bet['mins_avant']
             mk = bet['market_key']
 
-            outcome, _market, _event, err = _resoudre_pari_clv(
-                data, eq_dom, eq_ext, equipe, handicap, mk,
+            outcome, _market, _event, err = await _resoudre_pari_clv_async(
+                session, sport_key, data, eq_dom, eq_ext, equipe, handicap, mk, cache_event_marche,
             )
             if err:
                 pari_txt = _formater_pari_clv(equipe, handicap, mk)
@@ -2836,6 +2937,8 @@ async def tracker_clv_async(session):
 
             cote_actuelle = float(outcome['price'])
             clv_val = round((cote_prise / cote_actuelle) - 1, 4)
+            h_pin = float(outcome.get('point', handicap))
+            ligne_exacte = _ligne_clv_exacte(handicap, h_pin)
 
             envoyer_alerte, label_alerte, new_notifie = False, "", clv_notifie
             if mins_avant is not None:
@@ -2856,11 +2959,19 @@ async def tracker_clv_async(session):
                 clv_emoji = "🟢" if clv_val > 0 else "🔴"
                 pct = f"{clv_val:+.1%}"
                 pari_txt = _formater_pari_clv(equipe, handicap, mk)
+                if ligne_exacte:
+                    cote_ligne = f"📉 Cote actuelle Pinnacle : *{cote_actuelle:.2f}*"
+                else:
+                    ref_txt = _formater_pari_clv(equipe, h_pin, mk)
+                    cote_ligne = (
+                        f"📐 Réf. Pinnacle : *{ref_txt}* @ {cote_actuelle:.2f}\n"
+                        f"_(ligne retirée de l'API — CLV indicatif)_"
+                    )
                 await envoyer_telegram_async(session,
                     f"📊 *CLV — {ligue_cfg['nom']}*\n"
                     f"⚽ {eq_dom} vs {eq_ext}\n"
                     f"💎 *{pari_txt}* pris @ {cote_prise:.2f}\n"
-                    f"📉 Cote actuelle Pinnacle : *{cote_actuelle:.2f}*\n"
+                    f"{cote_ligne}\n"
                     f"{clv_emoji} CLV : *{pct}*\n"
                     f"_{label_alerte}_"
                 )

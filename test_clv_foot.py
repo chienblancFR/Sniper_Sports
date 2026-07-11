@@ -5,7 +5,9 @@ from __future__ import annotations
 import sys
 
 from sniper_bot_foot import (
+    _equipe_clv_match,
     _formater_pari_clv,
+    _fusionner_marches_pinnacle,
     _ligne_clv_exacte,
     _normaliser_equipe_clv,
     _resoudre_pari_clv,
@@ -24,6 +26,11 @@ def _market_spreads(outcomes):
 
 def test_normaliser_orgryte():
     assert _normaliser_equipe_clv("Örgryte IS") == _normaliser_equipe_clv("Orgryte IS")
+
+
+def test_equipe_mjallby_match():
+    assert _equipe_clv_match("Mjällby AIF", "Mjällby AIF", "Mjällby AIF", "AIK")
+    assert _equipe_clv_match("Mjällby AIF", "Mjallby", "Mjällby AIF", "AIK")
 
 
 def test_formater_pari_totaux():
@@ -57,16 +64,63 @@ def test_totals_ligne_exacte_parmi_plusieurs():
     assert float(o["price"]) == 1.84
 
 
-def test_totals_ligne_absente_refuse_proche():
-    """Pas de substitution 2.5 ou 3 si 2.75 absent."""
-    market = _market_totals([
-        {"name": "Under", "point": 2.5, "price": 1.91},
-        {"name": "Over", "point": 2.5, "price": 1.95},
-        {"name": "Under", "point": 3.0, "price": 1.85},
-        {"name": "Over", "point": 3.0, "price": 1.95},
+def test_spread_mjallby_fallback_moins_05():
+    """AH foot : -0.5 retiré, repli sur -0.25 (1 ligne principale API)."""
+    market = _market_spreads([
+        {"name": "AIK", "point": 0.25, "price": 1.97},
+        {"name": "Mjällby AIF", "point": -0.25, "price": 1.90},
     ])
-    o = _trouver_outcome_clv(market, "Under", 2.75, "totals", "Kalmar FF", "Orgryte IS")
-    assert o is None
+    o = _trouver_outcome_clv(
+        market, "Mjällby AIF", -0.5, "spreads", "Mjällby AIF", "AIK",
+    )
+    assert o is not None
+    assert float(o["point"]) == -0.25
+    assert float(o["price"]) == 1.90
+
+
+def test_fusion_alternate_totaux_under_3():
+    """Bulk = 3.25 seulement ; alternate_totals contient Under 3."""
+    pinnacle = {
+        'key': 'pinnacle',
+        'markets': [
+            {'key': 'totals', 'outcomes': [
+                {'name': 'Over', 'point': 3.25, 'price': 1.99},
+                {'name': 'Under', 'point': 3.25, 'price': 1.89},
+            ]},
+            {'key': 'alternate_totals', 'outcomes': [
+                {'name': 'Under', 'point': 3.0, 'price': 2.17},
+                {'name': 'Over', 'point': 3.0, 'price': 1.72},
+                {'name': 'Under', 'point': 3.25, 'price': 1.89},
+            ]},
+        ],
+    }
+    market = _fusionner_marches_pinnacle(pinnacle, 'totals')
+    o = _trouver_outcome_clv(market, 'Under', 3.0, 'totals', 'Aalesund', 'Molde')
+    assert o is not None
+    assert float(o['point']) == 3.0
+    assert float(o['price']) == 2.17
+
+
+def test_fusion_alternate_spread_moins_05():
+    pinnacle = {
+        'key': 'pinnacle',
+        'markets': [
+            {'key': 'spreads', 'outcomes': [
+                {'name': 'AIK', 'point': 0.25, 'price': 1.97},
+                {'name': 'Mjällby AIF', 'point': -0.25, 'price': 1.90},
+            ]},
+            {'key': 'alternate_spreads', 'outcomes': [
+                {'name': 'Mjällby AIF', 'point': -0.5, 'price': 2.10},
+                {'name': 'AIK', 'point': 0.5, 'price': 1.75},
+            ]},
+        ],
+    }
+    market = _fusionner_marches_pinnacle(pinnacle, 'spreads')
+    o = _trouver_outcome_clv(
+        market, 'Mjällby AIF', -0.5, 'spreads', 'Mjällby AIF', 'AIK',
+    )
+    assert o is not None
+    assert float(o['point']) == -0.5
 
 
 def test_event_kalmar_orgryte_ligne_exacte_disponible():
@@ -116,11 +170,14 @@ def test_goteborg_aik_ligne_exacte():
 def main():
     tests = [
         test_normaliser_orgryte,
+        test_equipe_mjallby_match,
         test_formater_pari_totaux,
         test_formater_pari_ah,
         test_ligne_clv_exacte_quarts,
         test_totals_ligne_exacte_parmi_plusieurs,
-        test_totals_ligne_absente_refuse_proche,
+        test_spread_mjallby_fallback_moins_05,
+        test_fusion_alternate_totaux_under_3,
+        test_fusion_alternate_spread_moins_05,
         test_event_kalmar_orgryte_ligne_exacte_disponible,
         test_goteborg_aik_ligne_exacte,
     ]
