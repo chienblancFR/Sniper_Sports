@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 
 from sniper_bot_foot import (
+    _formater_pari_clv,
+    _ligne_clv_exacte,
     _normaliser_equipe_clv,
     _resoudre_pari_clv,
     _trouver_event_clv,
@@ -24,17 +26,50 @@ def test_normaliser_orgryte():
     assert _normaliser_equipe_clv("Örgryte IS") == _normaliser_equipe_clv("Orgryte IS")
 
 
-def test_totals_ligne_deplacee():
+def test_formater_pari_totaux():
+    assert _formater_pari_clv("Under", 2.75, "totals") == "Under 2.75"
+    assert _formater_pari_clv("Over", 3.25, "totals") == "Over 3.25"
+
+
+def test_formater_pari_ah():
+    assert _formater_pari_clv("Malmo FF", -0.5, "spreads") == "Malmo FF (-0.5)"
+
+
+def test_ligne_clv_exacte_quarts():
+    assert _ligne_clv_exacte(2.75, 2.7500001)
+    assert _ligne_clv_exacte(0.25, 0.25)
+    assert not _ligne_clv_exacte(2.75, 3.0)
+
+
+def test_totals_ligne_exacte_parmi_plusieurs():
+    """Under 2.75 trouvé même si Pinnacle propose aussi 2.5 et 3."""
     market = _market_totals([
-        {"name": "Under", "point": 2.5, "price": 1.91},
-        {"name": "Over", "point": 2.5, "price": 1.95},
+        {"name": "Under", "point": 2.5, "price": 2.10},
+        {"name": "Over", "point": 2.5, "price": 1.75},
+        {"name": "Under", "point": 2.75, "price": 1.84},
+        {"name": "Over", "point": 2.75, "price": 1.98},
+        {"name": "Under", "point": 3.0, "price": 1.65},
+        {"name": "Over", "point": 3.0, "price": 2.25},
     ])
     o = _trouver_outcome_clv(market, "Under", 2.75, "totals", "Kalmar FF", "Orgryte IS")
     assert o is not None
-    assert float(o["point"]) == 2.5
+    assert float(o["point"]) == 2.75
+    assert float(o["price"]) == 1.84
 
 
-def test_event_kalmar_orgryte():
+def test_totals_ligne_absente_refuse_proche():
+    """Pas de substitution 2.5 ou 3 si 2.75 absent."""
+    market = _market_totals([
+        {"name": "Under", "point": 2.5, "price": 1.91},
+        {"name": "Over", "point": 2.5, "price": 1.95},
+        {"name": "Under", "point": 3.0, "price": 1.85},
+        {"name": "Over", "point": 3.0, "price": 1.95},
+    ])
+    o = _trouver_outcome_clv(market, "Under", 2.75, "totals", "Kalmar FF", "Orgryte IS")
+    assert o is None
+
+
+def test_event_kalmar_orgryte_ligne_exacte_disponible():
     data = [{
         "home_team": "Kalmar",
         "away_team": "Orgryte IS",
@@ -43,6 +78,8 @@ def test_event_kalmar_orgryte():
             "markets": [_market_totals([
                 {"name": "Under", "point": 2.5, "price": 2.01},
                 {"name": "Over", "point": 2.5, "price": 1.85},
+                {"name": "Under", "point": 2.75, "price": 1.92},
+                {"name": "Over", "point": 2.75, "price": 1.90},
             ])],
         }],
     }]
@@ -54,9 +91,10 @@ def test_event_kalmar_orgryte():
     )
     assert err2 is None
     assert outcome is not None
+    assert float(outcome["price"]) == 1.92
 
 
-def test_goteborg_aik():
+def test_goteborg_aik_ligne_exacte():
     data = [{
         "home_team": "IFK Goteborg",
         "away_team": "AIK Stockholm",
@@ -78,9 +116,13 @@ def test_goteborg_aik():
 def main():
     tests = [
         test_normaliser_orgryte,
-        test_totals_ligne_deplacee,
-        test_event_kalmar_orgryte,
-        test_goteborg_aik,
+        test_formater_pari_totaux,
+        test_formater_pari_ah,
+        test_ligne_clv_exacte_quarts,
+        test_totals_ligne_exacte_parmi_plusieurs,
+        test_totals_ligne_absente_refuse_proche,
+        test_event_kalmar_orgryte_ligne_exacte_disponible,
+        test_goteborg_aik_ligne_exacte,
     ]
     failed = 0
     for t in tests:
