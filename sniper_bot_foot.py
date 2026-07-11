@@ -3000,7 +3000,7 @@ async def _alerter_echec_clv(session, bet: dict, reason: str, reset_fail: bool =
         f"⚽ {eq_dom} vs {eq_ext}\n"
         f"💎 {pari_txt}\n"
         f"❌ *Raison :* `{reason}`\n"
-        f"⏳ H-{mins_avant:.0f} — le bot réessaie chaque cycle.\n"
+        f"⏳ *{mins_avant:.0f} min* avant KO — le bot réessaie chaque cycle.\n"
         f"_Si le match approche sans alerte CLV normale, vérifier les logs `[CLV]`._"
     )
     if reset_fail:
