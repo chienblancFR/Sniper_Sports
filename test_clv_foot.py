@@ -9,6 +9,8 @@ from sniper_bot_foot import (
     _formater_pari_clv,
     _fusionner_marches_pinnacle,
     _ligne_clv_exacte,
+    _marche_clv_coherent,
+    _marche_clv_depuis_pinnacle,
     _normaliser_equipe_clv,
     _resoudre_pari_clv,
     _trouver_event_clv,
@@ -31,6 +33,28 @@ def test_normaliser_orgryte():
 def test_equipe_mjallby_match():
     assert _equipe_clv_match("Mjällby AIF", "Mjällby AIF", "Mjällby AIF", "AIK")
     assert _equipe_clv_match("Mjällby AIF", "Mjallby", "Mjällby AIF", "AIK")
+    assert not _equipe_clv_match("Mjällby AIF", "AIK", "Mjällby AIF", "AIK")
+
+
+def test_equipe_clv_pas_confondre_dom_ext():
+    """Molde -0.25 ne doit pas matcher Aalesund -0.25 (cause CLV -37%)."""
+    assert not _equipe_clv_match("Molde", "Aalesund", "Aalesund", "Molde")
+    assert _equipe_clv_match("Molde", "Molde", "Aalesund", "Molde")
+    assert _equipe_clv_match("Aalesund", "Aalesund", "Aalesund", "Molde")
+
+
+def test_spread_molde_moins_025_pas_aalesund():
+    """Event odds : les deux équipes peuvent avoir -0.25 — garder Molde."""
+    market = _market_spreads([
+        {"name": "Aalesund", "point": -0.25, "price": 2.98},
+        {"name": "Molde", "point": -0.25, "price": 1.88},
+        {"name": "Aalesund", "point": 0.25, "price": 1.92},
+        {"name": "Molde", "point": 0.25, "price": 1.95},
+    ])
+    o = _trouver_outcome_clv(market, "Molde", -0.25, "spreads", "Aalesund", "Molde")
+    assert o is not None
+    assert o["name"] == "Molde"
+    assert float(o["price"]) == 1.88
 
 
 def test_formater_pari_totaux():
@@ -148,6 +172,69 @@ def test_event_kalmar_orgryte_ligne_exacte_disponible():
     assert float(outcome["price"]) == 1.92
 
 
+def test_marche_coherent_rejete_spreads_pour_totaux():
+    spreads = _market_spreads([
+        {"name": "AIK", "point": 0.25, "price": 1.97},
+        {"name": "Mjällby AIF", "point": -0.25, "price": 1.90},
+    ])
+    totals = _market_totals([
+        {"name": "Under", "point": 2.75, "price": 1.84},
+        {"name": "Over", "point": 2.75, "price": 1.98},
+    ])
+    assert not _marche_clv_coherent(spreads, "Under", "totals")
+    assert _marche_clv_coherent(totals, "Under", "totals")
+
+
+def test_bulk_depuis_pinnacle_recupere_totaux_si_cache_spreads():
+    """Simule l'ancien bug cache spreads → repli bulk totals."""
+    pinnacle = {
+        "key": "pinnacle",
+        "markets": [
+            {
+                "key": "totals",
+                "outcomes": [
+                    {"name": "Under", "point": 2.75, "price": 1.86},
+                    {"name": "Over", "point": 2.75, "price": 1.95},
+                ],
+            },
+            {
+                "key": "spreads",
+                "outcomes": [
+                    {"name": "AIK", "point": 0.25, "price": 1.97},
+                    {"name": "Mjällby AIF", "point": -0.25, "price": 1.90},
+                ],
+            },
+        ],
+    }
+    cache_spreads = _marche_clv_depuis_pinnacle(pinnacle, "spreads")
+    assert not _marche_clv_coherent(cache_spreads, "Under", "totals")
+    bulk_totals = _marche_clv_depuis_pinnacle(pinnacle, "totals")
+    assert _marche_clv_coherent(bulk_totals, "Under", "totals")
+    o = _trouver_outcome_clv(bulk_totals, "Under", 2.75, "totals", "Mjällby AIF", "AIK")
+    assert o is not None
+
+
+def test_cache_event_marche_separe_totals_spreads():
+    """Le cache event doit distinguer totals et spreads (même event_id)."""
+    spreads_market = _market_spreads([
+        {"name": "AIK", "point": 0.25, "price": 1.97},
+        {"name": "Mjällby AIF", "point": -0.25, "price": 1.90},
+    ])
+    totals_market = _market_totals([
+        {"name": "Under", "point": 2.75, "price": 1.84},
+        {"name": "Over", "point": 2.75, "price": 1.98},
+    ])
+    cache = {"evt123": spreads_market}
+    # Ancien bug : event_id seul → totals lisait le cache spreads → pin=[aucune]
+    wrong = cache.get("evt123")
+    assert _trouver_outcome_clv(wrong, "Under", 2.75, "totals", "Mjällby AIF", "AIK") is None
+    cache[("evt123", "totals")] = totals_market
+    right = cache[("evt123", "totals")]
+    o = _trouver_outcome_clv(right, "Under", 2.75, "totals", "Mjällby AIF", "AIK")
+    assert o is not None
+    assert float(o["price"]) == 1.84
+
+
 def test_goteborg_aik_ligne_exacte():
     data = [{
         "home_team": "IFK Goteborg",
@@ -171,6 +258,8 @@ def main():
     tests = [
         test_normaliser_orgryte,
         test_equipe_mjallby_match,
+        test_equipe_clv_pas_confondre_dom_ext,
+        test_spread_molde_moins_025_pas_aalesund,
         test_formater_pari_totaux,
         test_formater_pari_ah,
         test_ligne_clv_exacte_quarts,
@@ -178,7 +267,10 @@ def main():
         test_spread_mjallby_fallback_moins_05,
         test_fusion_alternate_totaux_under_3,
         test_fusion_alternate_spread_moins_05,
+        test_marche_coherent_rejete_spreads_pour_totaux,
+        test_bulk_depuis_pinnacle_recupere_totaux_si_cache_spreads,
         test_event_kalmar_orgryte_ligne_exacte_disponible,
+        test_cache_event_marche_separe_totals_spreads,
         test_goteborg_aik_ligne_exacte,
     ]
     failed = 0
