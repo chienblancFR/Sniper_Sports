@@ -127,6 +127,10 @@ FOOT_CLV_SCORE_MIN_RELAX = int(os.environ.get("FOOT_CLV_SCORE_MIN_RELAX", "75"))
 FOOT_CLV_ALERT_ECHEC = _env_bool("FOOT_CLV_ALERT_ECHEC", True)
 FOOT_CLV_DOUBLE_PASS = _env_bool("FOOT_CLV_DOUBLE_PASS", True)
 
+# Fenêtre prise de paris — alignée backtest H-24 (bande autour du snapshot bt_odds_h24)
+FOOT_SCAN_HEURES_MAX = float(os.environ.get("FOOT_SCAN_HEURES_MAX", "30"))
+FOOT_SCAN_HEURES_MIN = float(os.environ.get("FOOT_SCAN_HEURES_MIN", "18"))
+
 # Calibration P(couverture) AH — foot_calibration_ah.json (--fit-calibration platt)
 FOOT_CALIB_AH = _env_bool("FOOT_CALIB_AH", False)
 FOOT_CALIB_AH_FILE = os.environ.get("FOOT_CALIB_AH_FILE", FOOT_CALIB_AH_FILE_DEFAULT)
@@ -775,26 +779,54 @@ NAME_MAPPING = {
     "Orgryte IS":               "Örgryte IS",
 
     # ============================================================
-    # 🇳🇴 ELITESERIEN
+    # 🇳🇴 ELITESERIEN — canonique = libellés Odds API / Pinnacle
     # ============================================================
-    "FK Bodø/Glimt":            "Bodo/Glimt",
-    "Bodø/Glimt":               "Bodo/Glimt",
+    "FK Bodø/Glimt":            "Bodø/Glimt",
+    "Bodø/Glimt":               "Bodø/Glimt",
     "Bodo/Glimt":               "Bodø/Glimt",
     "Molde FK":                 "Molde",
+    "Molde":                    "Molde",
     "Rosenborg BK":             "Rosenborg",
-    "SK Brann":                 "Brann",
-    "Viking FK":                "Viking",
+    "Rosenborg":                "Rosenborg",
+    "Brann":                    "SK Brann",
+    "SK Brann":                 "SK Brann",
+    "Viking":                   "Viking FK",
+    "Viking FK":                "Viking FK",
     "Tromsø IL":                "Tromso",
     "IL Tromso":                "Tromso",
-    "Stabæk Fotball":           "Stabek",
-    "Stabek IF":                "Stabek",
+    "Tromso":                   "Tromso",
+    "Stabæk Fotball":           "Stabaek",
+    "Stabek IF":                "Stabaek",
+    "Stabaek":                  "Stabaek",
     "Strømsgodset IF":          "Stromsgodset",
+    "Stromsgodset":             "Stromsgodset",
     "FK Haugesund":             "Haugesund",
-    "Odd BK":                   "Odd",
+    "Haugesund":                "Haugesund",
+    "Odd BK":                   "Odds BK",
+    "ODD Ballklubb":            "Odds BK",
+    "Odds BK":                  "Odds BK",
     "Sandefjord Fotball":       "Sandefjord",
-    "Aalesunds FK":             "Aalesund",
-    "FK Jerv":                  "Jerv",
+    "Sandefjord":               "Sandefjord",
     "Lillestrøm SK":            "Lillestrom",
+    "Lillestrom":               "Lillestrom",
+    "Aalesunds FK":             "Aalesund",
+    "Aalesund":                 "Aalesund",
+    "Kristiansund BK":          "Kristiansund BK",
+    "Sarpsborg 08 FF":          "Sarpsborg FK",
+    "Sarpsborg FK":             "Sarpsborg FK",
+    "Valerenga":                "Vålerenga",
+    "Vålerenga":                "Vålerenga",
+    "Vålerenga IF":             "Vålerenga",
+    "Mjondalen":                "Mjøndalen",
+    "Mjøndalen IF":             "Mjøndalen",
+    "Mjøndalen":                "Mjøndalen",
+    "Ham-Kam":                  "HamKam",
+    "HamKam":                   "HamKam",
+    "FK Jerv":                  "Jerv",
+    "jerv":                     "Jerv",
+    "Jerv":                     "Jerv",
+    "Kongsvinger IL":           "Kongsvinger",
+    "Kongsvinger":              "Kongsvinger",
 
     # ============================================================
     # 🇧🇪 JUPILER PRO LEAGUE — canonique = libellés Odds API / Pinnacle
@@ -1760,35 +1792,18 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
     # Alimenter le cache d'heures dès le scan pour que calculer_pause() soit réactif
     cache_heures_matchs[id_m] = dt_obj
 
-    # 🎯 LE FILTRE TEMPOREL : Le Sniper ne s'active qu'à partir de H-36
-    if not (0.9 <= hr <= 36.0): return
+    # Filtre temporel : bande autour de H-24 (= snapshot backtest bt_odds_h24).
+    # Tracker CLV (H-1h / H-5min) reste indépendant — paris PENDING déjà pris.
+    if not (FOOT_SCAN_HEURES_MIN <= hr <= FOOT_SCAN_HEURES_MAX):
+        return
 
-    # poids_dyn calibré sur la fenêtre réelle [0.9h, 36h] du bot.
-    # L'ancienne formule (hr/168) produisait une variation de 15.1% à 18.2% — trop étroite.
-    # Nouvelle plage : 10% (H-0.9, marché très sharp) → 30% (H-36, signal modèle plus libre).
+    # poids_dyn : même courbe que backtest_football.calculer_poids_dyn (ancrage [0.9h, 36h])
+    # → à H-24 live ≈ backtest (~23 % modèle). Fenêtre de prise = FOOT_SCAN_* seulement.
     poids_dyn = 0.10 + 0.20 * min(1.0, (hr - 0.9) / (36.0 - 0.9))
 
-    # 🕐 EV MINIMUM GRADUÉ SELON L'HEURE AU KO
-    # Plus on se rapproche du coup d'envoi, plus Pinnacle a intégré l'information
-    # (compositions, blessures de dernière minute, mouvements sharp).
-    # On compense en exigeant un edge plus élevé pour valider le pari.
-    #   H > 6  → seuil normal   (modèle pertinent, peu d'info de dernière minute)
-    #   H 3-6  → +1.5%          (premiers mouvements pré-KO, compositions probables)
-    #   H < 3  → +3%            (compositions diffusées, marché au plus serré)
-    if hr < 3.0:
-        ev_min_effectif = ligue['ev_min'] + 0.03
-    elif hr < 6.0:
-        ev_min_effectif = ligue['ev_min'] + 0.015
-    else:
-        ev_min_effectif = ligue['ev_min']
-
-    # Label H-KO pour transparence dans les alertes Telegram
-    if hr < 3.0:
-        hko_label = f"🔴 H-{hr:.1f} (marché serré +3%)"
-    elif hr < 6.0:
-        hko_label = f"🟡 H-{hr:.1f} (pré-KO +1.5%)"
-    else:
-        hko_label = f"🟢 H-{hr:.1f}"
+    # EV min ligue (plus de paliers H-3/H-6 : hors bande FOOT_SCAN)
+    ev_min_effectif = ligue['ev_min']
+    hko_label = f"🟢 H-{hr:.1f} (bande H-{FOOT_SCAN_HEURES_MAX:.0f}→H-{FOOT_SCAN_HEURES_MIN:.0f})"
 
     n_d_m = NAME_MAPPING.get(n_d, n_d)
     n_e_m = NAME_MAPPING.get(n_e, n_e)
@@ -3155,6 +3170,10 @@ async def main_loop():
         log_info(f"📐 Calibration AH live : {n_l} ligue(s) ({FOOT_CALIB_AH_FILE})")
 
     log_info("🚀 Démarrage du Superviseur Sniper Football V25 Gold (aiosqlite)...")
+    log_info(
+        f"⏱️ Fenêtre prise de paris : H-{FOOT_SCAN_HEURES_MAX:.0f} → H-{FOOT_SCAN_HEURES_MIN:.0f} "
+        f"(parité backtest H-24)"
+    )
 
     # Détection initiale de la couverture xG + collecte historique des scores
     dernier_retest_xg = None

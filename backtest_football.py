@@ -27,6 +27,9 @@ Reset (avant de relancer le backtest / dashboard) :
   python backtest_football.py --collect --saisons 2025 --europe-only
       → Ajoute saison 2025-26 (API season=2025) : fixtures + xG + cotes, ligues EU only
 
+  python backtest_football.py --collect --saisons 2021,2022
+      → Ajoute saisons 2021-22 et 2022-23 (fixtures + xG + cotes Pinnacle H-24/clôture)
+
   python backtest_football.py --collect --saisons 2025 --europe-only --odds-only
       → Cotes 2025-26 uniquement (fixtures/xG déjà en base)
 
@@ -62,6 +65,7 @@ import numpy as np
 import csv
 import os
 import sys
+import unicodedata
 from scipy.stats import poisson
 from scipy.optimize import minimize_scalar, minimize
 from thefuzz import process
@@ -156,7 +160,7 @@ def verifier_fichier_db(path=DB_PATH):
 # ─────────────────────────────────────────────────────────────
 # ⚙️  CONFIGURATION
 # ─────────────────────────────────────────────────────────────
-SAISONS_BACKTEST = [2023, 2024]   # 2023 = 2023-24 (ligues hivernales)
+SAISONS_BACKTEST = [2021, 2022, 2023, 2024]   # 2021 = 2021-22 (ligues hivernales)
 SAISONS_EUROPE_EXTRA = [2025]       # 2025 = 2025-26 — collectée en plus pour l'Europe
 
 # Ligues calendrier estival (saison = année civile) — hors lot EU 2025-26 par défaut
@@ -192,7 +196,8 @@ CHAMPIONNATS = [
 
 KELLY_FRAC = 0.05
 MIN_COTE = 1.70
-# Cotes backtest collectées à H-24 (table bt_odds_h24)
+# Cotes backtest collectées à H-24 (table bt_odds_h24).
+# Live (sniper_bot_foot) : bande FOOT_SCAN_HEURES_MIN/MAX (défaut 18–30) autour de ce snapshot.
 H_ODDS_BACKTEST = 24.0
 
 
@@ -213,7 +218,8 @@ def _jour_cache(date_utc):
 def calculer_poids_dyn(hr: float) -> float:
     """
     Poids du modèle dans le blend EV — identique au bot live (sniper_bot_foot.py).
-    Fenêtre [0.9h, 36h] : 10% (marché sharp) → 30% (signal modèle plus libre).
+    Courbe ancrée [0.9h, 36h] : 10% → 30%. Backtest appelle avec hr=H_ODDS_BACKTEST (24).
+    Live ne prend des paris que dans FOOT_SCAN_* (≈ H-30→H-18), donc proche de ce poids.
     """
     return 0.10 + 0.20 * min(1.0, (hr - 0.9) / (36.0 - 0.9))
 
@@ -344,13 +350,27 @@ NAME_MAPPING = {
     "Mjällby AIF": "Mjallby", "Halmstads BK": "Halmstad",
     "IK Sirius FK": "Sirius", "Kalmar FF": "Kalmar",
     "Degerfors IF": "Degerfors", "GIF Sundsvall": "Sundsvall",
-    # 🇳🇴 ELITESERIEN
-    "FK Bodø/Glimt": "Bodo/Glimt", "Bodø/Glimt": "Bodo/Glimt",
-    "Molde FK": "Molde", "Rosenborg BK": "Rosenborg", "SK Brann": "Brann",
-    "Viking FK": "Viking", "Tromsø IL": "Tromso", "IL Tromso": "Tromso",
-    "Stabæk Fotball": "Stabek", "Strømsgodset IF": "Stromsgodset",
-    "FK Haugesund": "Haugesund", "Odd BK": "Odd",
-    "Sandefjord Fotball": "Sandefjord", "Lillestrøm SK": "Lillestrom",
+    # 🇳🇴 ELITESERIEN — canonique = libellés Odds API / Pinnacle (historical)
+    "FK Bodø/Glimt": "Bodø/Glimt", "Bodø/Glimt": "Bodø/Glimt", "Bodo/Glimt": "Bodø/Glimt",
+    "Molde FK": "Molde", "Molde": "Molde",
+    "Rosenborg BK": "Rosenborg", "Rosenborg": "Rosenborg",
+    "Brann": "SK Brann", "SK Brann": "SK Brann",
+    "Viking": "Viking FK", "Viking FK": "Viking FK",
+    "Tromsø IL": "Tromso", "IL Tromso": "Tromso", "Tromso": "Tromso",
+    "Stabæk Fotball": "Stabaek", "Stabaek": "Stabaek",
+    "Strømsgodset IF": "Stromsgodset", "Stromsgodset": "Stromsgodset",
+    "FK Haugesund": "Haugesund", "Haugesund": "Haugesund",
+    "Odd BK": "Odds BK", "ODD Ballklubb": "Odds BK", "Odds BK": "Odds BK",
+    "Sandefjord Fotball": "Sandefjord", "Sandefjord": "Sandefjord",
+    "Lillestrøm SK": "Lillestrom", "Lillestrom": "Lillestrom",
+    "Aalesunds FK": "Aalesund", "Aalesund": "Aalesund",
+    "Kristiansund BK": "Kristiansund BK",
+    "Sarpsborg 08 FF": "Sarpsborg FK", "Sarpsborg FK": "Sarpsborg FK",
+    "Valerenga": "Vålerenga", "Vålerenga": "Vålerenga", "Vålerenga IF": "Vålerenga",
+    "Mjondalen": "Mjøndalen", "Mjøndalen IF": "Mjøndalen", "Mjøndalen": "Mjøndalen",
+    "Ham-Kam": "HamKam", "HamKam": "HamKam",
+    "FK Jerv": "Jerv", "jerv": "Jerv", "Jerv": "Jerv",
+    "Kongsvinger IL": "Kongsvinger", "Kongsvinger": "Kongsvinger",
     # 🇧🇪 JUPILER PRO LEAGUE — canonique = libellés Odds API / Pinnacle
     # Noms API-Football (bt_fixtures)
     "Antwerp": "Royal Antwerp",
@@ -948,7 +968,11 @@ async def collecter_odds_ligue_saison(conn, session, ligue, saison):
 
 def _canonical_equipe(name: str) -> str:
     """Normalise un nom d'équipe (API-Football ou Odds API) vers libellé canonique."""
-    return NAME_MAPPING.get(name, name)
+    if not name:
+        return name
+    mapped = NAME_MAPPING.get(name, name)
+    nf = unicodedata.normalize('NFKD', mapped)
+    return ''.join(c for c in nf if not unicodedata.combining(c))
 
 
 def trouver_fixture(home_odds, away_odds, commence_time, fixture_map):
