@@ -127,6 +127,13 @@ FOOT_CLV_SCORE_MIN_RELAX = int(os.environ.get("FOOT_CLV_SCORE_MIN_RELAX", "75"))
 FOOT_CLV_ALERT_ECHEC = _env_bool("FOOT_CLV_ALERT_ECHEC", True)
 FOOT_CLV_DOUBLE_PASS = _env_bool("FOOT_CLV_DOUBLE_PASS", True)
 
+# Alerte monitoring CLV moyen (Telegram only — n'influence ni EV ni Kelly)
+FOOT_CLV_ALERT_MOYENNE = _env_bool("FOOT_CLV_ALERT_MOYENNE", True)
+FOOT_CLV_ALERT_FENETRE = int(os.environ.get("FOOT_CLV_ALERT_FENETRE", "20"))
+FOOT_CLV_ALERT_SEUIL = float(os.environ.get("FOOT_CLV_ALERT_SEUIL", "-0.02"))
+FOOT_CLV_ALERT_COOLDOWN_H = float(os.environ.get("FOOT_CLV_ALERT_COOLDOWN_H", "12"))
+_dernier_alerte_clv_moyenne: datetime | None = None
+
 # Fenêtre prise de paris — alignée backtest H-24 (bande autour du snapshot bt_odds_h24)
 FOOT_SCAN_HEURES_MAX = float(os.environ.get("FOOT_SCAN_HEURES_MAX", "30"))
 FOOT_SCAN_HEURES_MIN = float(os.environ.get("FOOT_SCAN_HEURES_MIN", "18"))
@@ -1256,6 +1263,64 @@ async def envoyer_telegram_async(session, msg):
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status == 200: log_info("📱 Signal Telegram envoyé.")
     except Exception as e: log_info(f"⚠️ Erreur Telegram : {e}")
+
+
+async def alerter_clv_moyenne_degradee(session) -> None:
+    """
+    Monitoring pur : si la CLV moyenne des N derniers paris (cote clôture connue)
+    passe sous le seuil, alerte Telegram. Aucun effet sur EV / Kelly / filtres.
+    """
+    global _dernier_alerte_clv_moyenne
+    if not FOOT_CLV_ALERT_MOYENNE:
+        return
+    fenetre = max(5, FOOT_CLV_ALERT_FENETRE)
+    try:
+        async with db_lock:
+            async with db_conn.execute(
+                """
+                SELECT clv FROM paris_log
+                WHERE cote_cloture > 1.0
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (fenetre,),
+            ) as cur:
+                rows = await cur.fetchall()
+    except Exception as e:
+        log_info(f"⚠️ Alerte CLV moyenne : lecture DB échouée : {e}")
+        return
+
+    if len(rows) < fenetre:
+        return
+
+    vals = [float(r[0]) for r in rows if r[0] is not None]
+    if len(vals) < fenetre:
+        return
+
+    mean_clv = sum(vals) / len(vals)
+    if mean_clv >= FOOT_CLV_ALERT_SEUIL:
+        return
+
+    now = datetime.now(timezone.utc)
+    if _dernier_alerte_clv_moyenne is not None:
+        heures = (now - _dernier_alerte_clv_moyenne).total_seconds() / 3600.0
+        if heures < FOOT_CLV_ALERT_COOLDOWN_H:
+            return
+
+    n_neg = sum(1 for v in vals if v < 0)
+    msg = (
+        f"⚠️ *Alerte CLV moyenne*\n"
+        f"CLV moy. *{mean_clv:+.2%}* sur les *{fenetre}* derniers paris "
+        f"(seuil {FOOT_CLV_ALERT_SEUIL:+.0%}).\n"
+        f"Négatifs : {n_neg}/{fenetre}\n"
+        f"_Monitoring uniquement — aucune mise bloquée._"
+    )
+    await envoyer_telegram_async(session, msg)
+    _dernier_alerte_clv_moyenne = now
+    log_info(
+        f"⚠️ Alerte CLV moyenne envoyée : {mean_clv:+.2%} "
+        f"(n={fenetre}, seuil={FOOT_CLV_ALERT_SEUIL:+.0%})"
+    )
 
 HISTORIQUE_CSV_LOCAL = "historique_sniper.csv"
 PA_DATA_DIR = "/home/chienblanc/data"
@@ -3120,6 +3185,8 @@ async def lancer_scan_global_async() -> int:
             if n_clv:
                 log_info(f"[CLV] 2e passe fin de cycle ({n_clv} paris).")
 
+        await alerter_clv_moyenne_degradee(session)
+
     return matchs_detectes
 
 
@@ -3174,6 +3241,11 @@ async def main_loop():
         f"⏱️ Fenêtre prise de paris : H-{FOOT_SCAN_HEURES_MAX:.0f} → H-{FOOT_SCAN_HEURES_MIN:.0f} "
         f"(parité backtest H-24)"
     )
+    if FOOT_CLV_ALERT_MOYENNE:
+        log_info(
+            f"📡 Alerte CLV moyenne : seuil {FOOT_CLV_ALERT_SEUIL:+.0%} "
+            f"sur {FOOT_CLV_ALERT_FENETRE} paris (cooldown {FOOT_CLV_ALERT_COOLDOWN_H:.0f}h)"
+        )
 
     # Détection initiale de la couverture xG + collecte historique des scores
     dernier_retest_xg = None
