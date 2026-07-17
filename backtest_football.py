@@ -184,6 +184,7 @@ LIGUES_EUROPEENNES = {
 }
 
 # Preset P1 — réduction volume AH (live + backtest : EV max 9% + tier ; cap optionnel via --max-ah-ligue-saison)
+# Steam AH : live only (FOOT_STEAM_* dans sniper) — pas de snapshots intradayout en bt_odds_h24
 P1_AH_EV_MAX_SPREADS = 0.09
 P1_AH_MAX_LIGUE_SAISON = 45  # exploration only — plus dans --p1-ah (parité live)
 

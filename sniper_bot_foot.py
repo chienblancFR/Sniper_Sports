@@ -164,6 +164,16 @@ FOOT_FATIGUE_AH_MODE = os.environ.get("FOOT_FATIGUE_AH_MODE", "either").strip().
 _UEFA_LIGUE_IDS = {2, 3, 848}
 _cache_calendrier_equipe: dict[tuple, list] = {}
 
+# Steam / line movement AH (live only — pas de snapshots H-24→H-18 en backtest)
+FOOT_STEAM_ACTIF = _env_bool("FOOT_STEAM_ACTIF", True)
+FOOT_STEAM_MIN_AGE_MIN = int(os.environ.get("FOOT_STEAM_MIN_AGE_MIN", "45"))
+FOOT_STEAM_MAX_SNAPSHOTS = int(os.environ.get("FOOT_STEAM_MAX_SNAPSHOTS", "48"))
+FOOT_STEAM_WARN_PCT = float(os.environ.get("FOOT_STEAM_WARN_PCT", "0.025"))
+FOOT_STEAM_BLOCK_PCT = float(os.environ.get("FOOT_STEAM_BLOCK_PCT", "0.05"))
+FOOT_STEAM_EV_EXTRA = float(os.environ.get("FOOT_STEAM_EV_EXTRA", "0.015"))
+FOOT_STEAM_FILE = os.environ.get("FOOT_STEAM_FILE", "foot_odds_history.json")
+_steam_logue = False
+
 # Alerte monitoring API down (Telegram only — n'influence ni EV ni Kelly)
 FOOT_API_ALERT = _env_bool("FOOT_API_ALERT", True)
 FOOT_API_ALERT_SEUIL = int(os.environ.get("FOOT_API_ALERT_SEUIL", "3"))
@@ -2032,6 +2042,161 @@ async def match_en_fatigue_ah(
     return True, " | ".join(details)
 
 
+def _lire_steam_history() -> dict:
+    try:
+        if os.path.isfile(FOOT_STEAM_FILE):
+            with open(FOOT_STEAM_FILE, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log_info(f"⚠️ Steam history lecture : {e}")
+    return {"fixtures": {}}
+
+
+def _sauver_steam_history(data: dict) -> None:
+    try:
+        with open(FOOT_STEAM_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log_info(f"⚠️ Steam history écriture : {e}")
+
+
+def _cle_ligne_ah(equipe: str, handicap: float) -> str:
+    return f"{equipe}|{float(handicap):+g}"
+
+
+def enregistrer_snapshot_ah(
+    fixture_id: int, home: str, away: str, spreads_outcomes: list
+) -> None:
+    """Historise les cotes Pinnacle AH (1 snapshot/cycle si mouvement)."""
+    if not FOOT_STEAM_ACTIF or not spreads_outcomes:
+        return
+    data = _lire_steam_history()
+    fixtures = data.setdefault("fixtures", {})
+    fid = str(fixture_id)
+    lines = {}
+    for o in spreads_outcomes:
+        try:
+            nom = o["name"]
+            h = float(o["point"])
+            cote = float(o["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if cote < 1.01:
+            continue
+        lines[_cle_ligne_ah(nom, h)] = round(cote, 3)
+    if not lines:
+        return
+    snap = {"ts": datetime.now(timezone.utc).isoformat(), "lines": lines}
+    entry = fixtures.setdefault(fid, {"home": home, "away": away, "snapshots": []})
+    entry["home"], entry["away"] = home, away
+    snaps = entry.setdefault("snapshots", [])
+    if snaps:
+        prev = snaps[-1].get("lines") or {}
+        if prev == lines:
+            return
+    snaps.append(snap)
+    if FOOT_STEAM_MAX_SNAPSHOTS > 0 and len(snaps) > FOOT_STEAM_MAX_SNAPSHOTS:
+        entry["snapshots"] = snaps[-FOOT_STEAM_MAX_SNAPSHOTS:]
+
+    # Purge fixtures sans update > 36 h
+    now = datetime.now(timezone.utc)
+    for gid in list(fixtures.keys()):
+        s_list = fixtures[gid].get("snapshots") or []
+        if not s_list:
+            del fixtures[gid]
+            continue
+        try:
+            last_ts = datetime.fromisoformat(s_list[-1]["ts"].replace("Z", "+00:00"))
+            if (now - last_ts).total_seconds() > 36 * 3600:
+                del fixtures[gid]
+        except Exception:
+            del fixtures[gid]
+
+    _sauver_steam_history(data)
+
+
+def evaluer_steam_ah(fixture_id: int, equipe: str, handicap: float, cote: float) -> dict:
+    """
+    Drift Pinnacle sur la ligne AH depuis le plus ancien snapshot ≥ MIN_AGE.
+    move_pct > 0 = cote allongée = steam contre nous.
+    """
+    vide = {
+        "contre_nous": False, "avec_nous": False, "move_pct": 0.0,
+        "reference": None, "actuelle": None, "age_min": 0, "block": False,
+    }
+    if not FOOT_STEAM_ACTIF:
+        return vide
+    entry = _lire_steam_history().get("fixtures", {}).get(str(fixture_id), {})
+    snaps = entry.get("snapshots") or []
+    if len(snaps) < 2:
+        return vide
+
+    now = datetime.now(timezone.utc)
+    ref_snap = None
+    age_min = 0
+    for snap in snaps:
+        try:
+            ts = datetime.fromisoformat(snap["ts"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        delta_min = (now - ts).total_seconds() / 60.0
+        if delta_min >= FOOT_STEAM_MIN_AGE_MIN:
+            ref_snap = snap
+            age_min = int(delta_min)
+            break
+    if ref_snap is None:
+        return vide
+
+    cle = _cle_ligne_ah(equipe, handicap)
+    ref_cote = (ref_snap.get("lines") or {}).get(cle)
+    try:
+        cote_actuelle = float(cote)
+        ref_cote = float(ref_cote)
+    except (TypeError, ValueError):
+        return {**vide, "age_min": age_min}
+
+    if ref_cote <= 1.0 or cote_actuelle <= 1.0:
+        return {**vide, "age_min": age_min, "reference": ref_cote}
+
+    move_pct = (cote_actuelle - ref_cote) / ref_cote
+    return {
+        "contre_nous": move_pct >= FOOT_STEAM_WARN_PCT,
+        "avec_nous": move_pct <= -FOOT_STEAM_WARN_PCT,
+        "block": move_pct >= FOOT_STEAM_BLOCK_PCT,
+        "move_pct": round(move_pct, 4),
+        "reference": round(ref_cote, 3),
+        "actuelle": round(cote_actuelle, 3),
+        "age_min": age_min,
+    }
+
+
+def _filtre_steam_ah_ok(steam: dict, ev_final: float, ev_lo: float) -> tuple[bool, str]:
+    """AH only. False = skip candidat. Soft warn → EV min + FOOT_STEAM_EV_EXTRA."""
+    global _steam_logue
+    if not FOOT_STEAM_ACTIF:
+        return True, ""
+    if not _steam_logue:
+        _steam_logue = True
+        log_info(
+            f"📉 Steam AH : ref ≥{FOOT_STEAM_MIN_AGE_MIN} min, "
+            f"block ≥{FOOT_STEAM_BLOCK_PCT:.1%}, "
+            f"+{FOOT_STEAM_EV_EXTRA:.1%} EV si warn ≥{FOOT_STEAM_WARN_PCT:.1%}"
+        )
+    if steam.get("block"):
+        return False, (
+            f"block {steam['move_pct']:+.1%} "
+            f"({steam['reference']}→{steam['actuelle']})"
+        )
+    if steam.get("contre_nous"):
+        besoin = ev_lo + FOOT_STEAM_EV_EXTRA
+        if ev_final < besoin:
+            return False, (
+                f"edge insuffisant {steam['move_pct']:+.1%} "
+                f"(EV {ev_final:.1%} < {besoin:.1%})"
+            )
+    return True, ""
+
+
 async def evaluer_force_lineup(session, fixture_id, team_id, saison_correcte, default_power=1.0):
     """Bouclier H-1 : Vérifie si les titulaires habituels sont bien sur le terrain."""
     try:
@@ -2209,6 +2374,13 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
     home_team_odds = match_o['home_team']
     away_team_odds = match_o['away_team']
 
+    # Steam AH : snapshot Pinnacle spreads (avant filtre EV — construit l'historique)
+    spreads_mkt = next((mkt for mkt in pinnacle['markets'] if mkt.get('key') == 'spreads'), None)
+    if spreads_mkt:
+        enregistrer_snapshot_ah(
+            id_m, home_team_odds, away_team_odds, spreads_mkt.get('outcomes') or []
+        )
+
     mat_preliminaire = generer_matrice_dixon(max(0.4, L_A_base), max(0.4, L_B_base), ligue['id'], saison_correcte)
     match_potentiel = False
 
@@ -2368,6 +2540,18 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                 pari_display = f"{nom} {h:g}"
 
             ev_final = (ev_modele * poids_dyn) + (ev_pinnacle * (1 - poids_dyn))
+
+            if market_key == 'spreads' and FOOT_STEAM_ACTIF:
+                steam = evaluer_steam_ah(id_m, nom, h, cote)
+                ok_steam, raison_steam = _filtre_steam_ah_ok(steam, ev_final, ev_lo)
+                if not ok_steam:
+                    log_info(f"🚫 Steam AH skip {n_d}-{n_e} {pari_display} : {raison_steam}")
+                    continue
+                if steam.get("avec_nous") and abs(steam.get("move_pct", 0)) >= FOOT_STEAM_WARN_PCT:
+                    log_info(
+                        f"📈 Steam AH avec nous {pari_display} "
+                        f"{steam['move_pct']:+.1%} ({steam['reference']}→{steam['actuelle']})"
+                    )
 
             if ev_lo <= ev_final <= ev_hi:
                 mise_u = round((kelly_theorique * 100) * KELLY_COURANT, 2)
@@ -3571,6 +3755,13 @@ async def main_loop():
             f"😴 Fatigue AH : ≤{FOOT_FATIGUE_MAX_MATCHS-1} matchs "
             f"/{FOOT_FATIGUE_FENETRE_J:.0f}j avant, {repos_txt}, {cup_txt} "
             f"(mode {FOOT_FATIGUE_AH_MODE})"
+        )
+    if FOOT_STEAM_ACTIF:
+        log_info(
+            f"📉 Steam AH : ref ≥{FOOT_STEAM_MIN_AGE_MIN} min, "
+            f"block ≥{FOOT_STEAM_BLOCK_PCT:.0%}, "
+            f"warn ≥{FOOT_STEAM_WARN_PCT:.0%} (+{FOOT_STEAM_EV_EXTRA:.0%} EV) "
+            f"— live only (pas de BT)"
         )
 
     # Détection initiale de la couverture xG + collecte historique des scores
