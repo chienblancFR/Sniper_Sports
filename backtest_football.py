@@ -107,6 +107,18 @@ API_ODDS_KEY     = os.getenv("API_ODDS_KEY")
 
 URL_FOOTBALL = "https://v3.football.api-sports.io"
 
+def _env_bool_bt(key: str, default: bool) -> bool:
+    v = os.environ.get(key, str(default)).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+# Fatigue AH (parité live sniper_bot_foot — coupe UEFA absente de bt_fixtures)
+FOOT_FATIGUE_AH_ACTIF = _env_bool_bt("FOOT_FATIGUE_AH_ACTIF", True)
+FOOT_FATIGUE_FENETRE_J = float(os.environ.get("FOOT_FATIGUE_FENETRE_J", "7"))
+FOOT_FATIGUE_MAX_MATCHS = int(os.environ.get("FOOT_FATIGUE_MAX_MATCHS", "3"))
+FOOT_FATIGUE_MIN_REPOS_J = float(os.environ.get("FOOT_FATIGUE_MIN_REPOS_J", "3"))
+FOOT_FATIGUE_AH_MODE = os.environ.get("FOOT_FATIGUE_AH_MODE", "either").strip().lower()
+
 
 def _headers_football():
     return {"x-apisports-key": API_FOOTBALL_KEY, "v": "3"}
@@ -1590,6 +1602,82 @@ def _ev_min_pour_marche(market, ligue_id, ev_min_l, ev_min_by_market=None,
     return ev_min_l
 
 
+def _parse_dt_bt(raw) -> datetime | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        dt = raw
+    else:
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+async def _preload_calendrier_fatigue(conn) -> dict[int, list[datetime]]:
+    """team_id → dates de match FT triées (toutes ligues en base)."""
+    cal: dict[int, list[datetime]] = defaultdict(list)
+    async with conn.execute(
+        "SELECT home_id, away_id, date_utc FROM bt_fixtures WHERE gh IS NOT NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    for hid, aid, date_utc in rows:
+        dt = _parse_dt_bt(date_utc)
+        if dt is None:
+            continue
+        if hid is not None:
+            cal[int(hid)].append(dt)
+        if aid is not None:
+            cal[int(aid)].append(dt)
+    for tid in cal:
+        cal[tid].sort()
+    return cal
+
+
+def _equipe_fatigue_bt(
+    dates: list[datetime], kickoff_raw, fenetre_j: float, max_matchs: int, min_repos_j: float
+) -> bool:
+    ko = _parse_dt_bt(kickoff_raw)
+    if ko is None or not dates:
+        return False
+    fenetre = max(1.0, fenetre_j)
+    debut = ko - timedelta(days=fenetre)
+    n_avant = sum(1 for d in dates if debut <= d < ko)
+    if n_avant >= max(1, max_matchs) - 1:
+        return True
+    if min_repos_j > 0:
+        precedents = [d for d in dates if d < ko]
+        if precedents:
+            repos_j = (ko - precedents[-1]).total_seconds() / 86400.0
+            if repos_j < min_repos_j:
+                return True
+    return False
+
+
+def _match_fatigue_ah_bt(cal: dict, h_id, a_id, date_utc) -> bool:
+    if not FOOT_FATIGUE_AH_ACTIF:
+        return False
+    mode = FOOT_FATIGUE_AH_MODE if FOOT_FATIGUE_AH_MODE in ("either", "home", "away") else "either"
+    checks = []
+    if mode in ("either", "home") and h_id is not None:
+        checks.append(int(h_id))
+    if mode in ("either", "away") and a_id is not None:
+        checks.append(int(a_id))
+    for tid in checks:
+        if _equipe_fatigue_bt(
+            cal.get(tid, []),
+            date_utc,
+            FOOT_FATIGUE_FENETRE_J,
+            FOOT_FATIGUE_MAX_MATCHS,
+            FOOT_FATIGUE_MIN_REPOS_J,
+        ):
+            return True
+    return False
+
+
 def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
                           markets=('spreads', 'totals'), poids_dyn=None,
                           ev_max_by_market=None, ev_min_by_market=None,
@@ -1953,6 +2041,16 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
     if calibrer_ah:
         min_c = CALIB_AH_MIN_SAMPLES_ISOTONIC if calibrer_ah == "isotonic" else CALIB_AH_MIN_SAMPLES_PLATT
         print(f"  📐 Calibration AH walk-forward : {calibrer_ah} (min {min_c} paris/ligue)")
+    if FOOT_FATIGUE_AH_ACTIF:
+        repos = (
+            f"repos≥{FOOT_FATIGUE_MIN_REPOS_J:g}j"
+            if FOOT_FATIGUE_MIN_REPOS_J > 0 else "repos off"
+        )
+        print(
+            f"  😴 Fatigue AH : ≤{FOOT_FATIGUE_MAX_MATCHS - 1} matchs "
+            f"/{FOOT_FATIGUE_FENETRE_J:.0f}j avant, {repos} "
+            f"(mode {FOOT_FATIGUE_AH_MODE}; coupe UEFA N/A en BT)"
+        )
 
     if n_odds == 0:
         print("\n  ⚠️  AUCUNE cote H-24 trouvée — la collecte d'odds a échoué.")
@@ -1962,6 +2060,8 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
 
     all_pending = []
     ligues = ligues or CHAMPIONNATS
+    cal_fatigue = await _preload_calendrier_fatigue(conn) if FOOT_FATIGUE_AH_ACTIF else {}
+    n_skip_fatigue = 0
 
     for ligue in ligues:
         async with conn.execute(
@@ -2075,6 +2175,14 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
                 calibrateur=calibrateur,
             )
 
+            if FOOT_FATIGUE_AH_ACTIF and _match_fatigue_ah_bt(
+                cal_fatigue, h_id, a_id, date_utc
+            ):
+                n_ah_avant = sum(1 for c in candidats if c[1] == 'spreads')
+                if n_ah_avant:
+                    n_skip_fatigue += n_ah_avant
+                    candidats = [c for c in candidats if c[1] != 'spreads']
+
             if not candidats:
                 continue
 
@@ -2127,6 +2235,9 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
 
         all_pending.extend(pending)
         print(f"  {ligue['nom']} : {signaux} signaux générés")
+
+    if FOOT_FATIGUE_AH_ACTIF and n_skip_fatigue:
+        print(f"  😴 AH skippés (fatigue domestique) : {n_skip_fatigue}")
 
     print(f"\n  📝 Total calculé : {len(all_pending)} signaux — écriture en base...")
     n_saved = await persister_signaux(all_pending)

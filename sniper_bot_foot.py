@@ -151,6 +151,19 @@ FOOT_EV_MIN_AH_TIER = _env_bool("FOOT_EV_MIN_AH_TIER", True)
 FOOT_AH_MAX_LIGUE_SAISON = int(os.environ.get("FOOT_AH_MAX_LIGUE_SAISON", "0"))
 _CALIB_AH_STORE: dict = {}
 
+# Filtre fatigue / congestion / coupe Europe — AH only (totaux inchangés)
+FOOT_FATIGUE_AH_ACTIF = _env_bool("FOOT_FATIGUE_AH_ACTIF", True)
+FOOT_FATIGUE_FENETRE_J = float(os.environ.get("FOOT_FATIGUE_FENETRE_J", "7"))
+# Skip AH si déjà ≥ (MAX-1) matchs FT dans la fenêtre (MAX=3 → 2 joués = 3e match)
+FOOT_FATIGUE_MAX_MATCHS = int(os.environ.get("FOOT_FATIGUE_MAX_MATCHS", "3"))
+FOOT_FATIGUE_MIN_REPOS_J = float(os.environ.get("FOOT_FATIGUE_MIN_REPOS_J", "3"))  # 0 = off
+FOOT_FATIGUE_CUP_ACTIF = _env_bool("FOOT_FATIGUE_CUP_ACTIF", True)
+FOOT_FATIGUE_CUP_HEURES = float(os.environ.get("FOOT_FATIGUE_CUP_HEURES", "72"))
+FOOT_FATIGUE_AH_MODE = os.environ.get("FOOT_FATIGUE_AH_MODE", "either").strip().lower()
+# UEFA CL / EL / Conference (API-Football)
+_UEFA_LIGUE_IDS = {2, 3, 848}
+_cache_calendrier_equipe: dict[tuple, list] = {}
+
 # Alerte monitoring API down (Telegram only — n'influence ni EV ni Kelly)
 FOOT_API_ALERT = _env_bool("FOOT_API_ALERT", True)
 FOOT_API_ALERT_SEUIL = int(os.environ.get("FOOT_API_ALERT_SEUIL", "3"))
@@ -1897,6 +1910,128 @@ async def evaluer_impact_blessures(session, fixture_id, team_id, default_power=1
     except Exception:
         return default_power
 
+
+def _parse_kickoff_dt(raw) -> datetime | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        dt = raw
+    else:
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+async def _calendrier_equipe_recent(session, team_id: int, kickoff_dt: datetime) -> list:
+    """
+    Fixtures FT de l'équipe (toutes compétitions) sur une fenêtre élargie.
+    Cache mémoire par (team_id, jour UTC) pour limiter le quota API.
+    """
+    ko = _parse_kickoff_dt(kickoff_dt)
+    if ko is None or not team_id:
+        return []
+    cache_key = (int(team_id), ko.strftime("%Y-%m-%d"))
+    if cache_key in _cache_calendrier_equipe:
+        return _cache_calendrier_equipe[cache_key]
+
+    fenetre = max(1.0, FOOT_FATIGUE_FENETRE_J)
+    cup_j = max(0.0, FOOT_FATIGUE_CUP_HEURES) / 24.0
+    lookback = max(fenetre, cup_j, FOOT_FATIGUE_MIN_REPOS_J) + 1.0
+    debut = (ko - timedelta(days=lookback)).strftime("%Y-%m-%d")
+    fin = ko.strftime("%Y-%m-%d")
+    url = (
+        f"{URL_FOOTBALL}/fixtures?team={int(team_id)}"
+        f"&from={debut}&to={fin}&status=FT"
+    )
+    res = await fetch_async(session, url, HEADERS_FB)
+    rows = []
+    for item in (res or {}).get("response") or []:
+        fx = item.get("fixture") or {}
+        lg = item.get("league") or {}
+        dt = _parse_kickoff_dt(fx.get("date"))
+        if dt is None or dt >= ko:
+            continue
+        try:
+            lid = int(lg.get("id") or 0)
+        except (TypeError, ValueError):
+            lid = 0
+        rows.append({"date": dt, "ligue_id": lid, "fixture_id": fx.get("id")})
+    rows.sort(key=lambda r: r["date"])
+    _cache_calendrier_equipe[cache_key] = rows
+    return rows
+
+
+def _raisons_fatigue_equipe(
+    past_rows: list, kickoff_dt: datetime, ligue_domestique_id: int | None
+) -> list[str]:
+    """Règles congestion / repos / coupe — listes de raisons (vide = OK)."""
+    raisons: list[str] = []
+    ko = _parse_kickoff_dt(kickoff_dt)
+    if ko is None:
+        return raisons
+
+    fenetre = max(1.0, FOOT_FATIGUE_FENETRE_J)
+    debut_fen = ko - timedelta(days=fenetre)
+    dans_fenetre = [r for r in past_rows if debut_fen <= r["date"] < ko]
+    seuil_avant = max(1, FOOT_FATIGUE_MAX_MATCHS) - 1
+    if len(dans_fenetre) >= seuil_avant:
+        raisons.append(
+            f"congestion {len(dans_fenetre)+1}e match/{fenetre:.0f}j"
+        )
+
+    if FOOT_FATIGUE_MIN_REPOS_J > 0 and past_rows:
+        dernier = past_rows[-1]["date"]
+        repos_j = (ko - dernier).total_seconds() / 86400.0
+        if repos_j < FOOT_FATIGUE_MIN_REPOS_J:
+            raisons.append(f"repos {repos_j:.1f}j < {FOOT_FATIGUE_MIN_REPOS_J:g}j")
+
+    if FOOT_FATIGUE_CUP_ACTIF and FOOT_FATIGUE_CUP_HEURES > 0:
+        cup_from = ko - timedelta(hours=FOOT_FATIGUE_CUP_HEURES)
+        for r in past_rows:
+            if r["date"] < cup_from:
+                continue
+            lid = r["ligue_id"]
+            if lid in _UEFA_LIGUE_IDS and lid != ligue_domestique_id:
+                heures = (ko - r["date"]).total_seconds() / 3600.0
+                raisons.append(f"coupe UEFA il y a {heures:.0f}h")
+                break
+
+    return raisons
+
+
+async def match_en_fatigue_ah(
+    session, id_d: int, id_e: int, kickoff_dt, ligue_id: int
+) -> tuple[bool, str]:
+    """
+    True si l'AH doit être skippé (fatigue). Totaux non concernés.
+    Mode either : home OU away fatigué → skip.
+    """
+    if not FOOT_FATIGUE_AH_ACTIF:
+        return False, ""
+
+    mode = FOOT_FATIGUE_AH_MODE if FOOT_FATIGUE_AH_MODE in ("either", "home", "away") else "either"
+    checks: list[tuple[str, int]] = []
+    if mode in ("either", "home"):
+        checks.append(("dom", id_d))
+    if mode in ("either", "away"):
+        checks.append(("ext", id_e))
+
+    details = []
+    for label, tid in checks:
+        rows = await _calendrier_equipe_recent(session, tid, kickoff_dt)
+        raisons = _raisons_fatigue_equipe(rows, kickoff_dt, ligue_id)
+        if raisons:
+            details.append(f"{label}: {', '.join(raisons)}")
+
+    if not details:
+        return False, ""
+    return True, " | ".join(details)
+
+
 async def evaluer_force_lineup(session, fixture_id, team_id, saison_correcte, default_power=1.0):
     """Bouclier H-1 : Vérifie si les titulaires habituels sont bien sur le terrain."""
     try:
@@ -2105,6 +2240,16 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
     if not match_potentiel:
         return
 
+    # Fatigue / congestion / coupe — AH only (après prelim pour économiser l'API)
+    skip_ah_fatigue = False
+    detail_fatigue = ""
+    if FOOT_FATIGUE_AH_ACTIF:
+        skip_ah_fatigue, detail_fatigue = await match_en_fatigue_ah(
+            session, id_d, id_e, dt_obj, ligue['id']
+        )
+        if skip_ah_fatigue:
+            log_info(f"😴 Skip AH fatigue {n_d}-{n_e} : {detail_fatigue}")
+
     # 2. FILTRE H-24 : Impact des Blessures (Uniquement sur les matchs prometteurs)
     force_blessure_d = await evaluer_impact_blessures(session, id_m, id_d)
     force_blessure_e = await evaluer_impact_blessures(session, id_m, id_e)
@@ -2153,6 +2298,8 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
         if market_key not in ('spreads', 'totals'):
             continue
         if market_key in marches_bloques:
+            continue
+        if market_key == 'spreads' and skip_ah_fatigue:
             continue
         if (
             market_key == 'spreads'
@@ -3410,6 +3557,20 @@ async def main_loop():
         log_info(
             f"🚨 Alerte API down : seuil {FOOT_API_ALERT_SEUIL} échecs "
             f"(cooldown {FOOT_API_ALERT_COOLDOWN_H:.0f}h) — Odds + API-Football"
+        )
+    if FOOT_FATIGUE_AH_ACTIF:
+        cup_txt = (
+            f"coupe UEFA <{FOOT_FATIGUE_CUP_HEURES:.0f}h"
+            if FOOT_FATIGUE_CUP_ACTIF else "sans filtre coupe"
+        )
+        repos_txt = (
+            f"repos≥{FOOT_FATIGUE_MIN_REPOS_J:g}j"
+            if FOOT_FATIGUE_MIN_REPOS_J > 0 else "repos off"
+        )
+        log_info(
+            f"😴 Fatigue AH : ≤{FOOT_FATIGUE_MAX_MATCHS-1} matchs "
+            f"/{FOOT_FATIGUE_FENETRE_J:.0f}j avant, {repos_txt}, {cup_txt} "
+            f"(mode {FOOT_FATIGUE_AH_MODE})"
         )
 
     # Détection initiale de la couverture xG + collecte historique des scores
