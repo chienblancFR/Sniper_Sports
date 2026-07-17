@@ -151,6 +151,18 @@ FOOT_EV_MIN_AH_TIER = _env_bool("FOOT_EV_MIN_AH_TIER", True)
 FOOT_AH_MAX_LIGUE_SAISON = int(os.environ.get("FOOT_AH_MAX_LIGUE_SAISON", "0"))
 _CALIB_AH_STORE: dict = {}
 
+# Alerte monitoring API down (Telegram only — n'influence ni EV ni Kelly)
+FOOT_API_ALERT = _env_bool("FOOT_API_ALERT", True)
+FOOT_API_ALERT_SEUIL = int(os.environ.get("FOOT_API_ALERT_SEUIL", "3"))
+FOOT_API_ALERT_COOLDOWN_H = float(os.environ.get("FOOT_API_ALERT_COOLDOWN_H", "6"))
+_echecs_api_consecutifs: dict[str, int] = {}
+_dernier_alerte_api: dict[str, datetime] = {}
+
+_API_SOURCE_LABELS = {
+    "football": "API-Football",
+    "odds": "Odds API (Pinnacle)",
+}
+
 
 def _recharger_calib_ah():
     global _CALIB_AH_STORE
@@ -1241,7 +1253,59 @@ HEADERS_FB = {"x-apisports-key": API_FOOTBALL_KEY, "v": "3"}
 # ==========================================
 # 🛠️ 2. OUTILS SYSTÈME
 # ==========================================
+def _api_source_from_url(url: str) -> str | None:
+    """Classe Odds / API-Football pour l'alerte ops (ignore météo etc.)."""
+    u = (url or "").lower()
+    if "api-sports" in u or "api-football" in u:
+        return "football"
+    if "the-odds-api" in u:
+        return "odds"
+    return None
+
+
+def _noter_succes_api(source: str | None) -> None:
+    if source:
+        _echecs_api_consecutifs[source] = 0
+
+
+async def alerter_api_down(
+    session, source: str, detail: str, *, immediat: bool = False
+) -> None:
+    """
+    Monitoring pur : échecs consécutifs Odds / API-Football → Telegram.
+    Aucun effet sur EV / Kelly / filtres / prises.
+    """
+    if not FOOT_API_ALERT or not source:
+        return
+
+    n = _echecs_api_consecutifs.get(source, 0) + 1
+    _echecs_api_consecutifs[source] = n
+    if not immediat and n < max(1, FOOT_API_ALERT_SEUIL):
+        return
+
+    now = datetime.now(timezone.utc)
+    dernier = _dernier_alerte_api.get(source)
+    if dernier is not None:
+        heures = (now - dernier).total_seconds() / 3600.0
+        if heures < FOOT_API_ALERT_COOLDOWN_H:
+            return
+
+    label = _API_SOURCE_LABELS.get(source, source)
+    msg = (
+        f"🚨 *Alerte API down — {label}*\n"
+        f"Échecs consécutifs : *{n}* "
+        f"(seuil {FOOT_API_ALERT_SEUIL}"
+        f"{', immédiat 401/403' if immediat else ''}).\n"
+        f"Détail : `{detail[:120]}`\n"
+        f"_Monitoring uniquement — aucune mise bloquée._"
+    )
+    await envoyer_telegram_async(session, msg)
+    _dernier_alerte_api[source] = now
+    log_info(f"🚨 Alerte API down ({label}) : {detail[:100]} (n={n})")
+
+
 async def fetch_async(session, url, headers=None, retries=3):
+    source = _api_source_from_url(url)
     async with semaphore:
         for attempt in range(retries):
             try:
@@ -1250,6 +1314,7 @@ async def fetch_async(session, url, headers=None, retries=3):
                         remaining = response.headers.get('x-ratelimit-requests-remaining')
                         if remaining is not None and int(remaining) < 10:
                             log_info(f"⚠️ QUOTA API-Football bas : {remaining} requêtes restantes !")
+                        _noter_succes_api(source)
                         return await response.json()
                     if response.status == 429:
                         wait = 60 * (attempt + 1)
@@ -1257,11 +1322,19 @@ async def fetch_async(session, url, headers=None, retries=3):
                         await asyncio.sleep(wait)
                         continue
                     log_info(f"⚠️ HTTP {response.status} (tentative {attempt+1}/{retries}) : {url[:80]}")
+                    immediat = response.status in (401, 403)
+                    await alerter_api_down(
+                        session, source, f"HTTP {response.status}", immediat=immediat
+                    )
                     return None
             except Exception as e:
                 wait = 2 ** attempt
                 log_info(f"⚠️ fetch_async erreur (tentative {attempt+1}/{retries}, pause {wait}s) : {e}")
                 await asyncio.sleep(wait)
+                if attempt == retries - 1:
+                    await alerter_api_down(session, source, str(e), immediat=False)
+                    return None
+        await alerter_api_down(session, source, "retries épuisés (429)", immediat=False)
         return None
 
 async def envoyer_telegram_async(session, msg):
@@ -3332,6 +3405,11 @@ async def main_loop():
         log_info(
             f"🎚️ P1 AH live : EV max {FOOT_EV_MAX_AH:.0%}, {tier_txt}, {cap_txt} "
             f"(parité backtest --p1-ah)"
+        )
+    if FOOT_API_ALERT:
+        log_info(
+            f"🚨 Alerte API down : seuil {FOOT_API_ALERT_SEUIL} échecs "
+            f"(cooldown {FOOT_API_ALERT_COOLDOWN_H:.0f}h) — Odds + API-Football"
         )
 
     # Détection initiale de la couverture xG + collecte historique des scores
