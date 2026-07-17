@@ -13,6 +13,7 @@ from foot_params import RHO_DEFAULT, get_dc_half_life_days, get_dc_xg_blend, get
 from utils import (
     appliquer_calibrateur_ah,
     ajuster_ev_proportionnel,
+    get_ev_min_spreads_ligue,
     load_calibration_ah,
     FOOT_CALIB_AH_FILE_DEFAULT,
 )
@@ -141,6 +142,12 @@ FOOT_SCAN_HEURES_MIN = float(os.environ.get("FOOT_SCAN_HEURES_MIN", "18"))
 # Calibration P(couverture) AH — foot_calibration_ah.json (--fit-calibration platt)
 FOOT_CALIB_AH = _env_bool("FOOT_CALIB_AH", False)
 FOOT_CALIB_AH_FILE = os.environ.get("FOOT_CALIB_AH_FILE", FOOT_CALIB_AH_FILE_DEFAULT)
+
+# Preset P1 volume AH (parité backtest --p1-ah) : EV max 9 %, EV min par tier, cap 45/ligue/saison
+FOOT_P1_AH = _env_bool("FOOT_P1_AH", True)
+FOOT_EV_MAX_AH = float(os.environ.get("FOOT_EV_MAX_AH", "0.09"))
+FOOT_EV_MIN_AH_TIER = _env_bool("FOOT_EV_MIN_AH_TIER", True)
+FOOT_AH_MAX_LIGUE_SAISON = int(os.environ.get("FOOT_AH_MAX_LIGUE_SAISON", "45"))
 _CALIB_AH_STORE: dict = {}
 
 
@@ -1538,6 +1545,48 @@ def obtenir_saison_api(nom_ligue):
     else:
         return annee_actuelle
 
+
+def _debut_saison_iso(nom_ligue: str, saison: int) -> str:
+    """Borne basse kickoff/timestamp pour compter les AH d'une saison API."""
+    ligues_estivales = ["Série A Brésil", "Allsvenskan", "MLS", "Eliteserien"]
+    if any(mot in nom_ligue for mot in ligues_estivales):
+        return f"{saison}-01-01"
+    return f"{saison}-07-01"
+
+
+async def compter_ah_ligue_saison(conn, ligue_nom: str, saison: int) -> int:
+    """Nombre de paris AH déjà loggés pour cette ligue depuis le début de saison."""
+    debut = _debut_saison_iso(ligue_nom, saison)
+    like_ligue = f"%{ligue_nom}%[spreads]%"
+    async with conn.execute(
+        """SELECT COUNT(*) FROM paris_log
+           WHERE ligue LIKE ?
+             AND (
+               (kickoff IS NOT NULL AND kickoff >= ?)
+               OR (kickoff IS NULL AND timestamp >= ?)
+             )""",
+        (like_ligue, debut, debut),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _bornes_ev_marche(market_key: str, ligue: dict, bump_rotation: float) -> tuple[float, float]:
+    """
+    EV min/max par marché. Preset P1 (FOOT_P1_AH) : AH plafonné à FOOT_EV_MAX_AH
+    et EV min par tier ligue ; totaux inchangés (ev_min/max ligue).
+    """
+    if market_key == 'spreads' and FOOT_P1_AH:
+        if FOOT_EV_MIN_AH_TIER:
+            ev_lo = get_ev_min_spreads_ligue(ligue['id'], ligue['ev_min'])
+        else:
+            ev_lo = ligue['ev_min']
+        ev_lo = ev_lo + bump_rotation
+        ev_hi = FOOT_EV_MAX_AH
+        return ev_lo, ev_hi
+    return ligue['ev_min'] + bump_rotation, ligue['ev_max']
+
+
 async def obtenir_meteo(session, team_home_id, kickoff_dt=None):
     """
     Récupère la météo prévue à l'heure du coup d'envoi (forecast).
@@ -1866,8 +1915,6 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
     # → à H-24 live ≈ backtest (~23 % modèle). Fenêtre de prise = FOOT_SCAN_* seulement.
     poids_dyn = 0.10 + 0.20 * min(1.0, (hr - 0.9) / (36.0 - 0.9))
 
-    # EV min ligue (plus de paliers H-3/H-6 : hors bande FOOT_SCAN)
-    ev_min_effectif = ligue['ev_min']
     hko_label = f"🟢 H-{hr:.1f} (bande H-{FOOT_SCAN_HEURES_MAX:.0f}→H-{FOOT_SCAN_HEURES_MIN:.0f})"
 
     n_d_m = NAME_MAPPING.get(n_d, n_d)
@@ -2012,14 +2059,19 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
     # Meilleur signal par type de marché (AH + totaux indépendants sur le même match)
     if mat_lineup_drop is not None:
         mat_actif = mat_lineup_drop
-        ev_min_rotation = ev_min_effectif + 0.02
+        bump_rotation = 0.02
     else:
         mat_actif = mat
-        ev_min_rotation = ev_min_effectif
+        bump_rotation = 0.0
 
     # Collecte candidats AH + totaux → meilleur EV par marché (max 2 paris/match)
     async with db_lock:
         marches_bloques = await _marches_pending_sur_match(db_conn, id_m)
+        n_ah_saison = 0
+        if FOOT_P1_AH and FOOT_AH_MAX_LIGUE_SAISON > 0:
+            n_ah_saison = await compter_ah_ligue_saison(
+                db_conn, ligue['nom'], saison_correcte
+            )
 
     candidats = []
     for market in pinnacle['markets']:
@@ -2028,7 +2080,15 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
             continue
         if market_key in marches_bloques:
             continue
+        if (
+            market_key == 'spreads'
+            and FOOT_P1_AH
+            and FOOT_AH_MAX_LIGUE_SAISON > 0
+            and n_ah_saison >= FOOT_AH_MAX_LIGUE_SAISON
+        ):
+            continue
         outcomes = market['outcomes']
+        ev_lo, ev_hi = _bornes_ev_marche(market_key, ligue, bump_rotation)
 
         for out in outcomes:
             h, cote, nom = float(out['point']), float(out['price']), out['name']
@@ -2088,7 +2148,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
 
             ev_final = (ev_modele * poids_dyn) + (ev_pinnacle * (1 - poids_dyn))
 
-            if ev_min_rotation <= ev_final <= ligue['ev_max']:
+            if ev_lo <= ev_final <= ev_hi:
                 mise_u = round((kelly_theorique * 100) * KELLY_COURANT, 2)
                 mise_u = min(mise_u, 5.0)
                 if mise_u >= 0.1:
@@ -2119,6 +2179,22 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                 f"Skip {best['market_key']} {n_d}-{n_e}: pari {best['market_key']} déjà PENDING"
             )
             continue
+
+        if (
+            best['market_key'] == 'spreads'
+            and FOOT_P1_AH
+            and FOOT_AH_MAX_LIGUE_SAISON > 0
+        ):
+            async with db_lock:
+                n_ah_saison = await compter_ah_ligue_saison(
+                    db_conn, ligue['nom'], saison_correcte
+                )
+            if n_ah_saison >= FOOT_AH_MAX_LIGUE_SAISON:
+                log_info(
+                    f"Skip AH {ligue['nom']} {n_d}-{n_e}: "
+                    f"cap saison {n_ah_saison}/{FOOT_AH_MAX_LIGUE_SAISON}"
+                )
+                continue
 
         h, cote, nom = best['h'], best['cote'], best['nom']
         ev_final = best['ev_final']
@@ -3245,6 +3321,16 @@ async def main_loop():
         log_info(
             f"📡 Alerte CLV moyenne : seuil {FOOT_CLV_ALERT_SEUIL:+.0%} "
             f"sur {FOOT_CLV_ALERT_FENETRE} paris (cooldown {FOOT_CLV_ALERT_COOLDOWN_H:.0f}h)"
+        )
+    if FOOT_P1_AH:
+        tier_txt = "tier Top7/Mid6/Niche5" if FOOT_EV_MIN_AH_TIER else "EV min ligue"
+        cap_txt = (
+            f"cap {FOOT_AH_MAX_LIGUE_SAISON}/ligue/saison"
+            if FOOT_AH_MAX_LIGUE_SAISON > 0 else "sans cap"
+        )
+        log_info(
+            f"🎚️ P1 AH live : EV max {FOOT_EV_MAX_AH:.0%}, {tier_txt}, {cap_txt} "
+            f"(parité backtest --p1-ah)"
         )
 
     # Détection initiale de la couverture xG + collecte historique des scores

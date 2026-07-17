@@ -171,7 +171,7 @@ LIGUES_EUROPEENNES = {
     140, 78, 88, 135, 94, 203, 61, 141, 39, 40, 144, 136,
 }
 
-# Preset P1 — réduction volume AH (backtest only, live inchangé)
+# Preset P1 — réduction volume AH (live : FOOT_P1_AH dans sniper_bot_foot.py)
 P1_AH_EV_MAX_SPREADS = 0.09
 P1_AH_MAX_LIGUE_SAISON = 45
 
