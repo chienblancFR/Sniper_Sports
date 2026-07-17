@@ -143,11 +143,12 @@ FOOT_SCAN_HEURES_MIN = float(os.environ.get("FOOT_SCAN_HEURES_MIN", "18"))
 FOOT_CALIB_AH = _env_bool("FOOT_CALIB_AH", False)
 FOOT_CALIB_AH_FILE = os.environ.get("FOOT_CALIB_AH_FILE", FOOT_CALIB_AH_FILE_DEFAULT)
 
-# Preset P1 volume AH (parité backtest --p1-ah) : EV max 9 %, EV min par tier, cap 45/ligue/saison
+# Preset P1 volume AH (parité backtest --p1-ah) : EV max 9 %, EV min par tier
+# Cap / ligue / saison désactivé (0) : first-come live ≠ top-EV backtest
 FOOT_P1_AH = _env_bool("FOOT_P1_AH", True)
 FOOT_EV_MAX_AH = float(os.environ.get("FOOT_EV_MAX_AH", "0.09"))
 FOOT_EV_MIN_AH_TIER = _env_bool("FOOT_EV_MIN_AH_TIER", True)
-FOOT_AH_MAX_LIGUE_SAISON = int(os.environ.get("FOOT_AH_MAX_LIGUE_SAISON", "45"))
+FOOT_AH_MAX_LIGUE_SAISON = int(os.environ.get("FOOT_AH_MAX_LIGUE_SAISON", "0"))
 _CALIB_AH_STORE: dict = {}
 
 

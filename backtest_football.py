@@ -171,9 +171,9 @@ LIGUES_EUROPEENNES = {
     140, 78, 88, 135, 94, 203, 61, 141, 39, 40, 144, 136,
 }
 
-# Preset P1 — réduction volume AH (live : FOOT_P1_AH dans sniper_bot_foot.py)
+# Preset P1 — réduction volume AH (live + backtest : EV max 9% + tier ; cap optionnel via --max-ah-ligue-saison)
 P1_AH_EV_MAX_SPREADS = 0.09
-P1_AH_MAX_LIGUE_SAISON = 45
+P1_AH_MAX_LIGUE_SAISON = 45  # exploration only — plus dans --p1-ah (parité live)
 
 CHAMPIONNATS = [
     {"nom": "La Liga",          "id": 140, "key": "soccer_spain_la_liga",            "c1": 4,  "euro": 6,  "rel": 18, "ev_min": 0.05, "ev_max": 0.15},
@@ -2350,11 +2350,10 @@ def explore_ev_filtres(signaux):
         sub = _cap_signaux_posthoc(base_ah_cap, cap)
         _ligne(f"cap {cap} AH/lig/s", sub)
 
-    print("\n  Preset --p1-ah (tier + cap 45 + EV AH ≤ 9%) :")
+    print("\n  Preset --p1-ah (tier + EV AH ≤ 9%, sans cap — parité live) :")
     p1_sub = _filtrer_signaux_ev(
         signaux, ev_max_spreads=0.09, ev_min_spreads_tier=True,
     )
-    p1_sub = _cap_signaux_posthoc(p1_sub, P1_AH_MAX_LIGUE_SAISON)
     _ligne("p1-ah", p1_sub)
     st_p1_ah = _resume_signaux([s for s in p1_sub if s[3] == 'spreads'])
     if st_p1_ah:
@@ -2364,6 +2363,9 @@ def explore_ev_filtres(signaux):
             f"\n     AH seul : n={st_p1_ah['n']} (~{per_ah:.0f}/lig/s), "
             f"CLV={st_p1_ah['clv']:+.2%}, ROI={st_p1_ah['roi']:+.2%}, "
             f"P&L={st_p1_ah['pnl']:+.1f}u"
+        )
+        print(
+            f"     Cap optionnel (exploration) : --max-ah-ligue-saison {P1_AH_MAX_LIGUE_SAISON}"
         )
 
     # Recommandation synthétique
@@ -2749,7 +2751,7 @@ async def main():
     parser.add_argument('--max-ah-ligue-saison', type=int, default=None,
                         help='Cap signaux AH / ligue / saison (meilleurs EV). Backtest only.')
     parser.add_argument('--p1-ah', action='store_true',
-                        help='Preset volume AH : ev-max-spreads 9%%, ev-min tier, cap 45 AH/ligue/saison')
+                        help='Preset volume AH : ev-max-spreads 9%% + ev-min tier (sans cap ; parité live)')
     parser.add_argument('--calibrer-ah', type=str, default=None, choices=('platt', 'isotonic'),
                         help='Calibration walk-forward P(couverture) AH par ligue (backtest only)')
     parser.add_argument('--fit-calibration', type=str, default=None, choices=('platt', 'isotonic'),
@@ -2803,8 +2805,7 @@ async def main():
             ev_max_by_market['spreads'] = P1_AH_EV_MAX_SPREADS
         if args.ev_min_spreads is None and not args.ev_min_spreads_tier:
             ev_min_spreads_tier = True
-        if max_ah_ligue_saison is None:
-            max_ah_ligue_saison = P1_AH_MAX_LIGUE_SAISON
+        # Pas de cap auto : FIFO live ≠ top-EV ; utiliser --max-ah-ligue-saison N si besoin
 
     if args.ev_min_spreads is not None:
         ev_min_by_market['spreads'] = args.ev_min_spreads
