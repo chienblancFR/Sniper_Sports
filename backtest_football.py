@@ -51,6 +51,10 @@ Reset (avant de relancer le backtest / dashboard) :
   python backtest_football.py --fit-calibration platt
       → Fit offline bt_signaux → foot_calibration_ah.json (live : FOOT_CALIB_AH=true)
 
+  python backtest_football.py --valider-calib-ah
+      → Étape B : compare Platt/isotonic (ligue/global) en walk-forward vs Brier Pinnacle
+        puis enregistre le meilleur modèle dans foot_calibration_ah.json
+
 Dashboard Streamlit : après --report, menu ⋮ → Clear cache → Rerun
 Si le CSV distant PythonAnywhere est utilisé, uploader le nouveau backtest_results.csv.
 
@@ -96,6 +100,7 @@ from utils import (
     shrink_proba_vers_marche,
     outcome_binaire_ah,
     fit_calibration_ah_par_ligue,
+    fit_calibration_ah_global,
     save_calibration_ah,
     brier_score_prob,
     CALIB_AH_MIN_SAMPLES_PLATT,
@@ -2761,11 +2766,163 @@ async def fit_calibration_ah_db(conn, method='platt', min_samples=None, out_path
     path = save_calibration_ah(data, path=out_path)
     n_lig = len(data.get("ligues", {}))
     print(f"\n  📐 Calibration AH ({method}) : {n_lig} ligue(s) fitées → {path}")
-    for lid_s, m in sorted(data.get("ligues", {}).items(), key=lambda x: int(x[0])):
-        nom = next((c['nom'] for c in CHAMPIONNATS if c['id'] == int(lid_s)), lid_s)
+    for lid_s, m in sorted(data.get("ligues", {}).items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0):
+        nom = next((c['nom'] for c in CHAMPIONNATS if c['id'] == int(lid_s)), lid_s) if str(lid_s).isdigit() else lid_s
         brier = m.get("brier", float('nan'))
         print(f"     {nom:<18} n={m.get('n_fit', 0):>4}  Brier={brier:.4f}")
     return path
+
+
+async def valider_calib_ah_brier(conn, save_best: bool = True):
+    """
+    Étape B — walk-forward offline sur p_modele stockés (pas de re-sim DC).
+    Compare Platt/isotonic × scope ligue/global × ±shrink vs Brier Pinnacle.
+    """
+    print("\n" + "=" * 60)
+    print("📐  ÉTAPE B — VALIDATION CALIB AH (Brier vs Pinnacle)")
+    print("=" * 60)
+
+    signaux = await charger_signaux(conn)
+    ah = [
+        s for s in signaux
+        if s[3] == "spreads"
+        and len(s) > 16 and s[16] is not None
+        and s[13] not in (None, 0.0)
+    ]
+    ah.sort(key=lambda s: s[15] or "")  # date_utc
+    if len(ah) < 80:
+        print(f"  ❌ Trop peu de paris AH avec p_modele (n={len(ah)}). Lancez --simulate d'abord.")
+        return None
+
+    odds_ah = await _preload_cotes_ah_h24(conn)
+
+    # Préparer lignes avec p_marché quand partenaire dispo
+    rows = []
+    for s in ah:
+        fid, lid, hv, cote = int(s[0]), int(s[1]), float(s[5]), float(s[6])
+        partner = odds_ah.get((fid, round(-hv, 2)))
+        p_mkt = _p_marche_ah_novig(cote, partner)
+        if p_mkt is None:
+            continue
+        cote_novig = cote_fair_2way(cote, partner) if partner else None
+        rows.append({
+            "lid": lid,
+            "p_raw": float(s[16]),
+            "y": outcome_binaire_ah(s[13]),
+            "p_mkt": p_mkt,
+            "cote_novig": cote_novig,
+        })
+
+    if len(rows) < 80:
+        print(f"  ❌ Trop peu de lignes avec partenaire H-24 (n={len(rows)}).")
+        return None
+
+    y_all = [r["y"] for r in rows]
+    p_mkt_all = [r["p_mkt"] for r in rows]
+    p_raw_all = [r["p_raw"] for r in rows]
+    b_mkt = brier_score_prob(p_mkt_all, y_all)
+    b_raw = brier_score_prob(p_raw_all, y_all)
+    b_naive = brier_score_prob([0.5] * len(y_all), y_all)
+
+    print(f"  n comparable : {len(rows)}")
+    print(f"  Shrink dispo (env) : w={FOOT_AH_SHRINK_W:.0%} actif={FOOT_AH_SHRINK_ACTIF}")
+    print(f"  Brier pile-ou-face     : {b_naive:.4f}")
+    print(f"  Brier Pinnacle no-vig  : {b_mkt:.4f}")
+    print(f"  Brier modèle brut      : {b_raw:.4f}  (Δ vs pin {b_raw - b_mkt:+.4f})")
+
+    configs = [
+        ("platt", "ligue", CALIB_AH_MIN_SAMPLES_PLATT, False),
+        ("isotonic", "ligue", CALIB_AH_MIN_SAMPLES_ISOTONIC, False),
+        ("platt", "global", CALIB_AH_MIN_SAMPLES_PLATT, False),
+        ("isotonic", "global", CALIB_AH_MIN_SAMPLES_ISOTONIC, False),
+        ("platt", "ligue", CALIB_AH_MIN_SAMPLES_PLATT, True),
+        ("isotonic", "ligue", CALIB_AH_MIN_SAMPLES_ISOTONIC, True),
+        ("platt", "global", CALIB_AH_MIN_SAMPLES_PLATT, True),
+        ("isotonic", "global", CALIB_AH_MIN_SAMPLES_ISOTONIC, True),
+    ]
+
+    print(f"\n  {'Config':<32} {'Brier':>8} {'Δ vs Pin':>10}  Verdict")
+    print(f"  {'─'*32} {'─'*8} {'─'*10}  {'─'*28}")
+
+    results = []
+    for method, scope, min_s, do_shrink in configs:
+        cal = CalibrateurWalkForwardAH(method, min_samples=min_s)
+        p_out = []
+        for r in rows:
+            lid_key = 0 if scope == "global" else r["lid"]
+            cal.refit_ligue(lid_key)
+            p1 = cal.apply(lid_key, r["p_raw"])
+            if do_shrink and r["cote_novig"] is not None:
+                p1 = shrink_proba_vers_marche(p1, r["cote_novig"], FOOT_AH_SHRINK_W)
+            p_out.append(p1)
+            cal.observe(lid_key, r["p_raw"], r["y"])
+
+        b = brier_score_prob(p_out, y_all)
+        delta = b - b_mkt if b is not None and b_mkt is not None else float("nan")
+        if delta < -1e-4:
+            verdict = "MEILLEUR que Pinnacle"
+        elif delta > 1e-4:
+            verdict = "moins bon que Pinnacle"
+        else:
+            verdict = "≈ Pinnacle"
+        label = f"{method}/{scope}" + ("+shrink" if do_shrink else "")
+        print(f"  {label:<32} {b:>8.4f} {delta:>+10.4f}  {verdict}")
+        results.append({
+            "method": method,
+            "scope": scope,
+            "min_samples": min_s,
+            "use_shrink": do_shrink,
+            "brier": b,
+            "delta": delta,
+            "label": label,
+        })
+
+    # Baseline : shrink seul (sans calib WF)
+    p_sh = [
+        shrink_proba_vers_marche(r["p_raw"], r["cote_novig"], FOOT_AH_SHRINK_W)
+        for r in rows
+    ]
+    b_sh = brier_score_prob(p_sh, y_all)
+    d_sh = b_sh - b_mkt
+    print(
+        f"  {'shrink seul (sans calib)':<32} {b_sh:>8.4f} {d_sh:>+10.4f}  "
+        f"{'MEILLEUR que Pinnacle' if d_sh < -1e-4 else ('moins bon que Pinnacle' if d_sh > 1e-4 else '≈ Pinnacle')}"
+    )
+
+    best = min(results, key=lambda x: x["brier"] if x["brier"] is not None else 9.0)
+    print(f"\n  → Meilleure config WF : {best['label']}  Brier={best['brier']:.4f}  Δ={best['delta']:+.4f}")
+
+    if not save_best:
+        return best
+
+    # Fit final (tout l'historique) pour le live
+    fit_rows = [(r["lid"], r["p_raw"], r["y"]) for r in rows]
+    if best["scope"] == "global":
+        data = fit_calibration_ah_global(
+            fit_rows, method=best["method"], min_samples=best["min_samples"],
+        )
+    else:
+        data = fit_calibration_ah_par_ligue(
+            fit_rows, method=best["method"], min_samples=best["min_samples"],
+        )
+    data["valider_brier_oos"] = round(float(best["brier"]), 6)
+    data["valider_delta_vs_pinnacle"] = round(float(best["delta"]), 6)
+    data["valider_scope"] = best["scope"]
+    data["valider_shrink_in_score"] = bool(best["use_shrink"])
+    path = save_calibration_ah(data)
+    n_m = len(data.get("ligues") or {})
+    print(f"  💾 Enregistré pour le live : {path} ({n_m} modèle(s), method={best['method']}, scope={best['scope']})")
+    if best["delta"] < -1e-4:
+        print("  ✅ Objectif étape B atteint en WF : Brier sous Pinnacle.")
+    else:
+        print("  ⚠️  Pas encore sous Pinnacle en WF — étape C (retune modèle) recommandée.")
+    print("  Live : FOOT_CALIB_AH=true + redéployer foot_calibration_ah.json")
+    print(
+        "  Note : le shrink live reste piloté par FOOT_AH_SHRINK_* "
+        f"(meilleure grille WF {'avec' if best['use_shrink'] else 'sans'} shrink post-calib)."
+    )
+    print("  BT décisions EV : relancer --simulate --calibrer-ah", best["method"], "--p1-ah …")
+    return best
 
 
 async def generer_rapport(conn):
@@ -3045,6 +3202,8 @@ async def main():
                         help='Fit offline bt_signaux → foot_calibration_ah.json')
     parser.add_argument('--fit-cal-min', type=int, default=None,
                         help='Min paris AH/ligue pour --fit-calibration (defaut 80 platt / 100 isotonic)')
+    parser.add_argument('--valider-calib-ah', action='store_true',
+                        help='Étape B : WF Platt/isotonic vs Brier Pinnacle + save meilleur JSON')
     parser.add_argument('--saisons', type=str, default=None,
                         help='Saisons API à collecter (ex: 2025 ou 2023,2024,2025). Défaut : config ligue.')
     parser.add_argument('--europe-only', action='store_true',
@@ -3107,7 +3266,7 @@ async def main():
 
     run_phases = (
         args.collect or args.simulate or args.report or args.tune or args.explore_ev
-        or args.fit_calibration
+        or args.fit_calibration or args.valider_calib_ah
     )
     all_phases = not run_phases and not args.reset and not args.reset_full
 
@@ -3161,6 +3320,8 @@ async def main():
                 await fit_calibration_ah_db(
                     conn, method=args.fit_calibration, min_samples=min_fit,
                 )
+            if args.valider_calib_ah:
+                await valider_calib_ah_brier(conn, save_best=True)
             if args.explore_ev:
                 signaux = await charger_signaux(conn)
                 explore_ev_filtres(signaux)

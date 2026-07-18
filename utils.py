@@ -688,12 +688,33 @@ def appliquer_calibrateur_ah(ligue_id, p_raw: float, store: dict | None = None) 
     if p_raw is None:
         return p_raw
     store = store if store is not None else load_calibration_ah()
-    model = (store.get("ligues") or {}).get(str(int(ligue_id)))
+    ligues = store.get("ligues") or {}
+    model = ligues.get(str(int(ligue_id))) or ligues.get("global")
     if not model:
         return p_raw
     if model.get("method") == "isotonic":
         return appliquer_isotonic(p_raw, model.get("xs", []), model.get("ys", []))
     return appliquer_platt(p_raw, model.get("a", 1.0), model.get("b", 0.0))
+
+
+def fit_calibration_ah_global(rows, method: str = "platt", min_samples: int = 80):
+    """Fit un seul modèle sur toutes les ligues → clé JSON 'global'."""
+    pairs = [(float(p), float(y)) for _, p, y in rows if p is not None and y == y]
+    out = {"version": 1, "method": method, "scope": "global", "min_samples": min_samples, "ligues": {}}
+    if len(pairs) < min_samples:
+        return out
+    p, y = zip(*pairs)
+    if method == "isotonic":
+        xs, ys, brier = fit_isotonic_regression(p, y)
+        out["ligues"]["global"] = {
+            "method": "isotonic", "xs": xs, "ys": ys, "n_fit": len(pairs), "brier": brier,
+        }
+    else:
+        a, b, brier = fit_platt_scaling(p, y)
+        out["ligues"]["global"] = {
+            "method": "platt", "a": a, "b": b, "n_fit": len(pairs), "brier": brier,
+        }
+    return out
 
 
 def brier_score_prob(p_pred, outcomes) -> float | None:
