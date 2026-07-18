@@ -84,7 +84,7 @@ from foot_params import (
     save_tuned_params,
     xg_decay_rate,
 )
-from odds_devig import cote_fair_2way
+from odds_devig import cote_fair_2way, proba_no_vig_shin_2way
 from utils import (
     construire_tableau_objectifs_clv_ah,
     formater_objectifs_clv_ah_texte,
@@ -2525,11 +2525,35 @@ TRANCHES_P_AH = [
 ]
 
 
-def _print_calibration_ah(signaux):
+async def _preload_cotes_ah_h24(conn) -> dict:
+    """(fixture_id, h_val arrondi) → cote Pinnacle H-24 (spreads)."""
+    out: dict = {}
+    async with conn.execute(
+        "SELECT fixture_id, h_val, cote FROM bt_odds_h24 WHERE market='spreads'"
+    ) as cur:
+        for fid, hv, cote in await cur.fetchall():
+            if hv is None or cote is None:
+                continue
+            out[(int(fid), round(float(hv), 2))] = float(cote)
+    return out
+
+
+def _p_marche_ah_novig(cote_prise: float, cote_partenaire: float | None) -> float | None:
+    """Proba fair Shin du côté pris (même méthode que le bot / simulate)."""
+    if cote_partenaire is None or cote_partenaire <= 1.0 or cote_prise is None or cote_prise <= 1.0:
+        return None
+    p_a, _ = proba_no_vig_shin_2way(float(cote_prise), float(cote_partenaire))
+    if p_a is None:
+        return None
+    return float(np.clip(p_a, 0.001, 0.999))
+
+
+async def _print_calibration_ah(conn, signaux):
     """
     Diagnostic calib AH only (pas de mélange totaux).
     1) ROI réalisé vs EV annoncé par tranche EV
     2) Brier global + fiabilité par tranche de p_modele
+    3) Brier modèle vs Pinnacle no-vig (mêmes paris AH)
     """
     ah = [s for s in signaux if s[3] == 'spreads' and s[13] is not None]
     print(f"\n{'─'*50}")
@@ -2619,6 +2643,67 @@ def _print_calibration_ah(signaux):
             f"  [{lo:.0%}-{hi:.0%}]  {len(idx):>5}  {p_m:>6.1%}  {f_r:>6.1%}  "
             f"{f_r - p_m:>+7.1%}  {b_s:>7}"
         )
+
+    # ── Étape A : Brier modèle vs Pinnacle no-vig (mêmes paris) ──
+    print(f"\n{'─'*50}")
+    print(f"  BRIER AH — modèle vs Pinnacle (no-vig H-24)")
+    print(f"{'─'*50}")
+    print("  Même set de paris AH (hors push). Plus bas = mieux.")
+    print("  Pinnacle = proba Shin dévigée (cote prise + côté opposé H-24).")
+
+    odds_ah = await _preload_cotes_ah_h24(conn)
+    y_cmp, p_raw_cmp, p_cal_cmp, p_mkt_cmp = [], [], [], []
+    n_sans_partenaire = 0
+    for s in ah_cal:
+        fid, hv, cote = int(s[0]), float(s[5]), float(s[6])
+        partner = odds_ah.get((fid, round(-hv, 2)))
+        p_mkt = _p_marche_ah_novig(cote, partner)
+        if p_mkt is None:
+            n_sans_partenaire += 1
+            continue
+        y_cmp.append(outcome_binaire_ah(s[13]))
+        p_raw_cmp.append(float(s[16]))
+        p_cal_cmp.append(
+            float(s[17]) if len(s) > 17 and s[17] is not None else float(s[16])
+        )
+        p_mkt_cmp.append(p_mkt)
+
+    if len(y_cmp) < 30:
+        print(
+            f"  Pas assez de lignes avec partenaire H-24 "
+            f"(n={len(y_cmp)}, sans partenaire={n_sans_partenaire})."
+        )
+        return
+
+    b_raw_c = brier_score_prob(p_raw_cmp, y_cmp)
+    b_cal_c = brier_score_prob(p_cal_cmp, y_cmp)
+    b_mkt = brier_score_prob(p_mkt_cmp, y_cmp)
+    b_naive = brier_score_prob([0.5] * len(y_cmp), y_cmp)
+
+    print(f"  n comparable              : {len(y_cmp)}"
+          f"  (exclu sans partenaire : {n_sans_partenaire})")
+    if b_naive is not None:
+        print(f"  Brier pile-ou-face (p=0.5): {b_naive:.4f}")
+    if b_mkt is not None:
+        print(f"  Brier Pinnacle no-vig     : {b_mkt:.4f}")
+    if b_raw_c is not None:
+        print(f"  Brier modèle (p_modele)   : {b_raw_c:.4f}")
+    if b_cal_c is not None:
+        print(f"  Brier modèle (p_cal)      : {b_cal_c:.4f}")
+
+    ref = b_cal_c if b_cal_c is not None else b_raw_c
+    if ref is not None and b_mkt is not None:
+        delta = ref - b_mkt
+        # négatif = modèle meilleur que Pinnacle
+        if delta < -1e-4:
+            verdict = "modèle MEILLEUR que Pinnacle"
+        elif delta > 1e-4:
+            verdict = "modèle MOINS BON que Pinnacle"
+        else:
+            verdict = "modèle ≈ Pinnacle"
+        print(f"  Δ Brier (modèle − marché) : {delta:+.4f}  → {verdict}")
+        print("  (Δ négatif = tu bats Pinnacle sur ces paris ; positif = le marché est plus juste)")
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2843,7 +2928,7 @@ async def generer_rapport(conn):
         ).to_csv(obj_csv, index=False, encoding="utf-8")
         print(f"\n  📄 Objectifs exportés : {obj_csv}")
 
-    _print_calibration_ah(signaux)
+    await _print_calibration_ah(conn, signaux)
 
     # ── Export CSV ──────────────────────────────────────────
     csv_path = "backtest_results.csv"
