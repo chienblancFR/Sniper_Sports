@@ -2496,6 +2496,108 @@ def explore_ev_filtres(signaux):
         print("     Live inchangé — tester d'abord en --simulate --report")
 
 
+# Tranches de p_modele pour fiabilité AH (couverture)
+TRANCHES_P_AH = [
+    (0.40, 0.48), (0.48, 0.52), (0.52, 0.56), (0.56, 0.62), (0.62, 0.75),
+]
+
+
+def _print_calibration_ah(signaux):
+    """
+    Diagnostic calib AH only (pas de mélange totaux).
+    1) ROI réalisé vs EV annoncé par tranche EV
+    2) Brier global + fiabilité par tranche de p_modele
+    """
+    ah = [s for s in signaux if s[3] == 'spreads' and s[13] is not None]
+    print(f"\n{'─'*50}")
+    print(f"  CALIBRATION AH — ROI réalisé vs EV annoncé")
+    print(f"{'─'*50}")
+    print("  (AH seul — l'ancien bloc mélangeait AH+totaux et n'utilisait pas p_modele)")
+    if not ah:
+        print("  Aucun signal AH.")
+        return
+
+    print(
+        f"  {'EV':<14} {'N':>5} {'EV_moy':>8} {'ROI':>8} {'écart':>8} {'WR':>6} {'P&L':>8}"
+    )
+    print(f"  {'─'*14} {'─'*5} {'─'*8} {'─'*8} {'─'*8} {'─'*6} {'─'*8}")
+    for lo, hi in TRANCHES_EV:
+        rows = [s for s in ah if lo <= s[8] < hi]
+        if not rows:
+            continue
+        mises = sum(s[10] for s in rows)
+        pnl = sum(s[13] * s[10] for s in rows)
+        roi = pnl / mises if mises else 0.0
+        ev_moy = float(np.mean([s[8] for s in rows]))
+        # Même convention que _stats_from_res : wins / tous (push inclus)
+        wr = sum(1 for s in rows if s[13] > 0) / len(rows)
+        print(
+            f"  [{lo:.0%}-{hi:.0%}]  {len(rows):>5}  {ev_moy:>+7.2%}  {roi:>+7.2%}  "
+            f"{roi - ev_moy:>+7.2%}  {wr:>5.1%}  {pnl:>+7.1f}u"
+        )
+
+    ah_all_ev = ah
+    mises_a = sum(s[10] for s in ah_all_ev)
+    pnl_a = sum(s[13] * s[10] for s in ah_all_ev)
+    roi_a = pnl_a / mises_a if mises_a else 0.0
+    ev_a = float(np.mean([s[8] for s in ah_all_ev]))
+    print(
+        f"  {'TOTAL AH':<14} {len(ah_all_ev):>5}  {ev_a:>+7.2%}  {roi_a:>+7.2%}  "
+        f"{roi_a - ev_a:>+7.2%}  {'':>6}  {pnl_a:>+7.1f}u"
+    )
+    print("  écart = ROI − EV_moy  (négatif ≈ sur-confiance du modèle)")
+
+    ah_cal = [
+        s for s in ah
+        if len(s) > 16 and s[16] is not None and s[13] not in (None, 0.0)
+    ]
+    print(f"\n{'─'*50}")
+    print(f"  CALIBRATION P(couverture) AH — Brier / fiabilité")
+    print(f"{'─'*50}")
+    if not ah_cal:
+        print("  Pas de p_modele AH exploitable.")
+        return
+
+    y = [outcome_binaire_ah(s[13]) for s in ah_cal]
+    p_raw = [float(s[16]) for s in ah_cal]
+    p_cal = [
+        float(s[17]) if len(s) > 17 and s[17] is not None else float(s[16])
+        for s in ah_cal
+    ]
+    b_raw = brier_score_prob(p_raw, y)
+    b_cal = brier_score_prob(p_cal, y)
+    if b_raw is not None:
+        print(f"  Brier P brut (p_modele)     : {b_raw:.4f}  (n={len(ah_cal)})")
+    if b_cal is not None:
+        print(f"  Brier P calibré (p_cal)     : {b_cal:.4f}")
+        if b_raw is not None:
+            delta = b_raw - b_cal
+            if delta > 1e-6:
+                print(f"  → Gain Brier : {delta:+.4f}")
+            else:
+                print(f"  → Gain Brier : {delta:+.4f} (calib WF quasi neutre)")
+
+    print(f"\n  Fiabilité par tranche de p_modele (fréquence réelle de couverture) :")
+    print(
+        f"  {'p':<14} {'N':>5} {'p_moy':>7} {'f_réel':>7} {'écart':>8} {'Brier':>7}"
+    )
+    print(f"  {'─'*14} {'─'*5} {'─'*7} {'─'*7} {'─'*8} {'─'*7}")
+    for lo, hi in TRANCHES_P_AH:
+        idx = [i for i, p in enumerate(p_raw) if lo <= p < hi]
+        if len(idx) < 20:
+            continue
+        pr = [p_raw[i] for i in idx]
+        yr = [y[i] for i in idx]
+        p_m = float(np.mean(pr))
+        f_r = float(np.mean(yr))
+        b_bin = brier_score_prob(pr, yr)
+        b_s = f"{b_bin:.4f}" if b_bin is not None else "  n/a"
+        print(
+            f"  [{lo:.0%}-{hi:.0%}]  {len(idx):>5}  {p_m:>6.1%}  {f_r:>6.1%}  "
+            f"{f_r - p_m:>+7.1%}  {b_s:>7}"
+        )
+
+
 # ─────────────────────────────────────────────────────────────
 # 📊  PHASE 3 — RAPPORT D'ANALYSE
 # ─────────────────────────────────────────────────────────────
@@ -2718,42 +2820,7 @@ async def generer_rapport(conn):
         ).to_csv(obj_csv, index=False, encoding="utf-8")
         print(f"\n  📄 Objectifs exportés : {obj_csv}")
 
-    # ── Courbe de calibration ───────────────────────────────
-    print(f"\n{'─'*50}")
-    print(f"  CALIBRATION DU MODÈLE (P_modèle vs fréquence réelle)")
-    print(f"{'─'*50}")
-    # Discrétiser les EV en tranches
-    tranches = TRANCHES_EV
-    for lo, hi in tranches:
-        rows_t = [s for s in signaux if lo <= s[8] < hi and s[13] is not None]
-        if not rows_t:
-            continue
-        win = sum(1 for s in rows_t if s[13] > 0)
-        push = sum(1 for s in rows_t if s[13] == 0)
-        n_t = len(rows_t)
-        wr = win / (n_t - push) if (n_t - push) > 0 else 0
-        ev_moy = np.mean([s[8] for s in rows_t])
-        print(f"  EV [{lo:.0%}-{hi:.0%}]  n={n_t:>4}  Win={wr:.1%}  EV_moy={ev_moy:+.2%}")
-
-    ah_cal = [
-        s for s in signaux
-        if s[3] == 'spreads' and len(s) > 16 and s[16] is not None and s[13] not in (None, 0.0)
-    ]
-    if ah_cal:
-        y = [outcome_binaire_ah(s[13]) for s in ah_cal]
-        p_raw = [s[16] for s in ah_cal]
-        p_cal = [s[17] if len(s) > 17 and s[17] is not None else s[16] for s in ah_cal]
-        b_raw = brier_score_prob(p_raw, y)
-        b_cal = brier_score_prob(p_cal, y)
-        print(f"\n{'─'*50}")
-        print(f"  CALIBRATION P(couverture) AH — Brier (n={len(ah_cal)})")
-        print(f"{'─'*50}")
-        if b_raw is not None:
-            print(f"  Brier P brut (p_modele)     : {b_raw:.4f}")
-        if b_cal is not None and any(len(s) > 17 and s[17] is not None for s in ah_cal):
-            print(f"  Brier P calibré (p_cal)     : {b_cal:.4f}")
-            if b_raw is not None and b_cal < b_raw:
-                print(f"  → Gain Brier : {b_raw - b_cal:+.4f}")
+    _print_calibration_ah(signaux)
 
     # ── Export CSV ──────────────────────────────────────────
     csv_path = "backtest_results.csv"
