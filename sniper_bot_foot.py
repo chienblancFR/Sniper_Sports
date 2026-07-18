@@ -15,6 +15,7 @@ from utils import (
     ajuster_ev_proportionnel,
     get_ev_min_spreads_ligue,
     load_calibration_ah,
+    shrink_proba_vers_marche,
     FOOT_CALIB_AH_FILE_DEFAULT,
 )
 import asyncio
@@ -172,6 +173,10 @@ FOOT_STEAM_WARN_PCT = float(os.environ.get("FOOT_STEAM_WARN_PCT", "0.025"))
 FOOT_STEAM_BLOCK_PCT = float(os.environ.get("FOOT_STEAM_BLOCK_PCT", "0.05"))
 FOOT_STEAM_EV_EXTRA = float(os.environ.get("FOOT_STEAM_EV_EXTRA", "0.015"))
 FOOT_STEAM_FILE = os.environ.get("FOOT_STEAM_FILE", "foot_odds_history.json")
+
+# Shrink AH : p_final = w*p_modele + (1-w)*p_novig Pinnacle (totaux inchangés)
+FOOT_AH_SHRINK_ACTIF = _env_bool("FOOT_AH_SHRINK_ACTIF", True)
+FOOT_AH_SHRINK_W = float(os.environ.get("FOOT_AH_SHRINK_W", "0.50"))  # poids modèle
 _steam_logue = False
 
 # Alerte monitoring API down (Telegram only — n'influence ni EV ni Kelly)
@@ -2509,16 +2514,30 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                 if cote_partenaire and cote_partenaire > 1.0:
                     cote_novig = cote_fair_2way(cote, cote_partenaire) or cote
                 else:
-                    cote_novig = cote
+                    cote_novig = None
                 ev_modele = calculer_ev_ah(mat_actif, h, is_h_odds, cote)
-                ev_pinnacle = calculer_ev_ah(mat_actif, h, is_h_odds, cote_novig)
+                ev_pinnacle = (
+                    calculer_ev_ah(mat_actif, h, is_h_odds, cote_novig)
+                    if cote_novig else ev_modele
+                )
                 kelly_theorique = calculer_kelly_ah(mat_actif, h, is_h_odds, cote)
                 p_modele = calculer_prob_modele_pari(mat_actif, 'spreads', h, is_h_odds=is_h_odds)
+                p_pour_ev = p_modele
                 if FOOT_CALIB_AH and p_modele is not None:
                     p_cal = appliquer_calibrateur_ah(ligue['id'], p_modele, _CALIB_AH_STORE)
                     if p_cal != p_modele:
                         ev_modele = ajuster_ev_proportionnel(ev_modele, p_modele, p_cal)
+                        p_pour_ev = p_cal
                         p_modele = p_cal
+                if FOOT_AH_SHRINK_ACTIF and cote_novig is not None and p_pour_ev is not None:
+                    p_shrunk = shrink_proba_vers_marche(p_pour_ev, cote_novig, FOOT_AH_SHRINK_W)
+                    if abs(p_shrunk - p_pour_ev) > 1e-9:
+                        ev_modele = ajuster_ev_proportionnel(ev_modele, p_pour_ev, p_shrunk)
+                        kelly_theorique = kelly_theorique * (p_shrunk / p_pour_ev)
+                        p_modele = p_shrunk
+                    ev_final = ev_modele
+                else:
+                    ev_final = (ev_modele * poids_dyn) + (ev_pinnacle * (1 - poids_dyn))
                 market_label = "🏆 HANDICAP"
                 pari_display = f"{nom} ({h:+g})"
             else:
@@ -2538,8 +2557,7 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                 p_modele = calculer_prob_modele_pari(mat_actif, 'totals', h, is_over=is_over)
                 market_label = "⚽ TOTAL"
                 pari_display = f"{nom} {h:g}"
-
-            ev_final = (ev_modele * poids_dyn) + (ev_pinnacle * (1 - poids_dyn))
+                ev_final = (ev_modele * poids_dyn) + (ev_pinnacle * (1 - poids_dyn))
 
             if market_key == 'spreads' and FOOT_STEAM_ACTIF:
                 steam = evaluer_steam_ah(id_m, nom, h, cote)
@@ -3762,6 +3780,12 @@ async def main_loop():
             f"block ≥{FOOT_STEAM_BLOCK_PCT:.0%}, "
             f"warn ≥{FOOT_STEAM_WARN_PCT:.0%} (+{FOOT_STEAM_EV_EXTRA:.0%} EV) "
             f"— live only (pas de BT)"
+        )
+    if FOOT_AH_SHRINK_ACTIF:
+        log_info(
+            f"⚖️ Shrink AH : {FOOT_AH_SHRINK_W:.0%} modèle + "
+            f"{1.0 - FOOT_AH_SHRINK_W:.0%} no-vig Pinnacle "
+            f"(remplace blend poids_dyn sur AH ; totaux inchangés)"
         )
 
     # Détection initiale de la couverture xG + collecte historique des scores

@@ -93,6 +93,7 @@ from utils import (
     CalibrateurWalkForwardAH,
     prob_implicite_ah,
     ajuster_ev_proportionnel,
+    shrink_proba_vers_marche,
     outcome_binaire_ah,
     fit_calibration_ah_par_ligue,
     save_calibration_ah,
@@ -118,6 +119,10 @@ FOOT_FATIGUE_FENETRE_J = float(os.environ.get("FOOT_FATIGUE_FENETRE_J", "7"))
 FOOT_FATIGUE_MAX_MATCHS = int(os.environ.get("FOOT_FATIGUE_MAX_MATCHS", "3"))
 FOOT_FATIGUE_MIN_REPOS_J = float(os.environ.get("FOOT_FATIGUE_MIN_REPOS_J", "3"))
 FOOT_FATIGUE_AH_MODE = os.environ.get("FOOT_FATIGUE_AH_MODE", "either").strip().lower()
+
+# Shrink AH model ↔ no-vig Pinnacle (même clés que sniper_bot_foot)
+FOOT_AH_SHRINK_ACTIF = _env_bool_bt("FOOT_AH_SHRINK_ACTIF", True)
+FOOT_AH_SHRINK_W = float(os.environ.get("FOOT_AH_SHRINK_W", "0.50"))
 
 
 def _headers_football():
@@ -1713,6 +1718,7 @@ def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
             ev_modele = ev_ah(mat, h_val, is_home, cote_h24)
             k = kelly_ah(mat, h_val, is_home, cote_h24)
             cote_partner = spreads_partner.get((market, -h_val))
+            cote_novig = None
             if cote_partner and cote_partner > 1.0:
                 cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
                 ev_pinnacle = ev_ah(mat, h_val, is_home, cote_novig)
@@ -1725,6 +1731,7 @@ def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
             k = kelly_total(mat, h_val, is_over, cote_h24)
             partner_side = 'under' if is_over else 'over'
             cote_partner = totals_partner.get((h_val, partner_side))
+            cote_novig = None
             if cote_partner and cote_partner > 1.0:
                 cote_novig = cote_fair_2way(cote_h24, cote_partner) or cote_h24
                 ev_pinnacle = ev_total(mat, h_val, is_over, cote_novig)
@@ -1739,8 +1746,19 @@ def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
             if calibrateur is not None and ligue_id is not None:
                 p_cal = calibrateur.apply(ligue_id, p_modele)
                 ev_modele = ajuster_ev_proportionnel(ev_modele, p_modele, p_cal)
+            if FOOT_AH_SHRINK_ACTIF and cote_novig is not None and p_cal is not None:
+                p_shrunk = shrink_proba_vers_marche(p_cal, cote_novig, FOOT_AH_SHRINK_W)
+                if abs(p_shrunk - p_cal) > 1e-9:
+                    ev_modele = ajuster_ev_proportionnel(ev_modele, p_cal, p_shrunk)
+                    k = k * (p_shrunk / p_cal) if p_cal > 1e-9 else k
+                    p_cal = p_shrunk
+                # Shrink remplace le blend EV poids_dyn (sinon double-amortissement)
+                ev_final = ev_modele
+            else:
+                ev_final = ev_modele * poids_dyn + ev_pinnacle * (1.0 - poids_dyn)
+        else:
+            ev_final = ev_modele * poids_dyn + ev_pinnacle * (1.0 - poids_dyn)
 
-        ev_final = ev_modele * poids_dyn + ev_pinnacle * (1.0 - poids_dyn)
         ev_cap = (ev_max_by_market or {}).get(market, ev_max_l)
         ev_floor = _ev_min_pour_marche(
             market, ligue_id, ev_min_l, ev_min_by_market, ev_min_spreads_tier,
@@ -2042,6 +2060,11 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
     if calibrer_ah:
         min_c = CALIB_AH_MIN_SAMPLES_ISOTONIC if calibrer_ah == "isotonic" else CALIB_AH_MIN_SAMPLES_PLATT
         print(f"  📐 Calibration AH walk-forward : {calibrer_ah} (min {min_c} paris/ligue)")
+    if FOOT_AH_SHRINK_ACTIF:
+        print(
+            f"  ⚖️ Shrink AH : p = {FOOT_AH_SHRINK_W:.0%}·modèle + "
+            f"{1.0 - FOOT_AH_SHRINK_W:.0%}·no-vig Pinnacle (remplace blend poids_dyn sur AH)"
+        )
     if FOOT_FATIGUE_AH_ACTIF:
         repos = (
             f"repos≥{FOOT_FATIGUE_MIN_REPOS_J:g}j"

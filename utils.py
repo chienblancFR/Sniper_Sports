@@ -500,6 +500,27 @@ def ajuster_ev_proportionnel(ev_raw: float, p_raw: float, p_cal: float) -> float
     return (1.0 + ev_raw) * ratio - 1.0
 
 
+def shrink_proba_vers_marche(
+    p_modele: float,
+    cote_novig: float | None,
+    w_modele: float,
+) -> float:
+    """
+    Blend p_modele avec la proba no-vig Pinnacle (1/cote_novig).
+    w_modele = poids modèle (0→marché pur, 1→modèle pur). Réduit la sur-confiance AH.
+    """
+    if p_modele is None:
+        return p_modele
+    p = float(np.clip(p_modele, 0.001, 0.999))
+    if cote_novig is None or cote_novig <= 1.0:
+        return p
+    w = float(np.clip(w_modele, 0.0, 1.0))
+    if w >= 1.0 - 1e-12:
+        return p
+    p_mkt = float(np.clip(1.0 / float(cote_novig), 0.001, 0.999))
+    return float(np.clip(w * p + (1.0 - w) * p_mkt, 0.001, 0.999))
+
+
 def outcome_binaire_ah(resultat: float) -> float:
     if resultat is None:
         return float("nan")
