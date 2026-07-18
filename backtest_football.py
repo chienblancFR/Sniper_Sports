@@ -122,7 +122,7 @@ FOOT_FATIGUE_AH_MODE = os.environ.get("FOOT_FATIGUE_AH_MODE", "either").strip().
 
 # Shrink AH model ↔ no-vig Pinnacle (même clés que sniper_bot_foot)
 FOOT_AH_SHRINK_ACTIF = _env_bool_bt("FOOT_AH_SHRINK_ACTIF", True)
-FOOT_AH_SHRINK_W = float(os.environ.get("FOOT_AH_SHRINK_W", "0.50"))
+FOOT_AH_SHRINK_W = float(os.environ.get("FOOT_AH_SHRINK_W", "0.70"))
 
 
 def _headers_football():

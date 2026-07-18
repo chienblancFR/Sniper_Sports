@@ -176,7 +176,7 @@ FOOT_STEAM_FILE = os.environ.get("FOOT_STEAM_FILE", "foot_odds_history.json")
 
 # Shrink AH : p_final = w*p_modele + (1-w)*p_novig Pinnacle (totaux inchangés)
 FOOT_AH_SHRINK_ACTIF = _env_bool("FOOT_AH_SHRINK_ACTIF", True)
-FOOT_AH_SHRINK_W = float(os.environ.get("FOOT_AH_SHRINK_W", "0.50"))  # poids modèle
+FOOT_AH_SHRINK_W = float(os.environ.get("FOOT_AH_SHRINK_W", "0.70"))  # poids modèle
 _steam_logue = False
 
 # Alerte monitoring API down (Telegram only — n'influence ni EV ni Kelly)
