@@ -493,6 +493,25 @@ def prob_implicite_ah(matrice, h, is_home, cote_max: float = 500.0) -> float:
     return float(np.clip(1.0 / hi, 0.001, 0.999))
 
 
+def prob_couverture_ah(matrice, h, is_home) -> float:
+    """
+    P(résultat AH > 0) = win + demi-win — aligné outcome_binaire_ah.
+    Plus rapide que prob_implicite_ah (pas de bisection) → idéal pour --tune-metric brier.
+    """
+    p = 0.0
+    n = matrice.shape[0]
+    for i in range(n):
+        for j in range(n):
+            prob = float(matrice[i, j])
+            if prob < 0.0001:
+                continue
+            diff = (i - j) if is_home else (j - i)
+            res_net = diff + h
+            if res_net > 0.25 + _EPS_AH_CAL or abs(res_net - 0.25) < _EPS_AH_CAL:
+                p += prob
+    return float(np.clip(p, 0.001, 0.999))
+
+
 def ajuster_ev_proportionnel(ev_raw: float, p_raw: float, p_cal: float) -> float:
     if p_raw is None or p_cal is None or p_raw <= 1e-6:
         return ev_raw

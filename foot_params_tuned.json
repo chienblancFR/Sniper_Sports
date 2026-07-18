@@ -1,8 +1,8 @@
 {
   "_meta": {
-    "generated_at": "2026-07-15T21:59:21.400730+00:00",
-    "source": "backtest_walkforward",
-    "metric": "mean_clv_ah_spreads",
+    "generated_at": "2026-07-18T22:24:03.214945+00:00",
+    "source": "backtest_walkforward_brier",
+    "metric": "mean_brier_ah_vs_pinnacle",
     "ligues_tuned": 16
   },
   "140": {
@@ -96,13 +96,16 @@
     "n_clv": 606
   },
   "39": {
-    "n_prior": 11,
-    "rho": -0.11,
-    "xg_half_life_days": 35,
+    "n_prior": 6,
+    "rho": -0.08,
+    "xg_half_life_days": 58,
     "dc_half_life_days": 120,
     "dc_xg_blend": 0.4,
-    "mean_clv": 0.0011,
-    "n_clv": 537
+    "n_clv": 0,
+    "mean_brier": 0.257298,
+    "mean_brier_mkt": 0.25062,
+    "brier_delta_vs_pin": 0.006678,
+    "n_brier": 1306
   },
   "40": {
     "n_prior": 8,

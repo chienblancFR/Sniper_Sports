@@ -39,6 +39,9 @@ Reset (avant de relancer le backtest / dashboard) :
 
   python backtest_football.py --tune --tune-metric blend --tune-clv-weight 0.6
 
+  python backtest_football.py --tune --tune-metric brier
+      → Étape C : retune n_prior/ρ/blend pour minimiser Brier AH vs Pinnacle
+
   python backtest_football.py --explore-ev
       → Compare volume / CLV / ROI par seuil ev_max (post-hoc sur signaux en base)
 
@@ -103,6 +106,7 @@ from utils import (
     fit_calibration_ah_global,
     save_calibration_ah,
     brier_score_prob,
+    prob_couverture_ah,
     CALIB_AH_MIN_SAMPLES_PLATT,
     CALIB_AH_MIN_SAMPLES_ISOTONIC,
 )
@@ -1551,7 +1555,8 @@ TUNE_GRID_DC_HL = [75, 90, 120]
 TUNE_GRID_DC_XG_BLEND = [0.30, 0.40, 0.50, 0.60, 0.70]
 TUNE_MIN_MATCHS = 80
 TUNE_MIN_CLV_SIGNALS = 30
-TUNE_METRICS = ('loglik', 'clv', 'blend')
+TUNE_MIN_BRIER_OBS = 80
+TUNE_METRICS = ('loglik', 'clv', 'blend', 'brier')
 
 
 async def _lambdas_pour_match(conn, ligue, saison, date_utc, h_id, a_id,
@@ -1817,14 +1822,17 @@ async def _eval_params_tune(
 ):
     """
     Évalue un jeu d'hyperparamètres en walk-forward.
-    metric : loglik | clv | blend
-    clv : CLV moyen AH (spreads) sur les signaux simulés (H-24 vs clôture Pinnacle).
+    metric : loglik | clv | blend | brier
+    brier : Brier P(couverture) AH sur la ligne |h| mini (2 côtés), vs no-vig Pinnacle.
+    Score brier = −Brier (maximiser = meilleur).
     """
     use_ll = metric in ('loglik', 'blend')
     use_clv = metric in ('clv', 'blend')
+    use_brier = metric == 'brier'
     caches = {'xg': {}, 'venue': {}, 'sos': {}, 'mot_luck': {}, 'dc': {}}
     ll_total, ll_n = 0.0, 0
     clv_sum, clv_n, sig_n = 0.0, 0, 0
+    brier_sum, brier_mkt_sum, brier_n = 0.0, 0.0, 0
     ev_min_l = ligue.get('ev_min', 0.05)
     ev_max_l = ligue.get('ev_max', 0.15)
 
@@ -1865,19 +1873,78 @@ async def _eval_params_tune(
                 clv_sum += (cote_h24 / cote_cloture) - 1.0
                 clv_n += 1
 
+        if use_brier and odds_by_fid is not None:
+            odds_h24 = odds_by_fid.get(fid)
+            if not odds_h24:
+                continue
+            home_name_odds = NAME_MAPPING.get(h_name, h_name)
+            spreads = [
+                (out, float(hv), float(c))
+                for mk, out, hv, c in odds_h24
+                if mk == 'spreads' and c and float(c) > 1.0
+            ]
+            if len(spreads) < 2:
+                continue
+            # Ligne principale = |h| le plus proche de 0
+            h_main = min((abs(hv) for _, hv, _ in spreads), default=None)
+            if h_main is None:
+                continue
+            sides = [(out, hv, c) for out, hv, c in spreads if abs(abs(hv) - h_main) < 0.011]
+            if len(sides) < 2:
+                continue
+            # Paire home/away sur ±h
+            by_h = {}
+            for out, hv, c in sides:
+                by_h.setdefault(round(hv, 2), []).append((out, c))
+            for hv_r, outs in list(by_h.items()):
+                partner_list = by_h.get(round(-hv_r, 2))
+                if not partner_list:
+                    continue
+                out, cote = outs[0]
+                cote_p = partner_list[0][1]
+                is_home = (out == home_name_odds) or (
+                    process.extractOne(out, [home_name_odds])[1] > 85
+                )
+                res = resultat_ah(gh, ga, hv_r, is_home)
+                if res in (None, 0.0):
+                    continue
+                y = outcome_binaire_ah(res)
+                p_mod = prob_couverture_ah(mat, hv_r, is_home)
+                p_a, _ = proba_no_vig_shin_2way(cote, cote_p)
+                if p_a is None:
+                    continue
+                p_mkt = float(np.clip(p_a, 0.001, 0.999))
+                brier_sum += (p_mod - y) ** 2
+                brier_mkt_sum += (p_mkt - y) ** 2
+                brier_n += 1
+                break  # une paire (un côté) par match suffit pour le ranking
+
     mean_ll = ll_total / ll_n if ll_n else float('-inf')
     mean_clv = clv_sum / clv_n if clv_n >= TUNE_MIN_CLV_SIGNALS else float('-inf')
+    mean_brier = brier_sum / brier_n if brier_n >= TUNE_MIN_BRIER_OBS else None
+    mean_brier_mkt = brier_mkt_sum / brier_n if brier_n >= TUNE_MIN_BRIER_OBS else None
     stats = {
         'mean_log_score': round(mean_ll, 5) if ll_n else None,
         'mean_clv': round(mean_clv, 6) if clv_n >= TUNE_MIN_CLV_SIGNALS else None,
         'n_clv': clv_n,
         'n_signals': sig_n,
+        'mean_brier': round(mean_brier, 6) if mean_brier is not None else None,
+        'mean_brier_mkt': round(mean_brier_mkt, 6) if mean_brier_mkt is not None else None,
+        'n_brier': brier_n,
+        'brier_delta_vs_pin': (
+            round(mean_brier - mean_brier_mkt, 6)
+            if mean_brier is not None and mean_brier_mkt is not None else None
+        ),
     }
 
     if metric == 'loglik':
         return mean_ll, stats
     if metric == 'clv':
         return mean_clv, stats
+    if metric == 'brier':
+        if mean_brier is None:
+            return float('-inf'), stats
+        return -mean_brier, stats  # maximiser = Brier plus bas
     if mean_ll == float('-inf') or mean_clv == float('-inf'):
         return float('-inf'), stats
     return _composite_tune_score(mean_clv, mean_ll, clv_weight), stats
@@ -1895,6 +1962,15 @@ def _format_tune_score(metric, score, stats):
         return f"log P={score:.4f}"
     if metric == 'clv':
         return f"CLV={score:+.4f} (n={stats.get('n_clv', 0)})"
+    if metric == 'brier':
+        b = stats.get('mean_brier')
+        bm = stats.get('mean_brier_mkt')
+        d = stats.get('brier_delta_vs_pin')
+        if b is None:
+            return "Brier=N/A"
+        ds = f"{d:+.4f}" if d is not None else "N/A"
+        bms = f"{bm:.4f}" if bm is not None else "N/A"
+        return f"Brier={b:.4f} (Pin={bms}, Δ={ds}, n={stats.get('n_brier', 0)})"
     ll = stats.get('mean_log_score')
     clv = stats.get('mean_clv')
     ll_s = f"{ll:.4f}" if ll is not None else "N/A"
@@ -1908,10 +1984,10 @@ async def tune_ligue_walkforward(conn, ligue, fixtures, metric='loglik', clv_wei
         return None
 
     odds_by_fid, close_by_key = None, None
-    if metric in ('clv', 'blend'):
+    if metric in ('clv', 'blend', 'brier'):
         odds_by_fid, close_by_key = await _preload_odds_tune(conn, ligue['id'])
         if not odds_by_fid:
-            print(f"  ⚠️ {ligue['nom']} : pas de cotes H-24 — tuning CLV impossible", flush=True)
+            print(f"  ⚠️ {ligue['nom']} : pas de cotes H-24 — tuning {metric} impossible", flush=True)
             return None
 
     n_eval = (
@@ -1921,7 +1997,12 @@ async def tune_ligue_walkforward(conn, ligue, fixtures, metric='loglik', clv_wei
     )
     start = max(TUNE_MIN_MATCHS // 2, len(fixtures) // 4)
     n_scored = len(fixtures) - start
-    metric_label = {'loglik': 'log P(score)', 'clv': 'CLV AH moyen', 'blend': f'blend CLV/logP ({clv_weight:.0%} CLV)'}
+    metric_label = {
+        'loglik': 'log P(score)',
+        'clv': 'CLV AH moyen',
+        'blend': f'blend CLV/logP ({clv_weight:.0%} CLV)',
+        'brier': 'Brier AH (minimiser, vs Pinnacle)',
+    }
     print(
         f"  ▶ {ligue['nom']} : {len(fixtures)} matchs, {n_scored} scorés (burn-in {start}), "
         f"{n_eval} combinaisons, métrique={metric_label.get(metric, metric)}…",
@@ -1973,6 +2054,14 @@ async def tune_ligue_walkforward(conn, ligue, fixtures, metric='loglik', clv_wei
         best['mean_clv'] = best_stats['mean_clv']
     if best_stats.get('n_clv') is not None:
         best['n_clv'] = best_stats['n_clv']
+    if best_stats.get('mean_brier') is not None:
+        best['mean_brier'] = best_stats['mean_brier']
+    if best_stats.get('mean_brier_mkt') is not None:
+        best['mean_brier_mkt'] = best_stats['mean_brier_mkt']
+    if best_stats.get('brier_delta_vs_pin') is not None:
+        best['brier_delta_vs_pin'] = best_stats['brier_delta_vs_pin']
+    if best_stats.get('n_brier') is not None:
+        best['n_brier'] = best_stats['n_brier']
 
     print(
         f"  ✅ {ligue['nom']} : n_prior={best['n_prior']} rho={best['rho']:.2f} "
@@ -1993,6 +2082,10 @@ async def tune_hyperparams_walkforward(conn, ligues=None, metric='loglik', clv_w
     elif metric == 'clv':
         print("  Metrique : CLV AH moyen (H-24 vs cloture Pinnacle) sur signaux simules", flush=True)
         print(f"  Min signaux CLV : {TUNE_MIN_CLV_SIGNALS} par combinaison", flush=True)
+    elif metric == 'brier':
+        print("  Metrique : Brier AH P(couverture) vs Pinnacle no-vig (etape C)", flush=True)
+        print(f"  Min observations Brier : {TUNE_MIN_BRIER_OBS} par combinaison", flush=True)
+        print("  Ligne : |h| minimal H-24, hors push — score = −Brier", flush=True)
     else:
         print(f"  Metrique : blend {clv_weight:.0%} CLV + {1-clv_weight:.0%} log P(score)", flush=True)
     print(f"  Grilles : n_prior{TUNE_GRID_N_PRIOR}, rho{TUNE_GRID_RHO}, "
@@ -2023,9 +2116,23 @@ async def tune_hyperparams_walkforward(conn, ligues=None, metric='loglik', clv_w
         'loglik': 'mean_log_score_prob',
         'clv': 'mean_clv_ah_spreads',
         'blend': f'blend_clv_{int(clv_weight * 100)}_loglik',
+        'brier': 'mean_brier_ah_vs_pinnacle',
     }.get(metric, metric)
-    path = save_tuned_params(results, metric=meta_metric)
+    path = save_tuned_params(
+        results,
+        source="backtest_walkforward_brier" if metric == "brier" else "backtest_walkforward",
+        metric=meta_metric,
+    )
     print(f"\n✅ Paramètres enregistrés → {path}")
+    if metric == 'brier':
+        n_beat = sum(
+            1 for v in results.values()
+            if v.get('brier_delta_vs_pin') is not None and v['brier_delta_vs_pin'] < -1e-4
+        )
+        n_ok = sum(1 for v in results.values() if v.get('mean_brier') is not None)
+        print(f"   Ligues sous Pinnacle (Δ Brier < 0) : {n_beat}/{n_ok}")
+        print("   Ensuite : --simulate --p1-ah --calibrer-ah platt --report")
+        print("             puis --valider-calib-ah pour re-mesurer vs marché")
     print("   Bot live + backtest : rechargement auto via foot_params.py")
 
 
@@ -3175,7 +3282,7 @@ async def main():
                         help='Calibration walk-forward n_prior / rho / demi-vies -> foot_params_tuned.json')
     parser.add_argument('--tune-metric', type=str, default='loglik',
                         choices=TUNE_METRICS,
-                        help='Metrique de tuning : loglik (defaut), clv (CLV AH), blend (mixte)')
+                        help='Metrique : loglik | clv | blend | brier (AH vs Pinnacle, etape C)')
     parser.add_argument('--tune-clv-weight', type=float, default=0.5,
                         help='Poids CLV dans --tune-metric blend (0.0-1.0, defaut 0.5)')
     parser.add_argument('--ligue',      type=str, default=None,
