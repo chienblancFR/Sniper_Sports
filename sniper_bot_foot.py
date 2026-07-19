@@ -179,6 +179,15 @@ FOOT_AH_SHRINK_ACTIF = _env_bool("FOOT_AH_SHRINK_ACTIF", True)
 FOOT_AH_SHRINK_W = float(os.environ.get("FOOT_AH_SHRINK_W", "0.70"))  # poids modèle
 _steam_logue = False
 
+# XI probable (H-24) : malus λ si titulaires habituels absents (blessures) — live only
+FOOT_XI_PROBABLE_ACTIF = _env_bool("FOOT_XI_PROBABLE_ACTIF", True)
+FOOT_XI_TOLERANCE = int(os.environ.get("FOOT_XI_TOLERANCE", "2"))  # absents XI type sans malus
+FOOT_XI_MALUS_PAR_ABSENT = float(os.environ.get("FOOT_XI_MALUS_PAR_ABSENT", "0.05"))
+FOOT_XI_MALUS_MAX = float(os.environ.get("FOOT_XI_MALUS_MAX", "0.25"))
+_cache_xi_type: dict[tuple[int, int], list[str]] = {}
+_cache_injuries_ids: dict[tuple[int, int], set[str]] = {}
+_xi_probable_logue = False
+
 # Alerte monitoring API down (Telegram only — n'influence ni EV ni Kelly)
 FOOT_API_ALERT = _env_bool("FOOT_API_ALERT", True)
 FOOT_API_ALERT_SEUIL = int(os.environ.get("FOOT_API_ALERT_SEUIL", "3"))
@@ -1907,7 +1916,7 @@ async def verifier_resultats_matchs(session):
                 log_info(f"🏁 Règlement : {equipe_pari} ({h_val}) -> {stat} ({profit_reel:+.2f}u)")
 
 async def evaluer_impact_blessures(session, fixture_id, team_id, default_power=1.0):
-    """Filtre H-24 : Vérifie le nombre de joueurs à l'infirmerie."""
+    """Filtre H-24 : Vérifie le nombre de joueurs à l'infirmerie (fallback si pas de XI type)."""
     try:
         url = f"{URL_FOOTBALL}/injuries?fixture={fixture_id}&team={team_id}"
         res = await fetch_async(session, url, HEADERS_FB)
@@ -1924,6 +1933,114 @@ async def evaluer_impact_blessures(session, fixture_id, team_id, default_power=1
             return default_power * (1.0 - malus)
     except Exception:
         return default_power
+
+
+async def _injury_player_ids(session, fixture_id, team_id) -> set[str]:
+    """IDs joueurs absents (blessure/suspension) pour ce fixture — cache mémoire."""
+    key = (int(fixture_id), int(team_id))
+    if key in _cache_injuries_ids:
+        return _cache_injuries_ids[key]
+    ids: set[str] = set()
+    try:
+        url = f"{URL_FOOTBALL}/injuries?fixture={fixture_id}&team={team_id}"
+        res = await fetch_async(session, url, HEADERS_FB)
+        for row in (res or {}).get("response") or []:
+            pid = (row.get("player") or {}).get("id")
+            if pid is not None:
+                ids.add(str(pid))
+    except Exception:
+        ids = set()
+    _cache_injuries_ids[key] = ids
+    return ids
+
+
+async def _xi_type_player_ids(session, team_id, saison_correcte) -> list[str]:
+    """
+    XI type = 11 joueurs avec le plus de minutes (toutes ligues CHAMPIONNATS).
+    Cache (team_id, saison) — coûteux (pagination /players).
+    """
+    key = (int(team_id), int(saison_correcte))
+    if key in _cache_xi_type:
+        return _cache_xi_type[key]
+
+    all_players_res = []
+    page = 1
+    try:
+        while True:
+            url_players = f"{URL_FOOTBALL}/players?team={team_id}&season={saison_correcte}&page={page}"
+            res_players = await fetch_async(session, url_players, HEADERS_FB)
+            if not res_players or not res_players.get("response"):
+                break
+            all_players_res.extend(res_players["response"])
+            total_pages = res_players.get("paging", {}).get("total", 1)
+            if page >= total_pages:
+                break
+            page += 1
+    except Exception:
+        _cache_xi_type[key] = []
+        return []
+
+    if not all_players_res:
+        _cache_xi_type[key] = []
+        return []
+
+    champ_ids = {c["id"] for c in CHAMPIONNATS}
+    player_minutes = []
+    for p in all_players_res:
+        p_id = str(p["player"]["id"])
+        stats_league = next(
+            (s for s in p.get("statistics") or [] if (s.get("league") or {}).get("id") in champ_ids),
+            None,
+        )
+        mins = 0
+        if stats_league and (stats_league.get("games") or {}).get("minutes"):
+            mins = stats_league["games"]["minutes"] or 0
+        player_minutes.append((p_id, mins))
+
+    player_minutes.sort(key=lambda x: x[1], reverse=True)
+    xi = [p[0] for p in player_minutes[:11]]
+    _cache_xi_type[key] = xi
+    return xi
+
+
+async def evaluer_force_xi_probable(
+    session, fixture_id, team_id, saison_correcte, default_power=1.0,
+) -> tuple[float, str, bool]:
+    """
+    Proxy « compo probable » à H-24 (API lineups absente) :
+    malus λ si des joueurs du XI type (minutes) sont dans /injuries.
+    Retourne (force, détail, ok) — ok=False si XI type indisponible → fallback blessures.
+    """
+    global _xi_probable_logue
+    if not FOOT_XI_PROBABLE_ACTIF:
+        return default_power, "", False
+
+    if not _xi_probable_logue:
+        _xi_probable_logue = True
+        log_info(
+            f"👥 XI probable H-24 : malus {FOOT_XI_MALUS_PAR_ABSENT:.0%}/titulaire "
+            f"absent au-delà de {FOOT_XI_TOLERANCE} (cap {FOOT_XI_MALUS_MAX:.0%}) "
+            f"— live only (pas de BT lineups)"
+        )
+
+    xi = await _xi_type_player_ids(session, team_id, saison_correcte)
+    if len(xi) < 8:
+        return default_power, "", False
+
+    injured = await _injury_player_ids(session, fixture_id, team_id)
+    if not injured:
+        return default_power, "", True
+
+    stars_out = sum(1 for p_id in xi if p_id in injured)
+    tol = max(0, FOOT_XI_TOLERANCE)
+    if stars_out <= tol:
+        return default_power, "", True
+
+    extra = stars_out - tol
+    malus = min(extra * FOOT_XI_MALUS_PAR_ABSENT, FOOT_XI_MALUS_MAX)
+    force = default_power * (1.0 - malus)
+    detail = f"{stars_out} tit. XI absents (−{malus:.0%})"
+    return force, detail, True
 
 
 def _parse_kickoff_dt(raw) -> datetime | None:
@@ -2212,33 +2329,9 @@ async def evaluer_force_lineup(session, fixture_id, team_id, saison_correcte, de
             return default_power
 
         current_starters = [str(player['player']['id']) for player in res_lineup['response'][0]['startXI']]
-
-        # Récupération paginée de l'effectif complet pour un XI type fiable
-        all_players_res = []
-        page = 1
-        while True:
-            url_players = f"{URL_FOOTBALL}/players?team={team_id}&season={saison_correcte}&page={page}"
-            res_players = await fetch_async(session, url_players, HEADERS_FB)
-            if not res_players or not res_players.get('response'):
-                break
-            all_players_res.extend(res_players['response'])
-            total_pages = res_players.get('paging', {}).get('total', 1)
-            if page >= total_pages:
-                break
-            page += 1
-
-        if not all_players_res:
+        xi_type = await _xi_type_player_ids(session, team_id, saison_correcte)
+        if len(xi_type) < 8:
             return default_power
-
-        player_minutes = []
-        for p in all_players_res:
-            p_id = str(p['player']['id'])
-            stats_league = next((s for s in p['statistics'] if s['league']['id'] in [c['id'] for c in CHAMPIONNATS]), None)
-            mins = stats_league['games']['minutes'] if stats_league and stats_league['games']['minutes'] else 0
-            player_minutes.append((p_id, mins))
-
-        player_minutes.sort(key=lambda x: x[1], reverse=True)
-        xi_type = [p[0] for p in player_minutes[:11]]
 
         stars_missing = sum(1 for p_id in xi_type if p_id not in current_starters)
 
@@ -2427,11 +2520,35 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
         if skip_ah_fatigue:
             log_info(f"😴 Skip AH fatigue {n_d}-{n_e} : {detail_fatigue}")
 
-    # 2. FILTRE H-24 : Impact des Blessures (Uniquement sur les matchs prometteurs)
-    force_blessure_d = await evaluer_impact_blessures(session, id_m, id_d)
-    force_blessure_e = await evaluer_impact_blessures(session, id_m, id_e)
+    # 2. Impact absences — XI probable (titulaires habituels blessés) dès H-24 ;
+    #    fallback compteur /injuries si FOOT_XI off ou XI type indisponible.
+    note_xi = ""
+    if FOOT_XI_PROBABLE_ACTIF:
+        force_xi_d, det_d, ok_d = await evaluer_force_xi_probable(
+            session, id_m, id_d, saison_correcte
+        )
+        force_xi_e, det_e, ok_e = await evaluer_force_xi_probable(
+            session, id_m, id_e, saison_correcte
+        )
+        if det_d or det_e:
+            parts = []
+            if det_d:
+                parts.append(f"Dom {det_d}")
+            if det_e:
+                parts.append(f"Ext {det_e}")
+            note_xi = " | ".join(parts)
+            log_info(f"👥 XI probable {n_d}-{n_e} : {note_xi}")
+        force_blessure_d = (
+            force_xi_d if ok_d else await evaluer_impact_blessures(session, id_m, id_d)
+        )
+        force_blessure_e = (
+            force_xi_e if ok_e else await evaluer_impact_blessures(session, id_m, id_e)
+        )
+    else:
+        force_blessure_d = await evaluer_impact_blessures(session, id_m, id_d)
+        force_blessure_e = await evaluer_impact_blessures(session, id_m, id_e)
 
-    # Réutiliser la matrice préliminaire si aucune blessure ne modifie les xG
+    # Réutiliser la matrice préliminaire si aucune absence ne modifie les λ
     if force_blessure_d == 1.0 and force_blessure_e == 1.0:
         mat = mat_preliminaire
     else:
@@ -2451,6 +2568,10 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
             L_B_drop = L_B_base * force_blessure_e * force_lineup_e
             mat_lineup_drop = generer_matrice_dixon(max(0.4, L_A_drop), max(0.4, L_B_drop), ligue['id'], saison_correcte)
             alerte_lineup_text = f"🔄 ROTATION MASSIVE DÉTECTÉE (Dom: {force_lineup_d:.2f}x | Ext: {force_lineup_e:.2f}x)"
+    if note_xi and not alerte_lineup_text:
+        alerte_lineup_text = f"👥 XI probable : {note_xi}"
+    elif note_xi and alerte_lineup_text:
+        alerte_lineup_text = f"{alerte_lineup_text}\n👥 XI probable : {note_xi}"
 
     # Meilleur signal par type de marché (AH + totaux indépendants sur le même match)
     if mat_lineup_drop is not None:
@@ -3786,6 +3907,12 @@ async def main_loop():
             f"⚖️ Shrink AH : {FOOT_AH_SHRINK_W:.0%} modèle + "
             f"{1.0 - FOOT_AH_SHRINK_W:.0%} no-vig Pinnacle "
             f"(remplace blend poids_dyn sur AH ; totaux inchangés)"
+        )
+    if FOOT_XI_PROBABLE_ACTIF:
+        log_info(
+            f"👥 XI probable H-24 : −{FOOT_XI_MALUS_PAR_ABSENT:.0%}/titulaire "
+            f"XI type absent (tolérance {FOOT_XI_TOLERANCE}, cap {FOOT_XI_MALUS_MAX:.0%}) "
+            f"— live only (BT N/A)"
         )
 
     # Détection initiale de la couverture xG + collecte historique des scores
