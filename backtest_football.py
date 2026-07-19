@@ -132,6 +132,8 @@ FOOT_FATIGUE_AH_MODE = os.environ.get("FOOT_FATIGUE_AH_MODE", "either").strip().
 # Shrink AH model ↔ no-vig Pinnacle (même clés que sniper_bot_foot)
 FOOT_AH_SHRINK_ACTIF = _env_bool_bt("FOOT_AH_SHRINK_ACTIF", True)
 FOOT_AH_SHRINK_W = float(os.environ.get("FOOT_AH_SHRINK_W", "0.70"))
+# Skip AH si |p_modèle − p_Pin no-vig| > seuil (parité live) — 0 = off
+FOOT_AH_MAX_DESACCORD = float(os.environ.get("FOOT_AH_MAX_DESACCORD", "0.08"))
 
 
 def _headers_football():
@@ -1756,6 +1758,15 @@ def _candidats_pour_match(mat, odds_h24, home_name_odds, ev_min_l, ev_max_l,
             if calibrateur is not None and ligue_id is not None:
                 p_cal = calibrateur.apply(ligue_id, p_modele)
                 ev_modele = ajuster_ev_proportionnel(ev_modele, p_modele, p_cal)
+            if (
+                FOOT_AH_MAX_DESACCORD > 0
+                and cote_novig is not None
+                and cote_novig > 1.0
+                and p_cal is not None
+            ):
+                p_pin = max(0.001, min(0.999, 1.0 / float(cote_novig)))
+                if abs(float(p_cal) - p_pin) > FOOT_AH_MAX_DESACCORD:
+                    continue
             if FOOT_AH_SHRINK_ACTIF and cote_novig is not None and p_cal is not None:
                 p_shrunk = shrink_proba_vers_marche(p_cal, cote_novig, FOOT_AH_SHRINK_W)
                 if abs(p_shrunk - p_cal) > 1e-9:
@@ -2176,6 +2187,11 @@ async def simuler_paris(conn, ligues=None, ev_max_by_market=None, ev_min_by_mark
         print(
             f"  ⚖️ Shrink AH : p = {FOOT_AH_SHRINK_W:.0%}·modèle + "
             f"{1.0 - FOOT_AH_SHRINK_W:.0%}·no-vig Pinnacle (remplace blend poids_dyn sur AH)"
+        )
+    if FOOT_AH_MAX_DESACCORD > 0:
+        print(
+            f"  🎯 Filtre désaccord AH : skip si |p_modèle−p_Pin| > "
+            f"{FOOT_AH_MAX_DESACCORD:.0%} (avant shrink)"
         )
     if FOOT_FATIGUE_AH_ACTIF:
         repos = (

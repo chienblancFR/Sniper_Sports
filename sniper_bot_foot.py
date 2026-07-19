@@ -191,6 +191,8 @@ FOOT_STEAM_FILE = os.environ.get("FOOT_STEAM_FILE", "foot_odds_history.json")
 # Shrink AH : p_final = w*p_modele + (1-w)*p_novig Pinnacle (totaux inchangés)
 FOOT_AH_SHRINK_ACTIF = _env_bool("FOOT_AH_SHRINK_ACTIF", True)
 FOOT_AH_SHRINK_W = float(os.environ.get("FOOT_AH_SHRINK_W", "0.70"))  # poids modèle
+# Skip AH si |p_modèle − p_Pin no-vig| trop grand (surconfiance) — 0 = off
+FOOT_AH_MAX_DESACCORD = float(os.environ.get("FOOT_AH_MAX_DESACCORD", "0.08"))
 _steam_logue = False
 
 # XI probable (H-24) : malus λ si titulaires habituels absents (blessures) — live only
@@ -3116,6 +3118,22 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
                         ev_modele = ajuster_ev_proportionnel(ev_modele, p_modele, p_cal)
                         p_pour_ev = p_cal
                         p_modele = p_cal
+                # Filtre qualité CLV : trop loin de Pin no-vig → skip (avant shrink)
+                if (
+                    FOOT_AH_MAX_DESACCORD > 0
+                    and cote_novig is not None
+                    and cote_novig > 1.0
+                    and p_pour_ev is not None
+                ):
+                    p_pin = max(0.001, min(0.999, 1.0 / float(cote_novig)))
+                    delta = abs(float(p_pour_ev) - p_pin)
+                    if delta > FOOT_AH_MAX_DESACCORD:
+                        log_info(
+                            f"🚫 AH désaccord Pin {n_d}-{n_e} {nom} ({h:+g}) : "
+                            f"Δ={delta:.1%} > {FOOT_AH_MAX_DESACCORD:.0%} "
+                            f"(modèle {p_pour_ev:.1%} vs Pin {p_pin:.1%})"
+                        )
+                        continue
                 if FOOT_AH_SHRINK_ACTIF and cote_novig is not None and p_pour_ev is not None:
                     p_shrunk = shrink_proba_vers_marche(p_pour_ev, cote_novig, FOOT_AH_SHRINK_W)
                     if abs(p_shrunk - p_pour_ev) > 1e-9:
@@ -4378,6 +4396,11 @@ async def main_loop():
             f"⚖️ Shrink AH : {FOOT_AH_SHRINK_W:.0%} modèle + "
             f"{1.0 - FOOT_AH_SHRINK_W:.0%} no-vig Pinnacle "
             f"(remplace blend poids_dyn sur AH ; totaux inchangés)"
+        )
+    if FOOT_AH_MAX_DESACCORD > 0:
+        log_info(
+            f"🎯 Filtre désaccord AH : skip si |p_modèle−p_Pin| > "
+            f"{FOOT_AH_MAX_DESACCORD:.0%} (avant shrink ; totaux inchangés)"
         )
     if FOOT_XI_PROBABLE_ACTIF:
         log_info(
