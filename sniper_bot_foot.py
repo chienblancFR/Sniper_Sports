@@ -90,6 +90,20 @@ async def init_db():
             await db_conn.execute(migration)
         except Exception:
             pass  # Colonne déjà présente
+    # Audit XI probable (H-24) vs lineup officielle (H-1) — Telegram avant KO
+    await db_conn.execute('''CREATE TABLE IF NOT EXISTS xi_audit
+                          (fixture_id INTEGER, team_id INTEGER,
+                           equipe TEXT, adversaire TEXT, venue TEXT,
+                           ligue TEXT, kickoff TEXT,
+                           xi_probable TEXT, xi_officiel TEXT,
+                           n_probable INTEGER DEFAULT 0,
+                           n_overlap INTEGER DEFAULT 0,
+                           n_missing INTEGER DEFAULT 0,
+                           ok INTEGER DEFAULT 0,
+                           notifie INTEGER DEFAULT 0,
+                           timestamp_probable TEXT,
+                           timestamp_officiel TEXT,
+                           PRIMARY KEY (fixture_id, team_id))''')
     await db_conn.commit()
 
 semaphore = None
@@ -188,10 +202,15 @@ FOOT_XI_MALUS_MAX = float(os.environ.get("FOOT_XI_MALUS_MAX", "0.25"))
 FOOT_XI_ROTATION_ACTIF = _env_bool("FOOT_XI_ROTATION_ACTIF", True)
 FOOT_XI_CUP_APRES_MALUS = float(os.environ.get("FOOT_XI_CUP_APRES_MALUS", "0.10"))
 FOOT_XI_FATIGUE_MALUS = float(os.environ.get("FOOT_XI_FATIGUE_MALUS", "0.05"))
-_cache_xi_type: dict[tuple[int, int], list[str]] = {}
+# Audit XI probable vs officiel → Telegram avant KO (live only)
+FOOT_XI_AUDIT_ACTIF = _env_bool("FOOT_XI_AUDIT_ACTIF", True)
+FOOT_XI_AUDIT_HEURES_MAX = float(os.environ.get("FOOT_XI_AUDIT_HEURES_MAX", "1.5"))
+FOOT_XI_AUDIT_HEURES_MIN = float(os.environ.get("FOOT_XI_AUDIT_HEURES_MIN", "0.05"))
+_cache_xi_type: dict[tuple[int, int], list[tuple[str, str]]] = {}
 _cache_injuries_ids: dict[tuple[int, int], set[str]] = {}
 _xi_probable_logue = False
 _xi_rotation_logue = False
+_xi_audit_logue = False
 _FINISHED_FX = frozenset({"FT", "AET", "PEN", "AWD", "WO"})
 
 # Alerte monitoring API down (Telegram only — n'influence ni EV ni Kelly)
@@ -1960,10 +1979,10 @@ async def _injury_player_ids(session, fixture_id, team_id) -> set[str]:
     return ids
 
 
-async def _xi_type_player_ids(session, team_id, saison_correcte) -> list[str]:
+async def _xi_type_players(session, team_id, saison_correcte) -> list[tuple[str, str]]:
     """
     XI type = 11 joueurs avec le plus de minutes (toutes ligues CHAMPIONNATS).
-    Cache (team_id, saison) — coûteux (pagination /players).
+    Retourne [(player_id, name), ...] — cache (team_id, saison).
     """
     key = (int(team_id), int(saison_correcte))
     if key in _cache_xi_type:
@@ -1993,7 +2012,11 @@ async def _xi_type_player_ids(session, team_id, saison_correcte) -> list[str]:
     champ_ids = {c["id"] for c in CHAMPIONNATS}
     player_minutes = []
     for p in all_players_res:
-        p_id = str(p["player"]["id"])
+        p_info = p.get("player") or {}
+        p_id = str(p_info.get("id") or "")
+        if not p_id:
+            continue
+        p_name = (p_info.get("name") or p_id).strip()
         stats_league = next(
             (s for s in p.get("statistics") or [] if (s.get("league") or {}).get("id") in champ_ids),
             None,
@@ -2001,12 +2024,308 @@ async def _xi_type_player_ids(session, team_id, saison_correcte) -> list[str]:
         mins = 0
         if stats_league and (stats_league.get("games") or {}).get("minutes"):
             mins = stats_league["games"]["minutes"] or 0
-        player_minutes.append((p_id, mins))
+        player_minutes.append((p_id, p_name, mins))
 
-    player_minutes.sort(key=lambda x: x[1], reverse=True)
-    xi = [p[0] for p in player_minutes[:11]]
+    player_minutes.sort(key=lambda x: x[2], reverse=True)
+    xi = [(p[0], p[1]) for p in player_minutes[:11]]
     _cache_xi_type[key] = xi
     return xi
+
+
+async def _xi_type_player_ids(session, team_id, saison_correcte) -> list[str]:
+    return [p[0] for p in await _xi_type_players(session, team_id, saison_correcte)]
+
+
+async def construire_xi_probable(
+    session, fixture_id, team_id, saison_correcte
+) -> list[dict]:
+    """XI type − blessés/suspendus connus. Liste [{id, name}, ...] (peut être < 11)."""
+    xi = await _xi_type_players(session, team_id, saison_correcte)
+    if len(xi) < 8:
+        return []
+    injured = await _injury_player_ids(session, fixture_id, team_id)
+    return [{"id": p_id, "name": name} for p_id, name in xi if p_id not in injured]
+
+
+async def enregistrer_xi_probable_audit(
+    session,
+    fixture_id: int,
+    team_id: int,
+    equipe: str,
+    adversaire: str,
+    venue: str,
+    ligue_nom: str,
+    kickoff_iso: str,
+    saison_correcte: int,
+) -> None:
+    """Persiste le XI probable à H-24 (une fois) pour comparaison ultérieure."""
+    global _xi_audit_logue
+    if not FOOT_XI_AUDIT_ACTIF:
+        return
+    if not _xi_audit_logue:
+        _xi_audit_logue = True
+        log_info(
+            f"📋 Audit XI : compare probable vs officiel à H≤{FOOT_XI_AUDIT_HEURES_MAX:g}h "
+            f"(Telegram avant KO ; tolérance {FOOT_XI_TOLERANCE})"
+        )
+
+    async with db_lock:
+        async with db_conn.execute(
+            "SELECT 1 FROM xi_audit WHERE fixture_id=? AND team_id=?",
+            (int(fixture_id), int(team_id)),
+        ) as cur:
+            if await cur.fetchone():
+                return
+
+    probable = await construire_xi_probable(
+        session, fixture_id, team_id, saison_correcte
+    )
+    if len(probable) < 8:
+        return
+
+    async with db_lock:
+        await db_conn.execute(
+            """INSERT OR IGNORE INTO xi_audit
+               (fixture_id, team_id, equipe, adversaire, venue, ligue, kickoff,
+                xi_probable, n_probable, notifie, timestamp_probable)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+            (
+                int(fixture_id),
+                int(team_id),
+                equipe,
+                adversaire,
+                venue,
+                ligue_nom,
+                kickoff_iso,
+                json.dumps(probable, ensure_ascii=False),
+                len(probable),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        await db_conn.commit()
+
+
+def _comparer_xi_probable_officiel(
+    probable: list[dict], officiel: list[dict]
+) -> tuple[int, int, int, list[str]]:
+    """Retourne (n_probable, n_overlap, n_missing, noms_manquants)."""
+    off_ids = {str(p.get("id")) for p in officiel if p.get("id") is not None}
+    overlap = 0
+    missing_names: list[str] = []
+    for p in probable:
+        pid = str(p.get("id") or "")
+        if pid and pid in off_ids:
+            overlap += 1
+        else:
+            missing_names.append(str(p.get("name") or pid))
+    n_prob = len(probable)
+    return n_prob, overlap, n_prob - overlap, missing_names
+
+
+async def _stats_xi_audit_cumul() -> tuple[int, float, float]:
+    """(n_équipes évaluées, % OK ≤ tolérance, overlap moyen / n_probable)."""
+    async with db_lock:
+        async with db_conn.execute(
+            """SELECT COUNT(*),
+                      AVG(CASE WHEN ok=1 THEN 1.0 ELSE 0.0 END),
+                      AVG(CASE WHEN n_probable > 0
+                               THEN 1.0 * n_overlap / n_probable ELSE NULL END)
+               FROM xi_audit
+               WHERE xi_officiel IS NOT NULL AND notifie=1"""
+        ) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        return 0, 0.0, 0.0
+    n, pct_ok, avg_ov = row
+    return int(n), float(pct_ok or 0.0), float(avg_ov or 0.0)
+
+
+async def _lineups_officielles_par_equipe(
+    session, fixture_id: int
+) -> dict[int, list[dict]]:
+    """team_id → [{id, name}, ...] startXI."""
+    out: dict[int, list[dict]] = {}
+    res = await fetch_async(
+        session, f"{URL_FOOTBALL}/fixtures/lineups?fixture={fixture_id}", HEADERS_FB
+    )
+    for block in (res or {}).get("response") or []:
+        try:
+            tid = int((block.get("team") or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not tid:
+            continue
+        starters = []
+        for row in block.get("startXI") or []:
+            pl = row.get("player") or {}
+            pid = pl.get("id")
+            if pid is None:
+                continue
+            starters.append({"id": str(pid), "name": (pl.get("name") or str(pid)).strip()})
+        if starters:
+            out[tid] = starters
+    return out
+
+
+async def verifier_xi_audit_async(session) -> int:
+    """
+    Quand la compo officielle sort (fenêtre avant KO) : compare au XI probable
+    enregistré à H-24, Telegram une fois, stats cumulées.
+    Retourne le nombre de matchs notifiés.
+    """
+    if not FOOT_XI_AUDIT_ACTIF:
+        return 0
+
+    async with db_lock:
+        async with db_conn.execute(
+            """SELECT fixture_id, team_id, equipe, adversaire, venue, ligue,
+                      kickoff, xi_probable
+               FROM xi_audit WHERE notifie=0"""
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    h_max = max(0.1, FOOT_XI_AUDIT_HEURES_MAX)
+    h_min = max(0.0, FOOT_XI_AUDIT_HEURES_MIN)
+
+    # Grouper par fixture
+    par_fx: dict[int, list] = {}
+    expires: list[tuple[int, int]] = []  # (fixture_id, team_id) trop tard sans lineup
+
+    for row in rows:
+        fixture_id, team_id, equipe, adversaire, venue, ligue, kickoff, xi_prob_json = row
+        ko = _parse_kickoff_dt(kickoff)
+        if ko is None:
+            continue
+        hrs = (ko - now).total_seconds() / 3600.0
+        if hrs > h_max:
+            continue
+        if hrs < h_min:
+            expires.append((int(fixture_id), int(team_id)))
+            continue
+        par_fx.setdefault(int(fixture_id), []).append(row)
+
+    # Expirés sans notif : marquer pour ne pas reboucler
+    if expires:
+        async with db_lock:
+            for fid, tid in expires:
+                await db_conn.execute(
+                    "UPDATE xi_audit SET notifie=2 WHERE fixture_id=? AND team_id=? AND notifie=0",
+                    (fid, tid),
+                )
+            await db_conn.commit()
+
+    n_notifies = 0
+    for fixture_id, team_rows in par_fx.items():
+        lineups = await _lineups_officielles_par_equipe(session, fixture_id)
+        if not lineups:
+            continue  # retry prochain cycle
+
+        ko = _parse_kickoff_dt(team_rows[0][6])
+        hrs = (ko - now).total_seconds() / 3600.0 if ko else 0.0
+        ligue = team_rows[0][5] or "?"
+        home_row = next((r for r in team_rows if r[4] == "home"), None)
+        away_row = next((r for r in team_rows if r[4] == "away"), None)
+        if home_row and away_row:
+            titre = f"{home_row[2]} - {away_row[2]}"
+        else:
+            titre = f"{team_rows[0][2]} vs {team_rows[0][3]}"
+
+        blocs_msg: list[str] = []
+        ts_now = datetime.now(timezone.utc).isoformat()
+
+        for row in team_rows:
+            _fid, team_id, equipe, _adv, venue, _lg, _ko, xi_prob_json = row
+            tid = int(team_id)
+            officiel = lineups.get(tid)
+            if not officiel:
+                continue
+            try:
+                probable = json.loads(xi_prob_json or "[]")
+            except json.JSONDecodeError:
+                probable = []
+            if not probable:
+                continue
+
+            n_prob, n_ov, n_miss, missing_names = _comparer_xi_probable_officiel(
+                probable, officiel
+            )
+            ok = 1 if n_miss <= FOOT_XI_TOLERANCE else 0
+            badge = "✅" if ok else "❌"
+            miss_txt = ", ".join(missing_names[:5])
+            if len(missing_names) > 5:
+                miss_txt += f" (+{len(missing_names) - 5})"
+            ligne = (
+                f"*{equipe}* ({venue}) : {n_ov}/{n_prob} {badge}"
+                + (f"\n  hors XI : {miss_txt}" if missing_names else "")
+            )
+            blocs_msg.append(ligne)
+
+            async with db_lock:
+                await db_conn.execute(
+                    """UPDATE xi_audit
+                       SET xi_officiel=?, n_probable=?, n_overlap=?, n_missing=?,
+                           ok=?, notifie=1, timestamp_officiel=?
+                       WHERE fixture_id=? AND team_id=?""",
+                    (
+                        json.dumps(officiel, ensure_ascii=False),
+                        n_prob,
+                        n_ov,
+                        n_miss,
+                        ok,
+                        ts_now,
+                        fixture_id,
+                        tid,
+                    ),
+                )
+                await db_conn.commit()
+
+        if not blocs_msg:
+            continue
+
+        n_cum, pct_ok, avg_ov = await _stats_xi_audit_cumul()
+        cumul = (
+            f"📊 Cumul : {pct_ok:.0%} OK (≤{FOOT_XI_TOLERANCE} erreurs) | "
+            f"overlap moy {avg_ov:.1%} (n={n_cum})"
+            if n_cum
+            else "📊 Cumul : première mesure"
+        )
+        msg = (
+            f"👥 *Audit XI probable vs officiel*\n"
+            f"🏟 {titre}\n"
+            f"🏷 {ligue} | H-{hrs:.1f}\n\n"
+            + "\n".join(blocs_msg)
+            + f"\n\n{cumul}"
+        )
+        await envoyer_telegram_async(session, msg)
+        log_info(f"📋 Audit XI notifié : {titre} (H-{hrs:.1f})")
+        n_notifies += 1
+
+    return n_notifies
+
+
+async def _mins_prochain_xi_audit() -> float | None:
+    """Minutes avant le prochain KO avec audit XI en attente (pour pause adaptative)."""
+    if not FOOT_XI_AUDIT_ACTIF:
+        return None
+    async with db_lock:
+        async with db_conn.execute(
+            "SELECT kickoff FROM xi_audit WHERE notifie=0 AND kickoff IS NOT NULL"
+        ) as cur:
+            rows = await cur.fetchall()
+    now = datetime.now(timezone.utc)
+    prochains = []
+    for (kickoff,) in rows:
+        ko = _parse_kickoff_dt(kickoff)
+        if ko is None:
+            continue
+        mins = (ko - now).total_seconds() / 60
+        if mins > 0:
+            prochains.append(mins)
+    return min(prochains) if prochains else None
 
 
 async def evaluer_force_xi_probable(
@@ -2480,6 +2799,16 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
 
     res_lineups = await fetch_async(session, f"{URL_FOOTBALL}/fixtures/lineups?fixture={id_m}", HEADERS_FB)
     lineup_ok = True if res_lineups and res_lineups.get('response') else False
+
+    # Snapshot XI probable (H-24) pour audit vs officiel avant KO — indépendant du filtre EV
+    if FOOT_XI_AUDIT_ACTIF and not lineup_ok:
+        ko_iso = dt_obj.astimezone(timezone.utc).isoformat() if dt_obj.tzinfo else dt_obj.replace(tzinfo=timezone.utc).isoformat()
+        await enregistrer_xi_probable_audit(
+            session, id_m, id_d, n_d, n_e, "home", ligue["nom"], ko_iso, saison_correcte
+        )
+        await enregistrer_xi_probable_audit(
+            session, id_m, id_e, n_e, n_d, "away", ligue["nom"], ko_iso, saison_correcte
+        )
 
     # ligue_avg_def : moyenne des buts encaissés par match selon le venue
     # Home team concède en moyenne m_ext_l (buts marqués par les visiteurs)
@@ -3894,6 +4223,7 @@ async def lancer_scan_global_async() -> int:
         await actualiser_kelly_adaptatif()        # 📐 Kelly dynamique selon drawdown
         await verifier_resultats_matchs(session)
         await tracker_clv_async(session)          # CLV proactif avant le scan des ligues
+        await verifier_xi_audit_async(session)    # XI probable vs officiel avant KO
 
         # Traitement par lots de 4 ligues en parallèle (réduit le dead-wait de 160s à ~40s)
         BATCH_SIZE = 4
@@ -3909,6 +4239,10 @@ async def lancer_scan_global_async() -> int:
             n_clv = await tracker_clv_async(session)
             if n_clv:
                 log_info(f"[CLV] 2e passe fin de cycle ({n_clv} paris).")
+
+        n_xi = await verifier_xi_audit_async(session)
+        if n_xi:
+            log_info(f"[XI audit] {n_xi} match(s) notifié(s) fin de cycle.")
 
         await alerter_clv_moyenne_degradee(session)
 
@@ -4025,6 +4359,11 @@ async def main_loop():
             f"fatigue −{FOOT_XI_FATIGUE_MALUS:.0%} "
             f"(avant lineups H-1 ; live only)"
         )
+    if FOOT_XI_AUDIT_ACTIF:
+        log_info(
+            f"📋 Audit XI : Telegram H≤{FOOT_XI_AUDIT_HEURES_MAX:g}h "
+            f"(OK si ≤{FOOT_XI_TOLERANCE} erreurs vs officiel)"
+        )
 
     # Détection initiale de la couverture xG + collecte historique des scores
     dernier_retest_xg = None
@@ -4098,15 +4437,21 @@ async def main_loop():
 
             matchs = await lancer_scan_global_async()
             mins_ko = await _mins_prochain_kickoff_pending()
-            pause = calculer_pause(matchs, mins_pending_ko=mins_ko)
+            mins_xi = await _mins_prochain_xi_audit()
+            mins_suivi = None
+            for m in (mins_ko, mins_xi):
+                if m is not None:
+                    mins_suivi = m if mins_suivi is None else min(mins_suivi, m)
+            pause = calculer_pause(matchs, mins_pending_ko=mins_suivi)
             pause_label = f"{pause//60} min" if pause >= 60 else f"{pause}s"
             log_info(f"😴 Pause adaptative : {pause_label} "
                      f"({'mode actif' if pause == 300 else 'mode veille' if pause == 900 else 'mode économie'}).")
-            if mins_ko is not None and mins_ko <= 120 and pause >= 180:
+            if mins_suivi is not None and mins_suivi <= 120 and pause >= 180:
                 demi = pause // 2
                 await asyncio.sleep(demi)
                 async with aiohttp.ClientSession() as session:
                     await tracker_clv_async(session)
+                    await verifier_xi_audit_async(session)
                 await asyncio.sleep(pause - demi)
             else:
                 await asyncio.sleep(pause)
