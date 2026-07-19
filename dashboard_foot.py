@@ -55,6 +55,9 @@ LIGUE_NOMS = {
     141: "LaLiga 2",       39: "Premier League",  40: "Championship",
     253: "MLS",           103: "Eliteserien",    144: "Jupiler Pro",
     136: "Serie B",       207: "Super League",
+    218: "Bundesliga AT", 119: "Superliga",      179: "Premiership",
+    106: "Ekstraklasa",    62: "Ligue 2",         79: "Bundesliga 2",
+    307: "Pro League",
 }
 
 

@@ -262,6 +262,13 @@ CIBLES_CLV_AH = {
     103: (0.0050, 80,  "Niche"),   # Eliteserien
     144: (0.0050, 100, "Niche"),   # Jupiler Pro
     207: (0.0050, 80,  "Niche"),   # Super League (Suisse)
+    218: (0.0050, 80,  "Niche"),   # Bundesliga AT
+    119: (0.0050, 80,  "Niche"),   # Superliga DK
+    179: (0.0050, 80,  "Niche"),   # Premiership SCO
+    106: (0.0050, 80,  "Niche"),   # Ekstraklasa
+    62:  (0.0050, 120, "Mid"),     # Ligue 2
+    79:  (0.0050, 120, "Mid"),     # Bundesliga 2
+    307: (0.0050, 80,  "Niche"),   # Pro League SA
 }
 CIBLE_CLV_AH_DEFAULT = (0.0050, 120, "Mid")
 
