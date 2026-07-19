@@ -261,6 +261,7 @@ CIBLES_CLV_AH = {
     71:  (0.0050, 100, "Niche"),   # Série A Brésil
     103: (0.0050, 80,  "Niche"),   # Eliteserien
     144: (0.0050, 100, "Niche"),   # Jupiler Pro
+    207: (0.0050, 80,  "Niche"),   # Super League (Suisse)
 }
 CIBLE_CLV_AH_DEFAULT = (0.0050, 120, "Mid")
 

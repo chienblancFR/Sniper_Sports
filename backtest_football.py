@@ -196,7 +196,7 @@ LIGUES_ESTIVALES = {71, 113, 253, 103}  # Brésil, Allsvenskan, MLS, Eliteserien
 
 # Championnats européens (calendrier hivernal) — reçoivent SAISONS_EUROPE_EXTRA
 LIGUES_EUROPEENNES = {
-    140, 78, 88, 135, 94, 203, 61, 141, 39, 40, 144, 136,
+    140, 78, 88, 135, 94, 203, 61, 141, 39, 40, 144, 136, 207,
 }
 
 # Preset P1 — réduction volume AH (live + backtest : EV max 9% + tier ; cap optionnel via --max-ah-ligue-saison)
@@ -221,6 +221,7 @@ CHAMPIONNATS = [
     {"nom": "Eliteserien",      "id": 103, "key": "soccer_norway_eliteserien",        "c1": 2,  "euro": 4,  "rel": 14, "ev_min": 0.05, "ev_max": 0.15},
     {"nom": "Jupiler Pro",      "id": 144, "key": "soccer_belgium_first_div",         "c1": 6,  "euro": 12, "rel": 13, "ev_min": 0.05, "ev_max": 0.15},
     {"nom": "Serie B",          "id": 136, "key": "soccer_italy_serie_b",             "c1": 2,  "euro": 8,  "rel": 16, "ev_min": 0.05, "ev_max": 0.15},
+    {"nom": "Super League",     "id": 207, "key": "soccer_switzerland_superleague",   "c1": 2,  "euro": 5,  "rel": 11, "ev_min": 0.05, "ev_max": 0.15},
 ]
 
 KELLY_FRAC = 0.05
@@ -400,6 +401,22 @@ NAME_MAPPING = {
     "Ham-Kam": "HamKam", "HamKam": "HamKam",
     "FK Jerv": "Jerv", "jerv": "Jerv", "Jerv": "Jerv",
     "Kongsvinger IL": "Kongsvinger", "Kongsvinger": "Kongsvinger",
+    # 🇨🇭 SUPER LEAGUE
+    "BSC Young Boys": "Young Boys", "Young Boys": "Young Boys",
+    "FC Basel 1893": "FC Basel", "FC Basel": "FC Basel", "Basel": "FC Basel",
+    "FC Zürich": "FC Zurich", "FC Zurich": "FC Zurich",
+    "Grasshopper Club Zürich": "Grasshoppers", "Grasshopper-Club Zürich": "Grasshoppers",
+    "Grasshoppers": "Grasshoppers",
+    "FC Lugano": "Lugano", "Lugano": "Lugano",
+    "Servette FC": "Servette", "Servette": "Servette",
+    "FC Luzern": "FC Luzern", "Luzern": "FC Luzern", "Lucerne": "FC Luzern",
+    "FC St. Gallen": "St Gallen", "FC St. Gallen 1879": "St Gallen",
+    "St. Gallen": "St Gallen", "St Gallen": "St Gallen",
+    "FC Sion": "Sion", "Sion": "Sion",
+    "FC Winterthur": "Winterthur", "Winterthur": "Winterthur",
+    "FC Lausanne-Sport": "Lausanne", "Lausanne-Sport": "Lausanne", "Lausanne": "Lausanne",
+    "Yverdon Sport": "Yverdon Sport", "Yverdon-Sport FC": "Yverdon Sport",
+    "FC Thun": "Thun", "Thun": "Thun",
     # 🇧🇪 JUPILER PRO LEAGUE — canonique = libellés Odds API / Pinnacle
     # Noms API-Football (bt_fixtures)
     "Antwerp": "Royal Antwerp",

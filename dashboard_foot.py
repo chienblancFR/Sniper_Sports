@@ -54,7 +54,7 @@ LIGUE_NOMS = {
     113: "Allsvenskan",    71: "Série A Brésil",  61: "Ligue 1",
     141: "LaLiga 2",       39: "Premier League",  40: "Championship",
     253: "MLS",           103: "Eliteserien",    144: "Jupiler Pro",
-    136: "Serie B",
+    136: "Serie B",       207: "Super League",
 }
 
 

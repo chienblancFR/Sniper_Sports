@@ -952,6 +952,42 @@ NAME_MAPPING = {
     "Kongsvinger":              "Kongsvinger",
 
     # ============================================================
+    # 🇨🇭 SUPER LEAGUE — canonique ≈ Odds API / Pinnacle
+    # ============================================================
+    "BSC Young Boys":           "Young Boys",
+    "Young Boys":               "Young Boys",
+    "FC Basel 1893":            "FC Basel",
+    "FC Basel":                 "FC Basel",
+    "Basel":                    "FC Basel",
+    "FC Zürich":                "FC Zurich",
+    "FC Zurich":                "FC Zurich",
+    "Grasshopper Club Zürich":  "Grasshoppers",
+    "Grasshopper-Club Zürich":  "Grasshoppers",
+    "Grasshoppers":             "Grasshoppers",
+    "FC Lugano":                "Lugano",
+    "Lugano":                   "Lugano",
+    "Servette FC":              "Servette",
+    "Servette":                 "Servette",
+    "FC Luzern":                "FC Luzern",
+    "Luzern":                   "FC Luzern",
+    "Lucerne":                  "FC Luzern",
+    "FC St. Gallen":            "St Gallen",
+    "FC St. Gallen 1879":       "St Gallen",
+    "St. Gallen":               "St Gallen",
+    "St Gallen":                "St Gallen",
+    "FC Sion":                  "Sion",
+    "Sion":                     "Sion",
+    "FC Winterthur":            "Winterthur",
+    "Winterthur":               "Winterthur",
+    "FC Lausanne-Sport":        "Lausanne",
+    "Lausanne-Sport":           "Lausanne",
+    "Lausanne":                 "Lausanne",
+    "Yverdon Sport":            "Yverdon Sport",
+    "Yverdon-Sport FC":         "Yverdon Sport",
+    "FC Thun":                  "Thun",
+    "Thun":                     "Thun",
+
+    # ============================================================
     # 🇧🇪 JUPILER PRO LEAGUE — canonique = libellés Odds API / Pinnacle
     # ============================================================
     # Noms API-Football
@@ -1320,6 +1356,18 @@ STADES_GPS = {
     517: (45.5683, 10.2311),  # Brescia (Stadio Mario Rigamonti)
     513: (44.1039, 9.8081),   # Spezia (Stadio Alberto Picco)
     509: (41.0847, 16.8400),  # Bari (Stadio San Nicola)
+
+    # ==========================================
+    # 🇨🇭 SUPER LEAGUE
+    # ==========================================
+    601: (46.9631, 7.4647),   # Young Boys (Wankdorf)
+    659: (47.5416, 7.6201),   # Basel (St. Jakob-Park)
+    663: (47.3827, 8.5039),   # Zürich (Letzigrund)
+    661: (46.0239, 8.9600),   # Lugano (Cornaredo)
+    662: (46.2089, 6.1286),   # Servette (Stade de Genève)
+    665: (47.0331, 8.3050),   # Luzern (Swissporarena)
+    660: (47.4081, 9.3083),   # St. Gallen (Kybunpark)
+    664: (46.2336, 7.3750),   # Sion (Tourbillon)
 }
 
 # 💎 LE CATALOGUE OPTIMISÉ PAR GRID SEARCH 💎
@@ -1341,6 +1389,7 @@ CHAMPIONNATS = [
     {"nom": "🇳🇴 Eliteserien", "id": 103, "key": "soccer_norway_eliteserien", "ev_min": 0.05, "ev_max": 0.15, "c1": 2, "euro": 4, "rel": 14},
     {"nom": "🇧🇪 Jupiler Pro League", "id": 144, "key": "soccer_belgium_first_div", "ev_min": 0.05, "ev_max": 0.15, "c1": 6, "euro": 12, "rel": 13},
     {"nom": "🇮🇹 Serie B", "id": 136, "key": "soccer_italy_serie_b", "ev_min": 0.05, "ev_max": 0.15, "c1": 2, "euro": 8, "rel": 16},
+    {"nom": "🇨🇭 Super League", "id": 207, "key": "soccer_switzerland_superleague", "ev_min": 0.05, "ev_max": 0.15, "c1": 2, "euro": 5, "rel": 11},
 ]
 
 URL_FOOTBALL = "https://v3.football.api-sports.io"
@@ -3418,7 +3467,10 @@ async def actualiser_stats_ligue(session, ligue_cfg, season):
 
     # Ligues européennes en off-season (juin-juillet) : inutile d'interroger l'API
     mois = datetime.now().month
-    is_euro = not any(mot in ligue_cfg['nom'] for mot in ["Brésil", "Allsvenskan", "MLS", "Eliteserien"])
+    is_euro = not any(
+        mot in ligue_cfg['nom']
+        for mot in ["Brésil", "Allsvenskan", "MLS", "Eliteserien", "Super League"]
+    )
     if is_euro and mois in (6, 7):
         log_info(f"💤 {ligue_cfg['nom']} : off-season (Coupe du Monde / intersaison). Ignorée jusqu'en août.")
         return None
