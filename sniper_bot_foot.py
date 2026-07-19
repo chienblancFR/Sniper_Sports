@@ -245,90 +245,122 @@ LIGUES_SANS_XG = {
     # 253 MLS            → CONFIRMÉ xG ✅ (29/06/2026)
 }
 
+async def _fixture_a_expected_goals(session, fixture_id: int) -> bool:
+    """True si /fixtures/statistics contient un expected_goals numérique pour ce match."""
+    stats = await fetch_async(
+        session, f"{URL_FOOTBALL}/fixtures/statistics?fixture={fixture_id}", HEADERS_FB
+    )
+    if not stats or not stats.get("response"):
+        return False
+    for team_stat in stats["response"]:
+        xg_raw = next(
+            (s["value"] for s in (team_stat.get("statistics") or []) if s.get("type") == "expected_goals"),
+            None,
+        )
+        try:
+            if xg_raw not in (None, "null", "", "None") and float(xg_raw) >= 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+async def _fixtures_ft_last(session, ligue_id: int, saison: int, n: int = 3) -> list:
+    url = f"{URL_FOOTBALL}/fixtures?league={ligue_id}&season={saison}&last={n}&status=FT"
+    data = await fetch_async(session, url, HEADERS_FB)
+    return list((data or {}).get("response") or [])
+
+
 async def detecter_ligues_sans_xg(session):
     """
-    Détecte automatiquement quelles ligues ont des données xG réelles dans API-Football.
-    Teste chaque ligue en récupérant un match récent et vérifiant la présence de
-    'expected_goals' dans /fixtures/statistics.
+    Détecte quelles ligues ont des xG réels dans API-Football.
 
-    Résultats mis en cache dans la table xg_couverture_ligue (retesté tous les 30 jours).
-    Met à jour LIGUES_SANS_XG en mémoire.
+    - Teste jusqu'à 3 matchs FT de la saison courante, puis 3 de N-1 si besoin
+      (évite le faux négatif « 1 match sans Opta ⇒ ligue entière sans xG »).
+    - Aucun fixture trouvé (intersaison) ⇒ indéterminé : on NE marque PAS
+      la ligue comme sans xG (le moteur tentera quand même les stats).
+    - Cache : positifs 30 j ; négatifs retestés à chaque passage (pas figés).
     """
     global LIGUES_SANS_XG
     log_info("🔬 Détection automatique de la couverture xG par ligue...")
     maintenant = datetime.now().isoformat()
-    seuil_retest = (datetime.now() - timedelta(days=30)).isoformat()
+    seuil_retest_ok = (datetime.now() - timedelta(days=30)).isoformat()
     nouvelles_sans_xg = set()
 
     for ligue in CHAMPIONNATS:
-        ligue_id = ligue['id']
+        ligue_id = ligue["id"]
 
-        # Vérifier si un test récent existe en DB (< 30 jours)
         async with db_lock:
             async with db_conn.execute(
                 "SELECT a_xg, teste_le FROM xg_couverture_ligue WHERE ligue_id=?",
-                (ligue_id,)
+                (ligue_id,),
             ) as cursor:
                 row = await cursor.fetchone()
 
-        if row and row[1] and row[1] > seuil_retest:
-            # Résultat encore frais — utiliser le cache
-            if row[0] == 0:
-                nouvelles_sans_xg.add(ligue_id)
+        # Positif récent → confiance ; négatif → toujours retester (faux négatifs)
+        if row and row[0] == 1 and row[1] and row[1] > seuil_retest_ok:
             continue
 
-        # Trouver un match récent terminé pour cette ligue
-        saison = obtenir_saison_api(ligue['nom'])
-        url = f"{URL_FOOTBALL}/fixtures?league={ligue_id}&season={saison}&last=3&status=FT"
-        data = await fetch_async(session, url, HEADERS_FB)
-        fixtures = data.get('response', []) if data else []
+        saison = obtenir_saison_api(ligue["nom"])
+        fixtures_n = await _fixtures_ft_last(session, ligue_id, saison, n=3)
+        fixtures_prev = await _fixtures_ft_last(session, ligue_id, saison - 1, n=3)
 
-        if not fixtures:
-            # Essayer saison précédente
-            url = f"{URL_FOOTBALL}/fixtures?league={ligue_id}&season={saison-1}&last=3&status=FT"
-            data = await fetch_async(session, url, HEADERS_FB)
-            fixtures = data.get('response', []) if data else []
-
-        if not fixtures:
-            log_info(f"  ⚠️ {ligue['nom']} : aucun match récent trouvé, xG supposé absent.")
-            nouvelles_sans_xg.add(ligue_id)
-            async with db_lock:
-                await db_conn.execute(
-                    "INSERT OR REPLACE INTO xg_couverture_ligue VALUES (?, ?, ?)",
-                    (ligue_id, 0, maintenant)
-                )
-                await db_conn.commit()
+        if not fixtures_n and not fixtures_prev:
+            log_info(
+                f"  ⚠️ {ligue['nom']} : aucun match FT (saison {saison}/{saison - 1}) "
+                f"— couverture xG indéterminée (on tentera les stats, pas de ban)."
+            )
+            # Ne pas écrire a_xg=0 : éviter un faux « sans xG » figé en intersaison
             continue
-
-        # Tester le premier match disponible
-        fixture_id = fixtures[0]['fixture']['id']
-        url_stats = f"{URL_FOOTBALL}/fixtures/statistics?fixture={fixture_id}"
-        stats = await fetch_async(session, url_stats, HEADERS_FB)
 
         a_xg = False
-        if stats and stats.get('response'):
-            for team_stat in stats['response']:
-                xg_raw = next(
-                    (s['value'] for s in team_stat['statistics'] if s['type'] == 'expected_goals'),
-                    None
-                )
-                try:
-                    if xg_raw not in (None, 'null', '', 'None') and float(xg_raw) >= 0:
-                        a_xg = True
-                        break
-                except (TypeError, ValueError):
-                    pass
+        fixture_ok = None
+        saison_ok = None
+        testes = 0
 
-        statut = "✅ xG disponibles" if a_xg else "❌ pas de xG"
-        log_info(f"  {ligue['nom']} (fixture {fixture_id}) → {statut}")
+        for label, fixtures, saison_fx in (
+            ("N", fixtures_n, saison),
+            ("N-1", fixtures_prev, saison - 1),
+        ):
+            if a_xg:
+                break
+            if not fixtures:
+                continue
+            for item in fixtures:
+                fx = item.get("fixture") or {}
+                fid = fx.get("id")
+                if not fid:
+                    continue
+                testes += 1
+                if await _fixture_a_expected_goals(session, int(fid)):
+                    a_xg = True
+                    fixture_ok = int(fid)
+                    saison_ok = saison_fx
+                    break
+            if a_xg:
+                break
+            log_info(
+                f"  {ligue['nom']} : {len(fixtures)} match(s) saison {saison_fx} "
+                f"sans expected_goals"
+                + (" → fallback N-1…" if label == "N" and fixtures_prev else "")
+            )
 
-        if not a_xg:
+        if a_xg:
+            log_info(
+                f"  {ligue['nom']} (fixture {fixture_ok}, saison {saison_ok}, "
+                f"{testes} testé(s)) → ✅ xG disponibles"
+            )
+        else:
+            log_info(
+                f"  {ligue['nom']} ({testes} match(s) testés, saisons "
+                f"{saison}/{saison - 1}) → ❌ pas de xG"
+            )
             nouvelles_sans_xg.add(ligue_id)
 
         async with db_lock:
             await db_conn.execute(
                 "INSERT OR REPLACE INTO xg_couverture_ligue VALUES (?, ?, ?)",
-                (ligue_id, int(a_xg), maintenant)
+                (ligue_id, int(a_xg), maintenant),
             )
             await db_conn.commit()
 
