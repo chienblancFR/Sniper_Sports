@@ -184,9 +184,15 @@ FOOT_XI_PROBABLE_ACTIF = _env_bool("FOOT_XI_PROBABLE_ACTIF", True)
 FOOT_XI_TOLERANCE = int(os.environ.get("FOOT_XI_TOLERANCE", "2"))  # absents XI type sans malus
 FOOT_XI_MALUS_PAR_ABSENT = float(os.environ.get("FOOT_XI_MALUS_PAR_ABSENT", "0.05"))
 FOOT_XI_MALUS_MAX = float(os.environ.get("FOOT_XI_MALUS_MAX", "0.25"))
+# Proxy rotation calendrier (fatigue / coupe UEFA juste après) → malus λ avant lineups H-1
+FOOT_XI_ROTATION_ACTIF = _env_bool("FOOT_XI_ROTATION_ACTIF", True)
+FOOT_XI_CUP_APRES_MALUS = float(os.environ.get("FOOT_XI_CUP_APRES_MALUS", "0.10"))
+FOOT_XI_FATIGUE_MALUS = float(os.environ.get("FOOT_XI_FATIGUE_MALUS", "0.05"))
 _cache_xi_type: dict[tuple[int, int], list[str]] = {}
 _cache_injuries_ids: dict[tuple[int, int], set[str]] = {}
 _xi_probable_logue = False
+_xi_rotation_logue = False
+_FINISHED_FX = frozenset({"FT", "AET", "PEN", "AWD", "WO"})
 
 # Alerte monitoring API down (Telegram only — n'influence ni EV ni Kelly)
 FOOT_API_ALERT = _env_bool("FOOT_API_ALERT", True)
@@ -2058,49 +2064,67 @@ def _parse_kickoff_dt(raw) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-async def _calendrier_equipe_recent(session, team_id: int, kickoff_dt: datetime) -> list:
+async def _calendrier_equipe_fenetre(
+    session, team_id: int, kickoff_dt: datetime
+) -> tuple[list, list]:
     """
-    Fixtures FT de l'équipe (toutes compétitions) sur une fenêtre élargie.
+    Fixtures toutes compétitions : FT passés + matchs à venir (fenêtre UEFA).
     Cache mémoire par (team_id, jour UTC) pour limiter le quota API.
+    Retourne (past_rows, future_rows).
     """
     ko = _parse_kickoff_dt(kickoff_dt)
     if ko is None or not team_id:
-        return []
+        return [], []
     cache_key = (int(team_id), ko.strftime("%Y-%m-%d"))
     if cache_key in _cache_calendrier_equipe:
-        return _cache_calendrier_equipe[cache_key]
+        cached = _cache_calendrier_equipe[cache_key]
+        if isinstance(cached, tuple) and len(cached) == 2:
+            return cached
+        # Ancien format (liste past seule) — ignore, refetch
+        _cache_calendrier_equipe.pop(cache_key, None)
 
     fenetre = max(1.0, FOOT_FATIGUE_FENETRE_J)
     cup_j = max(0.0, FOOT_FATIGUE_CUP_HEURES) / 24.0
     lookback = max(fenetre, cup_j, FOOT_FATIGUE_MIN_REPOS_J) + 1.0
+    lookforward = cup_j + 1.0
     debut = (ko - timedelta(days=lookback)).strftime("%Y-%m-%d")
-    fin = ko.strftime("%Y-%m-%d")
+    fin = (ko + timedelta(days=lookforward)).strftime("%Y-%m-%d")
     url = (
         f"{URL_FOOTBALL}/fixtures?team={int(team_id)}"
-        f"&from={debut}&to={fin}&status=FT"
+        f"&from={debut}&to={fin}"
     )
     res = await fetch_async(session, url, HEADERS_FB)
-    rows = []
+    past: list = []
+    future: list = []
     for item in (res or {}).get("response") or []:
         fx = item.get("fixture") or {}
         lg = item.get("league") or {}
         dt = _parse_kickoff_dt(fx.get("date"))
-        if dt is None or dt >= ko:
+        if dt is None:
             continue
         try:
             lid = int(lg.get("id") or 0)
         except (TypeError, ValueError):
             lid = 0
-        rows.append({"date": dt, "ligue_id": lid, "fixture_id": fx.get("id")})
-    rows.sort(key=lambda r: r["date"])
-    _cache_calendrier_equipe[cache_key] = rows
-    return rows
+        short = str(((fx.get("status") or {}).get("short") or "")).upper()
+        row = {"date": dt, "ligue_id": lid, "fixture_id": fx.get("id"), "status": short}
+        if dt < ko and short in _FINISHED_FX:
+            past.append(row)
+        elif dt > ko and short not in _FINISHED_FX:
+            future.append(row)
+    past.sort(key=lambda r: r["date"])
+    future.sort(key=lambda r: r["date"])
+    _cache_calendrier_equipe[cache_key] = (past, future)
+    return past, future
 
 
 def _raisons_fatigue_equipe(
-    past_rows: list, kickoff_dt: datetime, ligue_domestique_id: int | None
+    past_rows: list,
+    future_rows: list,
+    kickoff_dt: datetime,
+    ligue_domestique_id: int | None,
 ) -> list[str]:
-    """Règles congestion / repos / coupe — listes de raisons (vide = OK)."""
+    """Règles congestion / repos / coupe avant & après — listes de raisons (vide = OK)."""
     raisons: list[str] = []
     ko = _parse_kickoff_dt(kickoff_dt)
     if ko is None:
@@ -2132,7 +2156,60 @@ def _raisons_fatigue_equipe(
                 raisons.append(f"coupe UEFA il y a {heures:.0f}h")
                 break
 
+        cup_to = ko + timedelta(hours=FOOT_FATIGUE_CUP_HEURES)
+        for r in future_rows:
+            if r["date"] > cup_to:
+                break
+            lid = r["ligue_id"]
+            if lid in _UEFA_LIGUE_IDS and lid != ligue_domestique_id:
+                heures = (r["date"] - ko).total_seconds() / 3600.0
+                raisons.append(f"coupe UEFA dans {heures:.0f}h")
+                break
+
     return raisons
+
+
+async def evaluer_force_rotation_calendrier(
+    session, team_id: int, kickoff_dt, ligue_id: int, default_power: float = 1.0
+) -> tuple[float, str]:
+    """
+    Proxy composition avant lineups officielles :
+    malus λ si fatigue (congestion/repos/coupe récente) ou coupe UEFA juste après.
+    Live only — BT sans fixtures UEFA.
+    """
+    global _xi_rotation_logue
+    if not FOOT_XI_ROTATION_ACTIF:
+        return default_power, ""
+
+    if not _xi_rotation_logue:
+        _xi_rotation_logue = True
+        log_info(
+            f"🔄 Rotation calendrier → λ : coupe après −{FOOT_XI_CUP_APRES_MALUS:.0%}, "
+            f"fatigue −{FOOT_XI_FATIGUE_MALUS:.0%} "
+            f"(fenêtre UEFA {FOOT_FATIGUE_CUP_HEURES:.0f}h) — live only"
+        )
+
+    past, future = await _calendrier_equipe_fenetre(session, team_id, kickoff_dt)
+    raisons = _raisons_fatigue_equipe(past, future, kickoff_dt, ligue_id)
+    if not raisons:
+        return default_power, ""
+
+    malus = 0.0
+    tags: list[str] = []
+    for r in raisons:
+        if r.startswith("coupe UEFA dans"):
+            malus = max(malus, FOOT_XI_CUP_APRES_MALUS)
+            tags.append(r)
+        elif r.startswith("coupe UEFA il y a") or r.startswith("congestion") or r.startswith("repos"):
+            malus = max(malus, FOOT_XI_FATIGUE_MALUS)
+            tags.append(r)
+
+    if malus <= 0:
+        return default_power, ""
+
+    malus = min(malus, FOOT_XI_MALUS_MAX)
+    force = default_power * (1.0 - malus)
+    return force, f"{', '.join(tags)} (−{malus:.0%})"
 
 
 async def match_en_fatigue_ah(
@@ -2141,6 +2218,7 @@ async def match_en_fatigue_ah(
     """
     True si l'AH doit être skippé (fatigue). Totaux non concernés.
     Mode either : home OU away fatigué → skip.
+    Inclut coupe UEFA récente ET à venir (rotation).
     """
     if not FOOT_FATIGUE_AH_ACTIF:
         return False, ""
@@ -2154,8 +2232,8 @@ async def match_en_fatigue_ah(
 
     details = []
     for label, tid in checks:
-        rows = await _calendrier_equipe_recent(session, tid, kickoff_dt)
-        raisons = _raisons_fatigue_equipe(rows, kickoff_dt, ligue_id)
+        past, future = await _calendrier_equipe_fenetre(session, tid, kickoff_dt)
+        raisons = _raisons_fatigue_equipe(past, future, kickoff_dt, ligue_id)
         if raisons:
             details.append(f"{label}: {', '.join(raisons)}")
 
@@ -2548,12 +2626,34 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
         force_blessure_d = await evaluer_impact_blessures(session, id_m, id_d)
         force_blessure_e = await evaluer_impact_blessures(session, id_m, id_e)
 
-    # Réutiliser la matrice préliminaire si aucune absence ne modifie les λ
-    if force_blessure_d == 1.0 and force_blessure_e == 1.0:
+    # 2b. Proxy rotation calendrier (fatigue / coupe UEFA juste après) → malus λ
+    #     tant que la compo officielle n'est pas encore appliquée (H-1).
+    note_rot = ""
+    force_rot_d = force_rot_e = 1.0
+    if FOOT_XI_ROTATION_ACTIF:
+        force_rot_d, det_rot_d = await evaluer_force_rotation_calendrier(
+            session, id_d, dt_obj, ligue["id"]
+        )
+        force_rot_e, det_rot_e = await evaluer_force_rotation_calendrier(
+            session, id_e, dt_obj, ligue["id"]
+        )
+        if det_rot_d or det_rot_e:
+            parts = []
+            if det_rot_d:
+                parts.append(f"Dom {det_rot_d}")
+            if det_rot_e:
+                parts.append(f"Ext {det_rot_e}")
+            note_rot = " | ".join(parts)
+            log_info(f"🔄 Rotation λ {n_d}-{n_e} : {note_rot}")
+
+    # Réutiliser la matrice préliminaire si aucune absence / rotation ne modifie les λ
+    mult_d = force_blessure_d * force_rot_d
+    mult_e = force_blessure_e * force_rot_e
+    if mult_d == 1.0 and mult_e == 1.0:
         mat = mat_preliminaire
     else:
-        L_A = L_A_base * force_blessure_d
-        L_B = L_B_base * force_blessure_e
+        L_A = L_A_base * mult_d
+        L_B = L_B_base * mult_e
         mat = generer_matrice_dixon(max(0.4, L_A), max(0.4, L_B), ligue['id'], saison_correcte)
 
     # 3. BOUCLIER H-1 : Impact de la Composition Officielle
@@ -2564,14 +2664,19 @@ async def analyser_un_match(session, m, ligue, saison_correcte, sos_map, sos_att
         force_lineup_e = await evaluer_force_lineup(session, id_m, id_e, saison_correcte)
 
         if force_lineup_d <= 0.90 or force_lineup_e <= 0.90:
+            # Compo officielle = vérité : plus de proxy rotation calendrier
             L_A_drop = L_A_base * force_blessure_d * force_lineup_d
             L_B_drop = L_B_base * force_blessure_e * force_lineup_e
             mat_lineup_drop = generer_matrice_dixon(max(0.4, L_A_drop), max(0.4, L_B_drop), ligue['id'], saison_correcte)
             alerte_lineup_text = f"🔄 ROTATION MASSIVE DÉTECTÉE (Dom: {force_lineup_d:.2f}x | Ext: {force_lineup_e:.2f}x)"
-    if note_xi and not alerte_lineup_text:
-        alerte_lineup_text = f"👥 XI probable : {note_xi}"
-    elif note_xi and alerte_lineup_text:
-        alerte_lineup_text = f"{alerte_lineup_text}\n👥 XI probable : {note_xi}"
+    notes_compo = []
+    if note_xi:
+        notes_compo.append(f"👥 XI probable : {note_xi}")
+    if note_rot and mat_lineup_drop is None:
+        notes_compo.append(f"🔄 Rotation calendrier : {note_rot}")
+    if notes_compo:
+        extra = "\n".join(notes_compo)
+        alerte_lineup_text = f"{alerte_lineup_text}\n{extra}" if alerte_lineup_text else extra
 
     # Meilleur signal par type de marché (AH + totaux indépendants sur le même match)
     if mat_lineup_drop is not None:
@@ -3883,7 +3988,7 @@ async def main_loop():
         )
     if FOOT_FATIGUE_AH_ACTIF:
         cup_txt = (
-            f"coupe UEFA <{FOOT_FATIGUE_CUP_HEURES:.0f}h"
+            f"coupe UEFA ±{FOOT_FATIGUE_CUP_HEURES:.0f}h"
             if FOOT_FATIGUE_CUP_ACTIF else "sans filtre coupe"
         )
         repos_txt = (
@@ -3913,6 +4018,12 @@ async def main_loop():
             f"👥 XI probable H-24 : −{FOOT_XI_MALUS_PAR_ABSENT:.0%}/titulaire "
             f"XI type absent (tolérance {FOOT_XI_TOLERANCE}, cap {FOOT_XI_MALUS_MAX:.0%}) "
             f"— live only (BT N/A)"
+        )
+    if FOOT_XI_ROTATION_ACTIF:
+        log_info(
+            f"🔄 Rotation λ : coupe UEFA après −{FOOT_XI_CUP_APRES_MALUS:.0%}, "
+            f"fatigue −{FOOT_XI_FATIGUE_MALUS:.0%} "
+            f"(avant lineups H-1 ; live only)"
         )
 
     # Détection initiale de la couverture xG + collecte historique des scores
