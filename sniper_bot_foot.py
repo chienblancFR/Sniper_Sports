@@ -151,8 +151,8 @@ FOOT_CLV_ALERT_COOLDOWN_H = float(os.environ.get("FOOT_CLV_ALERT_COOLDOWN_H", "1
 _dernier_alerte_clv_moyenne: datetime | None = None
 
 # Fenêtre prise de paris — alignée backtest H-24 (bande autour du snapshot bt_odds_h24)
-FOOT_SCAN_HEURES_MAX = float(os.environ.get("FOOT_SCAN_HEURES_MAX", "30"))
-FOOT_SCAN_HEURES_MIN = float(os.environ.get("FOOT_SCAN_HEURES_MIN", "18"))
+FOOT_SCAN_HEURES_MAX = float(os.environ.get("FOOT_SCAN_HEURES_MAX", "26"))
+FOOT_SCAN_HEURES_MIN = float(os.environ.get("FOOT_SCAN_HEURES_MIN", "22"))
 
 # Calibration P(couverture) AH — foot_calibration_ah.json (--fit-calibration platt)
 FOOT_CALIB_AH = _env_bool("FOOT_CALIB_AH", False)

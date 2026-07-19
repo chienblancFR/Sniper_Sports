@@ -224,7 +224,7 @@ CHAMPIONNATS = [
 KELLY_FRAC = 0.05
 MIN_COTE = 1.70
 # Cotes backtest collectées à H-24 (table bt_odds_h24).
-# Live (sniper_bot_foot) : bande FOOT_SCAN_HEURES_MIN/MAX (défaut 18–30) autour de ce snapshot.
+# Live (sniper_bot_foot) : bande FOOT_SCAN_HEURES_MIN/MAX (défaut 22–26) autour de ce snapshot.
 H_ODDS_BACKTEST = 24.0
 
 
