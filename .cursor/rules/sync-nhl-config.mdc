@@ -1,0 +1,68 @@
+---
+description: Placer automatiquement chaque configurable NHL dans env/nhl.env (bloc thématique)
+alwaysApply: true
+---
+
+# Sync configurables NHL → env/
+
+Complète `sync-env-vars.mdc` : toute clé `NHL_*` lue dans le code NHL doit être **écrite immédiatement** dans les bons fichiers — jamais seulement documentée en fin de réponse.
+
+## Fichiers cibles (et uniquement ceux-là pour le NHL)
+
+| Fichier | Rôle |
+|---------|------|
+| `env/nhl.env` | Valeurs locales (gitignoré) — **toujours** mettre à jour si la clé est nouvelle |
+| `env/nhl.env.example` | Version versionnée, sans secrets — **même clé, même bloc, même défaut que le code** |
+| `env/common.env` + `env/common.env.example` | Uniquement secrets partagés (`API_ODDS_KEY`, `TELEGRAM_*`, `PA_FTP_*`, `DASHBOARD_PASSWORD`) |
+
+**Ne pas** ajouter de `NHL_*` dans `.env` racine, `identifiants_différent_api.env` ou `foot.env`.
+
+## Fichiers code déclencheurs
+
+Toute lecture `os.environ.get("NHL_…")` (ou constante dérivée) dans :
+
+- `nhl_sniper_omega.py`
+- `dashboard_nhl.py`
+- `backtest_nhl.py`
+
+→ sync env obligatoire dans la **même session de modification**.
+
+## Blocs thématiques (`env/nhl.env.example`)
+
+Placer chaque nouvelle clé dans le bloc correspondant (commentaire `# …` si nouveau sous-bloc) :
+
+| Préfixe / thème | Exemples |
+|-----------------|----------|
+| Ops & fenêtre live | `NHL_SEASON`, `NHL_SCAN_HEURES_AVANCE`, `NHL_MINUTES_AVANT_PUCK`, `NHL_DRY_RUN`, `NHL_OPS_*` |
+| Edge & mises | `NHL_EDGE_*`, `NHL_MISE_*`, `NHL_MARCHES_ACTIFS` |
+| Kelly dynamique | `NHL_KELLY_*` |
+| Line movement | `NHL_LINE_*` |
+| Modèle & blend | `NHL_BLEND_*`, `NHL_TEAM_RECENT_*`, `NHL_MARCHE_SHRINK_*`, `NHL_MODEL_TRUST_*` |
+| Calibrations | `NHL_RHO_*`, `NHL_OT_*`, `NHL_HIA_*`, `NHL_TRAVEL_*`, `NHL_FACEOFF_*`, `NHL_REF_*`, `NHL_PP_*`, `NHL_GSAX_*`, `NHL_PL_*`, `NHL_NB_OU_*`, `NHL_LIGUE_CALIB_*` |
+| PIT MoneyPuck | `NHL_PIT_*`, `NHL_MONEYPUCK_*`, `NHL_PIT_GBG_*` |
+| Backtest | `NHL_BT_*` (sous `# backtest_nhl.py`) |
+
+## Protocole
+
+1. Ajouter/modifier la lecture env dans le code Python.
+2. Ouvrir `env/nhl.env` **et** `env/nhl.env.example`.
+3. Si la clé n'existe pas : `CLE=valeur_defaut` — défaut **identique** à celui du `os.environ.get(..., "…")`.
+4. Commentaire court si le sens n'est pas évident (`# 0 = désactivé`, unité, etc.).
+5. **Ne jamais** écraser une valeur existante dans `env/nhl.env` (secrets / toggles user) sans demande explicite.
+6. Parité backtest : nouvelle clé `NHL_BT_*` dans `backtest_nhl.py` → bloc `# backtest_nhl.py` ; logique bot partagée → aussi `nhl_sniper_omega.py` si pertinent.
+
+## Exemple
+
+```python
+# backtest_nhl.py
+ODDS_PRISE_HEURES = float(os.environ.get("NHL_BT_ODDS_HEURES_AVANT", "3"))
+```
+
+```env
+# backtest_nhl.py
+NHL_BT_ODDS_HEURES_AVANT=3   # snapshot Pinnacle par match (h avant puck)
+```
+
+## Fin de modification
+
+Indiquer brièvement : `env/nhl.env` + `env/nhl.env.example` mis à jour (bloc concerné). Pas « à ajouter manuellement ».

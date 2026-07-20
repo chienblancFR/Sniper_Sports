@@ -1,0 +1,52 @@
+{
+  "rho": -0.12,
+  "hia": 0.05,
+  "prob_tie": 0.12,
+  "prob_en": 0.22,
+  "nb_ou_dispersion": 25.0,
+  "ot_home_adv": 0.52,
+  "ref_sensibilite": 0.2,
+  "faceoff_sensibilite": 0.25,
+  "pp_lam_share": 0.2,
+  "travel_b2b_atk_pct": 0.04,
+  "travel_b2b_def_pct": 0.06,
+  "travel_solo_atk_pct": 0.015,
+  "travel_solo_def_pct": 0.02,
+  "gsax_lam_mult": 1.0,
+  "pl_scale": 1.0,
+  "ou_mu_scale": 1.25,
+  "nb_matchs": 4198,
+  "pl_scale_calib_n": 4198,
+  "pl_scale_calib_saisons": [
+    2023,
+    2024,
+    2025
+  ],
+  "pl_scale_mse_default": 0.216384,
+  "pl_scale_mse_opt": 0.216187,
+  "date": "2026-07-20 22:05",
+  "pl_scale_brier_opt": 0.96,
+  "pl_scale_note": "brier_opt=0.96 sur PIT 2023-25 mais BT frozen ROI pire; opérationnel=1.0",
+  "nb_ou_dispersion_opt": 54.35,
+  "nb_ou_calib_n": 4198,
+  "nb_ou_calib_saisons": [
+    2023,
+    2024,
+    2025
+  ],
+  "nb_ou_nll_default": 10071.5773,
+  "nb_ou_nll_opt": 10059.6358,
+  "nb_ou_brier55_default": 0.281415,
+  "nb_ou_brier55_opt": 0.281656,
+  "nb_ou_note": "MLE PIT 2023-25 r_opt=54.4 mais BT frozen OU pire (CLV/ROI); opérationnel=25",
+  "ou_mu_scale_opt": 1.26,
+  "ou_mu_scale_calib_n": 4198,
+  "ou_mu_scale_calib_saisons": [
+    2023,
+    2024,
+    2025
+  ],
+  "ou_mu_scale_brier_default": 0.284983,
+  "ou_mu_scale_brier_opt": 0.251983,
+  "ou_mu_scale_note": "Grille elargie 0.90-1.50: opt PIT=1.26 (Brier 0.252) mais BT frozen 1.26 OU CLV/ROI/Brier legerement pires que 1.25; operationnel=1.25"
+}

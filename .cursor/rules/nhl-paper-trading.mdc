@@ -1,0 +1,17 @@
+---
+description: NHL saison paper trading uniquement — pas de vraies mises
+alwaysApply: true
+---
+
+# NHL — paper trading (saison en cours)
+
+L'utilisateur **ne mise pas d'argent réel** cette saison NHL : uniquement **paper trading** / dry-run.
+
+## Implications pour l'agent
+
+- Garder `NHL_DRY_RUN=true` sauf demande explicite contraire.
+- `NHL_TOUS_CANDIDATS_ACTIF=true` : prendre **tous** les edges valides par match (pas seulement le max-edge) pour maximiser les stats paper ; journal écrit même en dry-run.
+- Prioriser l'observation (CLV, logs, volume par bande d'edge) plutôt que la protection bankroll agressive.
+- Ne pas pousser à passer en live argent (`NHL_DRY_RUN=false`) sans demande claire.
+- Les bandes d'edge (`NHL_EDGE_BANDS_*`) peuvent rester **off** pour collecter du signal sur tous les edges ; les réactiver seulement si demandé.
+- Continuer l'attente gardiens confirmés (`NHL_ATTENDRE_GARDIENS_CONFIRMES=true`) — cohérence modèle, même en paper.

@@ -9,11 +9,12 @@ import logging
 import ftplib
 import json
 from datetime import datetime, timedelta, timezone
-from io import StringIO
+from io import BytesIO, StringIO, TextIOWrapper
 import traceback
+import zipfile
 from scipy.optimize import minimize
 from scipy.stats import nbinom
-from config_env import env_files_hint, load_project_env
+from config_env import env_files_hint, ensure_sport_env_key, load_project_env
 
 load_project_env("nhl")
 
@@ -54,11 +55,41 @@ FICHIER_JOURNAL = (
 BANKROLL_INITIALE = float(os.environ.get("NHL_BANKROLL", "1000.0"))
 NHL_SEASON = int(os.environ.get("NHL_SEASON", "2027"))
 EDGE_MINIMUM = float(os.environ.get("NHL_EDGE_MIN", "0.02"))
-# Edge min plus élevé tant que les gardiens ne sont pas confirmés (sinon on attend)
+# Edge min plus élevé si on autorise encore les paris sur gardiens « probables »
 NHL_EDGE_MIN_PROBABLE = float(os.environ.get("NHL_EDGE_MIN_PROBABLE", "0.04"))
+# true = aucun pari tant que les partants ne sont pas confirmés (comme lineups MLB)
+NHL_ATTENDRE_GARDIENS_CONFIRMES = _env_bool("NHL_ATTENDRE_GARDIENS_CONFIRMES", True)
 NHL_EDGE_DYNAMIQUE_ACTIF = _env_bool("NHL_EDGE_DYNAMIQUE_ACTIF", True)
 NHL_EDGE_DYNAMIQUE_EXTRA = float(os.environ.get("NHL_EDGE_DYNAMIQUE_EXTRA", "0.02"))
 NHL_EDGE_DYNAMIQUE_GP_PLEIN = float(os.environ.get("NHL_EDGE_DYNAMIQUE_GP_PLEIN", "20"))
+NHL_EDGE_BANDS_ACTIF = _env_bool("NHL_EDGE_BANDS_ACTIF", True)
+
+
+def _parser_edge_bands(raw):
+    """Parse '3-5,8-12' → [(3.0, 5.0), (8.0, 12.0)] (bornes en % d'edge, hi exclusif)."""
+    bandes = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        lo_s, hi_s = part.split("-", 1)
+        try:
+            lo, hi = float(lo_s.strip()), float(hi_s.strip())
+        except ValueError:
+            continue
+        if hi > lo:
+            bandes.append((lo, hi))
+    return bandes
+
+
+NHL_EDGE_ML_BANDS = _parser_edge_bands(os.environ.get("NHL_EDGE_ML_BANDS", "3-5,8-12"))
+NHL_EDGE_PL_BANDS = _parser_edge_bands(os.environ.get("NHL_EDGE_PL_BANDS", "3-5,12-20"))
+# O2 : exclut 5-8 et 12-20 (pire buckets Under O0) ; vide = pas de filtre bande OU
+NHL_EDGE_OU_BANDS = _parser_edge_bands(os.environ.get("NHL_EDGE_OU_BANDS", "3-5,8-12,20-30"))
+# Edge min dédié OU (fraction, ex. 0.04 = 4%)
+NHL_EDGE_MIN_OU = float(os.environ.get("NHL_EDGE_MIN_OU", "0.04"))
+# Cap du poids modèle sur totaux (≤ trust global → plus de shrink marché O/U)
+NHL_OU_TRUST_CAP = float(os.environ.get("NHL_OU_TRUST_CAP", "0.50"))
 KELLY_FRACTION = float(os.environ.get("NHL_KELLY_FRACTION", "0.25"))
 KELLY_FRACTION_GARDIEN_INCERTAIN = float(os.environ.get("NHL_KELLY_GARDIEN", "0.125"))
 NHL_KELLY_DYNAMIQUE_ACTIF = _env_bool("NHL_KELLY_DYNAMIQUE_ACTIF", True)
@@ -82,6 +113,8 @@ NHL_LINE_STEAM_BLOCK_PCT = float(os.environ.get("NHL_LINE_STEAM_BLOCK_PCT", "0.0
 NHL_LINE_STEAM_EDGE_EXTRA = float(os.environ.get("NHL_LINE_STEAM_EDGE_EXTRA", "0.015"))
 NHL_MISE_MAX_PCT = float(os.environ.get("NHL_MISE_MAX_PCT", "2"))
 NHL_DRY_RUN = _env_bool("NHL_DRY_RUN", False)
+# Paper : tous les candidats edge (pas seulement le max-edge du match)
+NHL_TOUS_CANDIDATS_ACTIF = _env_bool("NHL_TOUS_CANDIDATS_ACTIF", False)
 NHL_ODDS_QUOTA_ALERT = int(os.environ.get("NHL_ODDS_QUOTA_ALERT", "100"))
 NHL_OPS_ALERTES_ACTIF = _env_bool("NHL_OPS_ALERTES_ACTIF", True)
 NHL_OPS_ALERTE_COOLDOWN_H = float(os.environ.get("NHL_OPS_ALERTE_COOLDOWN_H", "6"))
@@ -97,8 +130,8 @@ NHL_GSAX_SHRINK_MIN_GAMES = int(os.environ.get("NHL_GSAX_SHRINK_MIN_GAMES", "1")
 NHL_TEAM_RECENT_WINDOW = int(os.environ.get("NHL_TEAM_RECENT_WINDOW", "10"))
 NHL_TEAM_RECENT_GP_PLEIN = float(os.environ.get("NHL_TEAM_RECENT_GP_PLEIN", "10"))
 NHL_MARCHE_SHRINK_ACTIF = _env_bool("NHL_MARCHE_SHRINK_ACTIF", True)
-NHL_MODEL_TRUST_MIN = float(os.environ.get("NHL_MODEL_TRUST_MIN", "0.70"))
-NHL_MODEL_TRUST_MAX = float(os.environ.get("NHL_MODEL_TRUST_MAX", "0.90"))
+NHL_MODEL_TRUST_MIN = float(os.environ.get("NHL_MODEL_TRUST_MIN", "0.55"))
+NHL_MODEL_TRUST_MAX = float(os.environ.get("NHL_MODEL_TRUST_MAX", "0.80"))
 NHL_MODEL_TRUST_GP_PLEIN = float(os.environ.get("NHL_MODEL_TRUST_GP_PLEIN", "20"))
 NHL_RHO_MIN_MATCHS = int(os.environ.get("NHL_RHO_MIN_MATCHS", "30"))
 NHL_RHO_INTERVAL_MATCHS = int(os.environ.get("NHL_RHO_INTERVAL_MATCHS", "20"))
@@ -120,6 +153,9 @@ NHL_NB_OU_ACTIF = _env_bool("NHL_NB_OU_ACTIF", True)
 NHL_NB_OU_CALIB_ACTIF = _env_bool("NHL_NB_OU_CALIB_ACTIF", True)
 NHL_NB_OU_DISPERSION_DEFAULT = float(os.environ.get("NHL_NB_OU_DISPERSION_DEFAULT", "25"))
 NHL_NB_OU_MIN_MATCHS = int(os.environ.get("NHL_NB_OU_MIN_MATCHS", "100"))
+# Scale μ totaux avant NB O/U (corrige biais Under) — n'altère pas ML/PL
+NHL_OU_MU_SCALE_DEFAULT = float(os.environ.get("NHL_OU_MU_SCALE", "1.0"))
+NHL_OU_MU_SCALE_CALIB_MIN_MATCHS = int(os.environ.get("NHL_OU_MU_SCALE_CALIB_MIN_MATCHS", "80"))
 NHL_REF_SHRINK_ACTIF = _env_bool("NHL_REF_SHRINK_ACTIF", True)
 NHL_OT_HOME_ADVANTAGE = float(os.environ.get("NHL_OT_HOME_ADVANTAGE", "0.52"))
 NHL_OT_CALIB_ACTIF = _env_bool("NHL_OT_CALIB_ACTIF", True)
@@ -130,7 +166,7 @@ NHL_HIA_PAR_EQUIPE_ACTIF = _env_bool("NHL_HIA_PAR_EQUIPE_ACTIF", True)
 NHL_HIA_TEAM_GP_PLEIN = float(os.environ.get("NHL_HIA_TEAM_GP_PLEIN", "15"))
 NHL_HIA_TEAM_MIN_GAMES = int(os.environ.get("NHL_HIA_TEAM_MIN_GAMES", "3"))
 HIA_REF_CALIBRATION = 0.05  # HIA utilisé lors du calcul des lambdas historiques du journal
-NHL_MARCHES_ACTIFS = {m.strip().upper() for m in os.environ.get("NHL_MARCHES_ACTIFS", "ML,PL,OU").split(",") if m.strip()}
+NHL_MARCHES_ACTIFS = {m.strip().upper() for m in os.environ.get("NHL_MARCHES_ACTIFS", "ML,PL").split(",") if m.strip()}
 RHO_META_FILE = "rho_calibrage_meta.json"
 REFEREE_META_FILE = "referee_calibrage_meta.json"
 ODDS_HISTORY_FILE = "nhl_odds_history.json"
@@ -139,10 +175,22 @@ PIT_CACHE_FILE = "nhl_pit_moneypuck_cache.json"
 MONEYPUCK_GBG_ALL_TEAMS_URL = (
     "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/all_teams.csv"
 )
-MONEYPUCK_GBG_ALL_GOALIES_URL = (
-    "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/all_goalies.csv"
+MONEYPUCK_GBG_GOALIES_DIR_URL = (
+    "https://moneypuck.com/moneypuck/playerData/careers/gameByGame/regular/goalies/"
 )
 GOALIE_PIT_CACHE_FILE = "nhl_goalie_pit_moneypuck_cache.json"
+NHL_PIT_GBG_TEAMS_CSV = os.environ.get("NHL_PIT_GBG_TEAMS_CSV", "").strip()
+NHL_PIT_GBG_GOALIES_CSV = os.environ.get("NHL_PIT_GBG_GOALIES_CSV", "").strip()
+NHL_MONEYPUCK_DATA_DIR = os.environ.get("NHL_MONEYPUCK_DATA_DIR", "").strip()
+NHL_PIT_GBG_AUTO_DISCOVER = _env_bool("NHL_PIT_GBG_AUTO_DISCOVER", True)
+# Construit all_goalies.csv depuis les zips shots MoneyPuck (peter-tanner) si absent
+NHL_PIT_GBG_GOALIES_FROM_SHOTS = _env_bool("NHL_PIT_GBG_GOALIES_FROM_SHOTS", True)
+MONEYPUCK_SHOTS_ZIP_URL = (
+    "https://peter-tanner.com/moneypuck/downloads/shots_{year}.zip"
+)
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_pit_teams_csv_resolu = ""
+_pit_goalies_csv_resolu = ""
 HIA_TEAM_META_FILE = "hia_equipes_meta.json"
 # Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
 XG_FOR_COLONNES = (
@@ -305,8 +353,333 @@ def _trouver_cle_float(dictionnaire, cible):
     return None, None
 
 
+def _lire_csv_fichier_local(path):
+    """Lit un CSV MoneyPuck local (contourne HTTP 403 bot-protection)."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            texte = f.read()
+        return texte if texte.strip() else None
+    except Exception as e:
+        log_nhl(f"⚠️ Lecture CSV local {path} : {e}", level="warning")
+        return None
+
+
+def _candidats_pit_teams_csv():
+    """Emplacements standards pour all_teams.csv (auto-découverte locale)."""
+    home = os.path.expanduser("~")
+    noms = ("all_teams.csv", "moneypuck_all_teams.csv")
+    dossiers = [
+        os.path.join(_PROJECT_ROOT, "data", "moneypuck"),
+        _PROJECT_ROOT,
+        os.path.join(home, "Downloads"),
+        os.path.join(home, "Téléchargements"),
+        os.path.join(home, "Desktop"),
+        os.path.join(home, "Bureau"),
+    ]
+    candidats = []
+    for dossier in dossiers:
+        for nom in noms:
+            candidats.append(os.path.join(dossier, nom))
+    return candidats
+
+
+def _resoudre_pit_teams_csv():
+    """
+    Résout all_teams.csv : env explicite → auto-découverte → sync env/nhl.env.
+  """
+    global _pit_teams_csv_resolu, NHL_PIT_GBG_TEAMS_CSV
+
+    if _pit_teams_csv_resolu and os.path.isfile(_pit_teams_csv_resolu):
+        return _pit_teams_csv_resolu
+
+    configure = os.environ.get("NHL_PIT_GBG_TEAMS_CSV", NHL_PIT_GBG_TEAMS_CSV).strip()
+    if configure and os.path.isfile(configure):
+        _pit_teams_csv_resolu = os.path.abspath(configure)
+        NHL_PIT_GBG_TEAMS_CSV = _pit_teams_csv_resolu
+        return _pit_teams_csv_resolu
+
+    if NHL_PIT_GBG_AUTO_DISCOVER:
+        for chemin in _candidats_pit_teams_csv():
+            if not os.path.isfile(chemin):
+                continue
+            abs_path = os.path.abspath(chemin)
+            os.environ["NHL_PIT_GBG_TEAMS_CSV"] = abs_path
+            NHL_PIT_GBG_TEAMS_CSV = abs_path
+            _pit_teams_csv_resolu = abs_path
+            if ensure_sport_env_key("nhl", "NHL_PIT_GBG_TEAMS_CSV", abs_path):
+                log_nhl(
+                    f"ℹ️ MoneyPuck PIT — auto-config env/nhl.env : NHL_PIT_GBG_TEAMS_CSV={abs_path}",
+                )
+            else:
+                log_nhl(f"ℹ️ MoneyPuck PIT — fichier détecté : {abs_path}")
+            return abs_path
+
+    return ""
+
+
+def _candidats_pit_goalies_csv():
+    """Emplacements standards pour all_goalies.csv (auto-découverte locale)."""
+    home = os.path.expanduser("~")
+    noms = ("all_goalies.csv", "moneypuck_all_goalies.csv")
+    dossiers = [
+        os.path.join(_PROJECT_ROOT, "data", "moneypuck"),
+        _PROJECT_ROOT,
+        os.path.join(home, "Downloads"),
+        os.path.join(home, "Téléchargements"),
+        os.path.join(home, "Desktop"),
+        os.path.join(home, "Bureau"),
+    ]
+    candidats = []
+    for dossier in dossiers:
+        for nom in noms:
+            candidats.append(os.path.join(dossier, nom))
+    return candidats
+
+
+def _resoudre_pit_goalies_csv():
+    """Résout all_goalies.csv : env → auto-découverte → sync env/nhl.env."""
+    global _pit_goalies_csv_resolu, NHL_PIT_GBG_GOALIES_CSV
+
+    if _pit_goalies_csv_resolu and os.path.isfile(_pit_goalies_csv_resolu):
+        return _pit_goalies_csv_resolu
+
+    configure = os.environ.get("NHL_PIT_GBG_GOALIES_CSV", NHL_PIT_GBG_GOALIES_CSV).strip()
+    if configure and os.path.isfile(configure):
+        _pit_goalies_csv_resolu = os.path.abspath(configure)
+        NHL_PIT_GBG_GOALIES_CSV = _pit_goalies_csv_resolu
+        return _pit_goalies_csv_resolu
+
+    if NHL_PIT_GBG_AUTO_DISCOVER:
+        for chemin in _candidats_pit_goalies_csv():
+            if not os.path.isfile(chemin):
+                continue
+            abs_path = os.path.abspath(chemin)
+            os.environ["NHL_PIT_GBG_GOALIES_CSV"] = abs_path
+            NHL_PIT_GBG_GOALIES_CSV = abs_path
+            _pit_goalies_csv_resolu = abs_path
+            if ensure_sport_env_key("nhl", "NHL_PIT_GBG_GOALIES_CSV", abs_path):
+                log_nhl(
+                    f"ℹ️ MoneyPuck PIT gardiens — auto-config env/nhl.env : "
+                    f"NHL_PIT_GBG_GOALIES_CSV={abs_path}"
+                )
+            else:
+                log_nhl(f"ℹ️ MoneyPuck PIT gardiens — fichier détecté : {abs_path}")
+            return abs_path
+
+    return ""
+
+
+def _dates_gameid_depuis_teams_csv():
+    """gameId NHL → date ISO via all_teams.csv local."""
+    path = _resoudre_pit_teams_csv()
+    texte = _lire_csv_fichier_local(path) if path else None
+    if not texte:
+        return {}
+    out = {}
+    for row in csv.DictReader(StringIO(texte)):
+        gid = str(row.get("gameId") or row.get("game_id") or "").strip()
+        if not gid:
+            continue
+        date_str = _normaliser_date_iso(
+            row.get("gameDate") or row.get("game_date") or row.get("date")
+        )
+        if date_str:
+            out[gid] = date_str
+    return out
+
+
+def _mp_shots_game_id_vers_nhl(season_label, mp_game_id, is_playoff=False):
+    """
+    MoneyPuck shots game_id (ex. 20001) → NHL (ex. 2024020001).
+    season_label = colonne season du CSV shots (2024 → saison 2024-25).
+    """
+    try:
+        n = int(float(mp_game_id))
+        y = int(float(season_label))
+    except (TypeError, ValueError):
+        return None
+    if n < 20000:
+        return None
+    num = n - 20000
+    game_type = "03" if is_playoff else "02"
+    return f"{y}{game_type}{num:04d}"
+
+
+def construire_all_goalies_csv_depuis_shots(annees_shots=None, out_path=None, force=False):
+    """
+    Agrège les zips shots MoneyPuck (peter-tanner) → all_goalies.csv compatible PIT.
+    Pas d'all_goalies natif chez MoneyPuck ; les shots restent téléchargeables.
+    """
+    global NHL_PIT_GBG_GOALIES_CSV, _pit_goalies_csv_resolu
+    if annees_shots is None:
+        # BT saisons 2023-2026 → shots 2022-2025 (+1 an pour prior PIT)
+        annees_shots = [2022, 2023, 2024, 2025]
+    if out_path is None:
+        out_path = os.path.join(_PROJECT_ROOT, "data", "moneypuck", "all_goalies.csv")
+    if os.path.isfile(out_path) and not force:
+        return out_path
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    dates_par_gid = _dates_gameid_depuis_teams_csv()
+    db_path = os.environ.get("NHL_BT_DB", os.path.join(_PROJECT_ROOT, "backtest_nhl.db"))
+    if os.path.isfile(db_path):
+        try:
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            for gid, date_utc in conn.execute(
+                "SELECT game_id, date_utc FROM nhl_games WHERE date_utc IS NOT NULL"
+            ):
+                iso = _normaliser_date_iso(str(date_utc)[:10])
+                if iso:
+                    dates_par_gid[str(gid)] = iso
+            conn.close()
+        except Exception as e:
+            log_nhl(f"⚠️ Dates nhl_games pour gardiens : {e}", level="warning")
+    # (season_bt, game_id, name) → agg
+    agg = {}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    for year in annees_shots:
+        url = MONEYPUCK_SHOTS_ZIP_URL.format(year=year)
+        log_nhl(f"⬇️ MoneyPuck shots {year} — téléchargement pour GSAx PIT…")
+        try:
+            resp = requests.get(url, headers=headers, timeout=180)
+        except Exception as e:
+            log_nhl(f"⚠️ Shots {year} : {e}", level="warning")
+            continue
+        if resp.status_code != 200:
+            log_nhl(f"⚠️ Shots {year} : HTTP {resp.status_code}", level="warning")
+            continue
+        try:
+            zf = zipfile.ZipFile(BytesIO(resp.content))
+        except Exception as e:
+            log_nhl(f"⚠️ Shots {year} zip invalide : {e}", level="warning")
+            continue
+        csv_name = next((n for n in zf.namelist() if n.endswith(".csv")), None)
+        if not csv_name:
+            continue
+        with zf.open(csv_name) as raw:
+            reader = csv.DictReader(TextIOWrapper(raw, encoding="utf-8"))
+            for row in reader:
+                if str(row.get("shotOnEmptyNet", "0")).strip() in ("1", "1.0", "True", "true"):
+                    continue
+                name = (row.get("goalieNameForShot") or "").strip()
+                if not name:
+                    continue
+                try:
+                    xg = float(row.get("xGoal") or 0)
+                    goal = float(row.get("goal") or 0)
+                except (TypeError, ValueError):
+                    continue
+                season_label = row.get("season") or str(year)
+                is_po = str(row.get("isPlayoffGame") or row.get("playoffGame") or "0").strip() in (
+                    "1", "1.0", "True", "true",
+                )
+                nhl_gid = _mp_shots_game_id_vers_nhl(season_label, row.get("game_id"), is_po)
+                if not nhl_gid:
+                    continue
+                home = (row.get("homeTeamCode") or "").strip()
+                away = (row.get("awayTeamCode") or row.get("roadTeamCode") or "").strip()
+                shooter_team = (row.get("teamCode") or row.get("team") or "").strip()
+                if shooter_team and home and away:
+                    team = away if shooter_team == home else home
+                else:
+                    try:
+                        is_home_shooter = float(row.get("isHomeTeam") or 0) >= 0.5
+                    except (TypeError, ValueError):
+                        is_home_shooter = False
+                    team = away if is_home_shooter else home
+                if not team:
+                    continue
+                # MoneyPuck BT season = label shots + 1 (2024 → saison 2024-25 = 2025)
+                try:
+                    season_bt = int(float(season_label)) + 1
+                except (TypeError, ValueError):
+                    season_bt = year + 1
+                cle = (season_bt, nhl_gid, name)
+                bucket = agg.setdefault(cle, {
+                    "season": season_bt,
+                    "gameId": nhl_gid,
+                    "name": name,
+                    "team": team,
+                    "xGoals": 0.0,
+                    "goals": 0.0,
+                    "shots": 0,
+                    "situation": "all",
+                })
+                bucket["xGoals"] += xg
+                bucket["goals"] += goal
+                bucket["shots"] += 1
+                if not bucket.get("gameDate"):
+                    bucket["gameDate"] = dates_par_gid.get(nhl_gid, "")
+
+        log_nhl(f"✅ Shots {year} agrégés — {len(agg)} lignes gardien-match cumulées")
+
+    # Icetime proxy : part des tirs de l'équipe × 3600 s (min 600)
+    shots_par_game_team = {}
+    for (season_bt, gid, _name), b in agg.items():
+        key = (season_bt, gid, b["team"])
+        shots_par_game_team[key] = shots_par_game_team.get(key, 0) + b["shots"]
+
+    rows_out = []
+    for (season_bt, gid, name), b in agg.items():
+        team_shots = shots_par_game_team.get((season_bt, gid, b["team"]), b["shots"])
+        share = b["shots"] / max(team_shots, 1)
+        icetime = max(600, min(3600, int(round(3600 * share))))
+        date_str = b.get("gameDate") or dates_par_gid.get(gid, "")
+        if not date_str:
+            # date proxy depuis game_id NHL (YYYYMM… non fiable) — skip sans date
+            continue
+        rows_out.append({
+            "season": season_bt,
+            "gameId": gid,
+            "gameDate": date_str.replace("-", ""),
+            "name": name,
+            "team": b["team"],
+            "situation": "all",
+            "icetime": icetime,
+            "xGoals": round(b["xGoals"], 4),
+            "goals": int(round(b["goals"])),
+        })
+
+    if not rows_out:
+        log_nhl("⚠️ Aucune ligne gardien construite depuis les shots", level="warning")
+        return None
+
+    fieldnames = [
+        "season", "gameId", "gameDate", "name", "team",
+        "situation", "icetime", "xGoals", "goals",
+    ]
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(sorted(rows_out, key=lambda r: (r["season"], r["gameDate"], r["gameId"], r["name"])))
+
+    abs_path = os.path.abspath(out_path)
+    os.environ["NHL_PIT_GBG_GOALIES_CSV"] = abs_path
+    NHL_PIT_GBG_GOALIES_CSV = abs_path
+    _pit_goalies_csv_resolu = abs_path
+    ensure_sport_env_key("nhl", "NHL_PIT_GBG_GOALIES_CSV", abs_path)
+    log_nhl(f"🥅 all_goalies.csv écrit — {len(rows_out)} lignes → {abs_path}")
+    return abs_path
+
+
 def _fetch_moneypuck_csv(kind, season):
     """Télécharge un CSV MoneyPuck seasonSummary (saison N, puis N-1 si échec)."""
+    if NHL_MONEYPUCK_DATA_DIR:
+        for s in (season, season - 1):
+            path = os.path.join(
+                NHL_MONEYPUCK_DATA_DIR,
+                "seasonSummary",
+                str(s),
+                "regular",
+                f"{kind}.csv",
+            )
+            texte = _lire_csv_fichier_local(path)
+            if texte:
+                return texte, s
     headers = {"User-Agent": "Mozilla/5.0"}
     for s in (season, season - 1):
         url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{s}/regular/{kind}.csv"
@@ -476,7 +849,7 @@ def _normaliser_date_iso(date_brut):
     if not date_brut:
         return None
     texte = str(date_brut).strip()[:10]
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y"):
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%Y%m%d"):
         try:
             return datetime.strptime(texte, fmt).strftime("%Y-%m-%d")
         except ValueError:
@@ -486,6 +859,9 @@ def _normaliser_date_iso(date_brut):
 
 def _fetch_moneypuck_gbg_all_teams():
     """Télécharge le CSV game-by-game agrégé équipes (toutes saisons)."""
+    texte = _lire_csv_fichier_local(_resoudre_pit_teams_csv())
+    if texte:
+        return texte
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(MONEYPUCK_GBG_ALL_TEAMS_URL, headers=headers, timeout=60)
@@ -718,23 +1094,32 @@ def _invalider_pit_index_memo():
 
 
 def _fetch_moneypuck_gbg_all_goalies():
-    """Télécharge le CSV game-by-game agrégé gardiens (toutes saisons)."""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(MONEYPUCK_GBG_ALL_GOALIES_URL, headers=headers, timeout=90)
-        if response.status_code == 200 and response.text.strip():
-            return response.text
-        log_nhl(
-            f"⚠️ MoneyPuck goalies game-by-game : HTTP {response.status_code}",
-            level="warning",
-        )
-    except Exception as e:
-        log_nhl(f"⚠️ MoneyPuck goalies game-by-game : {e}", level="warning")
+    """
+    CSV game-by-game gardiens agrégé (local).
+    Auto-découverte → sinon construction depuis zips shots peter-tanner.
+    """
+    path = _resoudre_pit_goalies_csv()
+    texte = _lire_csv_fichier_local(path) if path else None
+    if texte:
+        return texte
+
+    if NHL_PIT_GBG_GOALIES_FROM_SHOTS:
+        built = construire_all_goalies_csv_depuis_shots()
+        if built:
+            texte = _lire_csv_fichier_local(built)
+            if texte:
+                return texte
+
+    log_nhl(
+        "ℹ️ GSAx PIT gardiens indisponible — placez all_goalies.csv dans data/moneypuck/ "
+        "ou activez NHL_PIT_GBG_GOALIES_FROM_SHOTS (zips shots MoneyPuck).",
+        level="warning",
+    )
     return None
 
 
 def _parser_gbg_goalies(texte, seasons):
-    """Parse all_goalies.csv → une ligne par (saison, gameId, gardien)."""
+    """Parse un CSV agrégé local → une ligne par (saison, gameId, gardien)."""
     csv_reader = csv.DictReader(StringIO(texte))
     matchs = {}
     seasons_set = {int(s) for s in seasons}
@@ -827,14 +1212,21 @@ def _ecrire_goalie_pit_cache_meta(meta):
 
 
 def _build_goalie_by_game_lookup(matchs, goalie_index):
-    """game_id → {team_abbrev: {name, gsax_per_60}} pour les partants MoneyPuck."""
+    """game_id → {team_abbrev: {name, gsax_per_60}} — partant = max icetime."""
     by_game = {}
+    best_ice = {}
     for m in matchs:
         team = m.get("team")
         if not team:
             continue
+        gid = str(m["game_id"])
+        ice = float(m.get("icetime") or 0)
+        prev = best_ice.get((gid, team), -1.0)
+        if ice < prev:
+            continue
+        best_ice[(gid, team)] = ice
         gsax = _gsax_gardien_avant_match(goalie_index, m["name"], m["date"], m["game_id"])
-        by_game.setdefault(m["game_id"], {})[team] = {
+        by_game.setdefault(gid, {})[team] = {
             "name": m["name"],
             "gsax_per_60": gsax,
         }
@@ -1369,35 +1761,63 @@ def get_rosters_avec_fallback(game_id):
 
 def get_goalie_confirmation_status(game_id):
     """
-    Explore le Landing Page du match pour détecter si les gardiens
-    sont validés ou simplement pressentis.
-    Retourner un dictionnaire avec le statut de confirmation.
+    Landing NHL : gardiens CONFIRMED vs seulement pressentis.
+    Retourne {away_confirmed, home_team_confirmed}.
     """
     url = f"https://api-web.nhle.com/v1/gamecenter/{game_id}/landing"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {"User-Agent": "Mozilla/5.0"}
     status = {"away_confirmed": False, "home_team_confirmed": False}
+
+    def _entry_confirmee(entry):
+        if not entry or not isinstance(entry, dict):
+            return False
+        st = str(entry.get("status") or entry.get("confirmationState") or "").upper()
+        if st in ("CONFIRMED", "CONFIRMÉ", "CONFIRME"):
+            return True
+        if entry.get("isConfirmed") is True or entry.get("confirmed") is True:
+            return True
+        if entry.get("starterConfirmation") is True:
+            return True
+        return False
 
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200: return status
+        if response.status_code != 200:
+            return status
         data = response.json()
 
-        # On fouille l'aperçu du match (Match Preview / Summary)
-        game_info = data.get("gameInfo", {})
+        away_list = data.get("awayTeam", {}).get("probableGoalies", []) or []
+        home_list = data.get("homeTeam", {}).get("probableGoalies", []) or []
 
-        # L'API NHL utilise le drapeau 'isStarter' ou place le gardien dans
-        # la section 'confirmedStarters' lorsqu'un journaliste officiel valide l'info.
-        away_goalis_list = data.get("awayTeam", {}).get("probableGoalies", [])
-        home_goalis_list = data.get("homeTeam", {}).get("probableGoalies", [])
+        # confirmedStarters si présent
+        confirmed = data.get("confirmedStarters") or data.get("gameInfo", {}).get("confirmedStarters")
+        if isinstance(confirmed, dict):
+            if confirmed.get("awayTeam") or confirmed.get("away"):
+                status["away_confirmed"] = True
+            if confirmed.get("homeTeam") or confirmed.get("home"):
+                status["home_team_confirmed"] = True
 
-        if away_goalis_list and away_goalis_list[0].get("status") == "CONFIRMED":
+        if away_list and _entry_confirmee(away_list[0]):
             status["away_confirmed"] = True
-        if home_goalis_list and home_goalis_list[0].get("status") == "CONFIRMED":
+        if home_list and _entry_confirmee(home_list[0]):
             status["home_team_confirmed"] = True
 
         return status
-    except:
+    except Exception:
         return status
+
+
+def gardiens_sont_confirmes(game_id, source_roster=None):
+    """
+    True si les deux partants sont fiables pour parier.
+    - boxscore publié (alignements NHL) → confirmé
+    - sinon landing avec status CONFIRMED des deux côtés
+    """
+    if source_roster == "boxscore":
+        return True
+    statut = get_goalie_confirmation_status(game_id)
+    return bool(statut.get("away_confirmed") and statut.get("home_team_confirmed"))
+
 
 def get_teams_played_yesterday():
     """Récupère la liste des abréviations des équipes qui ont joué hier."""
@@ -1948,6 +2368,51 @@ def lire_nb_ou_dispersion():
     if not NHL_NB_OU_ACTIF:
         return NHL_NB_OU_DISPERSION_DEFAULT
     return float(lire_rho_meta().get("nb_ou_dispersion", NHL_NB_OU_DISPERSION_DEFAULT))
+
+
+def lire_ou_mu_scale():
+    """Facteur d'échelle sur μ totaux (NB O/U uniquement)."""
+    return float(lire_rho_meta().get("ou_mu_scale", NHL_OU_MU_SCALE_DEFAULT))
+
+
+def _brier_ou_mu_scale(scale, historique_matchs, r_disp=None, cuts=(5.5, 6.5)):
+    """Brier moyen Over @ cuts avec μ = scale * (λ_h + λ_a)."""
+    r_disp = float(r_disp if r_disp is not None else lire_nb_ou_dispersion())
+    sse, n = 0.0, 0
+    for match in historique_matchs:
+        try:
+            lam_h = float(match["lambda_domicile_calcule"])
+            lam_a = float(match["lambda_exterieur_calcule"])
+            total = int(match["vrai_score_domicile"]) + int(match["vrai_score_exterieur"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        mu = max(float(scale) * (lam_h + lam_a), 0.1)
+        po, _ = _prob_over_under_nb(mu, r_disp, list(cuts))
+        w = _poids_recency_mle(match)
+        for cut in cuts:
+            pred = float(po.get(cut, 0.5))
+            outcome = 1.0 if total > cut else 0.0
+            sse += w * (pred - outcome) ** 2
+            n += 1
+    return sse / max(n, 1)
+
+
+def calibrer_ou_mu_scale(historique_matchs, r_disp=None):
+    """Grille Brier sur facteur d'échelle μ totaux (O/U)."""
+    r_disp = float(r_disp if r_disp is not None else lire_nb_ou_dispersion())
+    # 0.90–1.50 : plafond 1.25 tapé en M1 (μ trop bas)
+    candidats = [i / 100.0 for i in range(90, 151)]
+    meilleur, meilleur_mse = NHL_OU_MU_SCALE_DEFAULT, float("inf")
+    for scale in candidats:
+        mse = _brier_ou_mu_scale(scale, historique_matchs, r_disp=r_disp)
+        if mse < meilleur_mse:
+            meilleur_mse, meilleur = mse, scale
+    opt = round(meilleur, 3)
+    log_nhl(
+        f"✅ Calibrage OU μ scale — {opt:.2f} (défaut {NHL_OU_MU_SCALE_DEFAULT:.2f}, "
+        f"Brier Over 5.5/6.5 {meilleur_mse:.4f})"
+    )
+    return opt
 
 
 def calibrer_ot_home_advantage(historique_matchs):
@@ -2679,6 +3144,7 @@ def calculate_master_odds_v4(
         mu_total = sum(
             (h + a) * matrice_finale[h][a] for h in range(12) for a in range(12)
         )
+        mu_total = max(mu_total * lire_ou_mu_scale(), 0.1)
         prob_over_cuts, prob_under_cuts = _prob_over_under_nb(
             mu_total, lire_nb_ou_dispersion(), cuts_cibles,
         )
@@ -2766,6 +3232,42 @@ def _edge_minimum_dynamique(gp_moyen, gardiens_confirmes=True):
         return base
     immaturite = 1.0 - min(1.0, max(float(gp_moyen or 0), 0.0) / NHL_EDGE_DYNAMIQUE_GP_PLEIN)
     return round(base + immaturite * NHL_EDGE_DYNAMIQUE_EXTRA, 4)
+
+
+def _bandes_edge_marche(marche):
+    """Bandes autorisées (%) pour un marché, ou [] si pas de filtre bande."""
+    marche = (marche or "").upper()
+    # OU : bandes si configurées — indépendant de NHL_EDGE_BANDS_ACTIF (paper ML/PL sans bandes)
+    if marche == "OU":
+        return NHL_EDGE_OU_BANDS
+    if not NHL_EDGE_BANDS_ACTIF:
+        return []
+    if marche == "ML":
+        return NHL_EDGE_ML_BANDS
+    if marche == "PL":
+        return NHL_EDGE_PL_BANDS
+    return []
+
+
+def _edge_dans_bandes(marche, edge_pct):
+    """
+    True si l'edge (%) est dans une bande autorisée du marché.
+    Sans bandes configurées pour ce marché → pas de filtre additionnel.
+    """
+    bandes = _bandes_edge_marche(marche)
+    if not bandes:
+        return True
+    try:
+        e = float(edge_pct)
+    except (TypeError, ValueError):
+        return False
+    return any(lo <= e < hi for lo, hi in bandes)
+
+
+def _formater_bandes_edge(bandes):
+    if not bandes:
+        return "aucune"
+    return ", ".join(f"{lo:g}-{hi:g}%" for lo, hi in bandes)
 
 
 def _blend_proba_marche(prob_modele_a, prob_modele_b, cote_marche_a, cote_marche_b, w_modele):
@@ -2868,6 +3370,9 @@ def shrink_cotes_vers_marche(cotes_vraies, cotes_bookmaker, cotes_puckline, gp_m
         resultat["cote_pl_away"] = round(1 / max(p_away, 0.001), 2)
 
     if cotes_bookmaker and "totals" in cotes_bookmaker:
+        w_ou = w
+        if NHL_OU_TRUST_CAP > 0:
+            w_ou = min(w, NHL_OU_TRUST_CAP)
         prob_over = dict(cotes_vraies.get("prob_over_cuts", {}))
         prob_under = dict(cotes_vraies.get("prob_under_cuts", {}))
         for cut, prix in cotes_bookmaker["totals"].items():
@@ -2879,7 +3384,7 @@ def shrink_cotes_vers_marche(cotes_vraies, cotes_bookmaker, cotes_puckline, gp_m
             if p_over_modele is None or p_under_modele is None:
                 continue
             p_over, p_under = _blend_proba_marche(
-                p_over_modele, p_under_modele, prix["Over"], prix["Under"], w,
+                p_over_modele, p_under_modele, prix["Over"], prix["Under"], w_ou,
             )
             prob_over[cle_over] = p_over
             prob_under[cle_under] = p_under
@@ -3501,11 +4006,26 @@ def _choisir_meilleur_pari(candidats):
     return best
 
 
+def _cle_notification_pari(game_id, type_pari):
+    """Clé mémoire / journal : un signal = un match + un type de pari."""
+    return f"{game_id}|{type_pari}"
+
+
+def _selectionner_paris(candidats):
+    """Max-edge seul, ou tous les candidats (paper / stats)."""
+    if not candidats:
+        return []
+    if NHL_TOUS_CANDIDATS_ACTIF:
+        return list(candidats)
+    best = _choisir_meilleur_pari(candidats)
+    return [best] if best else []
+
+
 def _construire_candidats_pari(
     m, cotes_vraies, cotes_bookmaker, cotes_puckline, bankroll, gardiens_verrouilles,
     kelly_mult=None, gp_moyen_match=None, kelly_param_mult=1.0, confiance_detail=None,
 ):
-    """Évalue ML / PL / O-U selon NHL_MARCHES_ACTIFS."""
+    """Évalue ML / PL / O-U selon NHL_MARCHES_ACTIFS (+ bandes d'edge si actives)."""
     candidats = []
     if kelly_mult is None:
         kelly_mult = _multiplicateur_kelly_dynamique()
@@ -3518,41 +4038,39 @@ def _construire_candidats_pari(
         kelly_param_mult=kelly_param_mult,
     )
 
+    def _ajouter(marche, type_pari, inv, cote_book, cote_vraie):
+        if not inv:
+            return
+        if not _edge_dans_bandes(marche, inv["edge"]):
+            return
+        candidats.append({
+            "type": type_pari, "inv": inv,
+            "cote_book": cote_book, "cote_vraie": cote_vraie,
+            "marche": marche,
+        })
+
     if "ML" in NHL_MARCHES_ACTIFS:
         inv = calculate_kelly(cotes_vraies["prob_1"], cotes_bookmaker["cote_1"], **kelly_kw)
-        if inv:
-            candidats.append({
-                "type": f"Victoire {m['home_team']}", "inv": inv,
-                "cote_book": cotes_bookmaker["cote_1"], "cote_vraie": cotes_vraies["cote_1"],
-                "marche": "ML",
-            })
+        _ajouter("ML", f"Victoire {m['home_team']}", inv, cotes_bookmaker["cote_1"], cotes_vraies["cote_1"])
         inv = calculate_kelly(cotes_vraies["prob_2"], cotes_bookmaker["cote_2"], **kelly_kw)
-        if inv:
-            candidats.append({
-                "type": f"Victoire {m['away_team']}", "inv": inv,
-                "cote_book": cotes_bookmaker["cote_2"], "cote_vraie": cotes_vraies["cote_2"],
-                "marche": "ML",
-            })
+        _ajouter("ML", f"Victoire {m['away_team']}", inv, cotes_bookmaker["cote_2"], cotes_vraies["cote_2"])
 
     if "PL" in NHL_MARCHES_ACTIFS and cotes_puckline:
         if "cote_pl_home" in cotes_puckline:
             inv = calculate_kelly(cotes_vraies["prob_pl_home"], cotes_puckline["cote_pl_home"], **kelly_kw)
-            if inv:
-                candidats.append({
-                    "type": f"Puck Line {m['home_team']} -1.5", "inv": inv,
-                    "cote_book": cotes_puckline["cote_pl_home"], "cote_vraie": cotes_vraies["cote_pl_home"],
-                    "marche": "PL",
-                })
+            _ajouter(
+                "PL", f"Puck Line {m['home_team']} -1.5", inv,
+                cotes_puckline["cote_pl_home"], cotes_vraies["cote_pl_home"],
+            )
         if "cote_pl_away" in cotes_puckline:
             inv = calculate_kelly(cotes_vraies["prob_pl_away"], cotes_puckline["cote_pl_away"], **kelly_kw)
-            if inv:
-                candidats.append({
-                    "type": f"Puck Line {m['away_team']} -1.5", "inv": inv,
-                    "cote_book": cotes_puckline["cote_pl_away"], "cote_vraie": cotes_vraies["cote_pl_away"],
-                    "marche": "PL",
-                })
+            _ajouter(
+                "PL", f"Puck Line {m['away_team']} -1.5", inv,
+                cotes_puckline["cote_pl_away"], cotes_vraies["cote_pl_away"],
+            )
 
     if "OU" in NHL_MARCHES_ACTIFS and "totals" in cotes_bookmaker:
+        kelly_ou = {**kelly_kw, "edge_min_override": NHL_EDGE_MIN_OU}
         for cut, prices in cotes_bookmaker["totals"].items():
             cut_arrondi = _arrondir_cut(cut)
             _, prob_over = _trouver_cle_float(cotes_vraies["prob_over_cuts"], cut_arrondi)
@@ -3560,23 +4078,17 @@ def _construire_candidats_pari(
             if prob_over is None:
                 continue
             if "Over" in prices:
-                inv = calculate_kelly(prob_over, prices["Over"], **kelly_kw)
-                if inv:
-                    candidats.append({
-                        "type": f"OVER {cut_arrondi}", "inv": inv,
-                        "cote_book": prices["Over"],
-                        "cote_vraie": round(1 / max(prob_over, 0.001), 2),
-                        "marche": "OU",
-                    })
+                inv = calculate_kelly(prob_over, prices["Over"], **kelly_ou)
+                _ajouter(
+                    "OU", f"OVER {cut_arrondi}", inv, prices["Over"],
+                    round(1 / max(prob_over, 0.001), 2),
+                )
             if "Under" in prices and prob_under is not None:
-                inv = calculate_kelly(prob_under, prices["Under"], **kelly_kw)
-                if inv:
-                    candidats.append({
-                        "type": f"UNDER {cut_arrondi}", "inv": inv,
-                        "cote_book": prices["Under"],
-                        "cote_vraie": round(1 / max(prob_under, 0.001), 2),
-                        "marche": "OU",
-                    })
+                inv = calculate_kelly(prob_under, prices["Under"], **kelly_ou)
+                _ajouter(
+                    "OU", f"UNDER {cut_arrondi}", inv, prices["Under"],
+                    round(1 / max(prob_under, 0.001), 2),
+                )
 
     return candidats
 
@@ -3802,12 +4314,14 @@ def _multiplicateur_kelly_parametrique(
 
 def calculate_kelly(
     true_prob, book_odds, bankroll, gardiens_confirmes=True,
-    kelly_mult=None, gp_moyen=None, kelly_param_mult=1.0,
+    kelly_mult=None, gp_moyen=None, kelly_param_mult=1.0, edge_min_override=None,
 ):
     if book_odds <= 1.0 or true_prob <= 0.01 or true_prob >= 0.99:
         return None
     edge = true_prob - (1 / book_odds)
     edge_min = _edge_minimum_dynamique(gp_moyen, gardiens_confirmes)
+    if edge_min_override is not None:
+        edge_min = max(edge_min, float(edge_min_override))
     if edge <= edge_min:
         return None
     b = book_odds - 1.0
@@ -3856,21 +4370,15 @@ def _executer_opportunite(opp):
         f"🎯 Edge {best_pari['inv']['edge']}% [{best_pari.get('marche', '?')}] — "
         f"{best_pari['type']} ({m['away_team']} @ {m['home_team']}) "
         f"mise {best_pari['inv']['mise']} €"
+        + (" [DRY RUN]" if NHL_DRY_RUN else "")
     )
-
-    if NHL_DRY_RUN:
-        envoyer_alerte(
-            m["away_team"], g_ext, m["home_team"], g_dom,
-            best_pari["cote_vraie"], best_pari["inv"], best_pari["type"],
-            dry_run=True,
-        )
-        enregistrer_notification(id_match)
-        return
 
     envoyer_alerte(
         m["away_team"], g_ext, m["home_team"], g_dom,
         best_pari["cote_vraie"], best_pari["inv"], best_pari["type"],
+        dry_run=NHL_DRY_RUN,
     )
+    # Paper : journal même en DRY_RUN (CLV / P&L / stats saison)
     enregistrer_transaction(
         id_match, m["away_team"], m["home_team"], best_pari["type"],
         best_pari["cote_vraie"], cotes_vraies, best_pari["inv"], best_pari["cote_book"],
@@ -3880,6 +4388,10 @@ def _executer_opportunite(opp):
         rho=opp["rho"], hia=opp["hia_match"],
     )
     enregistrer_notification(id_match)
+    if not NHL_TOUS_CANDIDATS_ACTIF:
+        # Compat mémoire legacy (un signal / match)
+        game_id = str(id_match).split("|")[0].split("_")[0]
+        enregistrer_notification(f"{game_id}_notified")
 
 # ==========================================
 # 6. JOURNAL DE TRADING & NOTIFICATIONS
@@ -4009,7 +4521,7 @@ def envoyer_alerte(ext, g_ext, dom, g_dom, vraie_cote_pari, investissement, type
     msg += f"🎯 **ORDRE : PARIER {type_pari}**\n🔥 Edge : **+{investissement['edge']}%**\n⚖️ Kelly : **{investissement['pct_bankroll']}%**\n"
     msg += f"💵 **MISE : {investissement['mise']} €**\n──────────────\n📊 True Odds: {vraie_cote_pari}"
     if dry_run:
-        msg += "\n\n_(Aucune écriture journal — mode simulation)_"
+        msg += "\n\n_(Paper / DRY RUN — journal écrit, pas de mise réelle)_"
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
@@ -4107,7 +4619,19 @@ def run_sniper():
     mode = "DRY RUN (simulation)" if NHL_DRY_RUN else "LIVE"
     log_nhl(f"🤖 Lancement Sniper NHL — mode {mode}")
     if NHL_DRY_RUN:
-        log_nhl("🧪 NHL_DRY_RUN actif : signaux Telegram sans écriture journal.")
+        log_nhl("🧪 NHL_DRY_RUN actif : Telegram paper + écriture journal (pas de mise réelle).")
+    if NHL_TOUS_CANDIDATS_ACTIF:
+        log_nhl("📚 Tous candidats actifs — chaque edge valide est pris (pas seulement le max du match).")
+    if NHL_ATTENDRE_GARDIENS_CONFIRMES:
+        log_nhl(
+            "🛡️ Attente gardiens confirmés — aucun pari sur simple « probable » "
+            "(boxscore ou status CONFIRMED requis)"
+        )
+    else:
+        log_nhl(
+            f"⚠️ Paris sur gardiens probables autorisés — edge min {NHL_EDGE_MIN_PROBABLE:.0%}, "
+            f"Kelly ÷2 ({KELLY_FRACTION_GARDIEN_INCERTAIN})"
+        )
     cap_label = f"{NHL_MISE_MAX_PCT}% bankroll" if NHL_MISE_MAX_PCT > 0 else "Kelly pur (pas de cap %)"
     log_nhl(f"💶 Cap mise : {cap_label} | journal → {FICHIER_JOURNAL}")
     log_nhl(f"📊 Alerte quota Odds API si ≤ {NHL_ODDS_QUOTA_ALERT} requêtes restantes")
@@ -4116,7 +4640,12 @@ def run_sniper():
         f"OT home adv ML : {lire_ot_home_advantage():.0%}"
         + (" (calibré)" if NHL_OT_CALIB_ACTIF else " (fixe)")
         + " | "
-        f"edge min {EDGE_MINIMUM:.0%} (confirmés) / {NHL_EDGE_MIN_PROBABLE:.0%} (probables)"
+        f"edge min {EDGE_MINIMUM:.0%} (confirmés)"
+        + (
+            f" / {NHL_EDGE_MIN_PROBABLE:.0%} (probables)"
+            if not NHL_ATTENDRE_GARDIENS_CONFIRMES
+            else ""
+        )
         + (
             f" + dynamique +{NHL_EDGE_DYNAMIQUE_EXTRA:.0%} à 0 GP → base à {NHL_EDGE_DYNAMIQUE_GP_PLEIN:.0f} GP"
             if NHL_EDGE_DYNAMIQUE_ACTIF else ""
@@ -4125,6 +4654,19 @@ def run_sniper():
         f"rho+HIA recalibrés tous les {NHL_RHO_INTERVAL_MATCHS} matchs (min {NHL_RHO_MIN_MATCHS}) | "
         f"empty-net/tie recalibrés dès {NHL_EMPTY_NET_MIN_MATCHS} matchs"
     )
+    if NHL_EDGE_BANDS_ACTIF:
+        log_nhl(
+            f"🎚️ Bandes d'edge actives — ML [{_formater_bandes_edge(NHL_EDGE_ML_BANDS)}] | "
+            f"PL [{_formater_bandes_edge(NHL_EDGE_PL_BANDS)}]"
+            + (f" | OU [{_formater_bandes_edge(NHL_EDGE_OU_BANDS)}]" if NHL_EDGE_OU_BANDS else "")
+        )
+    elif NHL_EDGE_OU_BANDS:
+        log_nhl(
+            f"🎚️ Bandes OU actives (ML/PL sans bandes) — [{_formater_bandes_edge(NHL_EDGE_OU_BANDS)}] "
+            f"| edge min OU {NHL_EDGE_MIN_OU:.0%} | trust cap OU {NHL_OU_TRUST_CAP:.2f}"
+        )
+    if "OU" in NHL_MARCHES_ACTIFS and NHL_OU_TRUST_CAP > 0:
+        log_nhl(f"📉 Shrink totaux — trust modèle plafonné à {NHL_OU_TRUST_CAP:.2f}")
     if NHL_BLEND_GP_PLEIN > 0:
         log_nhl(f"🔀 Blend MoneyPuck N/N-1 jusqu'à {NHL_BLEND_GP_PLEIN:.0f} GP moyen/ligue")
     if NHL_PP_PK_SHRINK_GP > 0:
@@ -4163,6 +4705,9 @@ def run_sniper():
             f"📈 O/U Negative Binomial actif — dispersion r={r_nb:.1f} "
             f"(calibrée MLE si ≥{NHL_NB_OU_MIN_MATCHS} matchs, défaut {NHL_NB_OU_DISPERSION_DEFAULT:.0f})"
         )
+        ou_mu_s = lire_ou_mu_scale()
+        if abs(ou_mu_s - 1.0) > 1e-6:
+            log_nhl(f"📏 OU μ scale — {ou_mu_s:.3f} (applique à μ avant NB, ML/PL inchangés)")
     if NHL_KELLY_DYNAMIQUE_ACTIF:
         log_nhl(
             f"🎚️ Kelly dynamique actif — BSS fenêtre {NHL_KELLY_BRIER_FENETRE} paris (min {NHL_KELLY_BRIER_MIN_PARIS}), "
@@ -4315,9 +4860,11 @@ def run_sniper():
                 if NHL_LINE_MOVE_ACTIF:
                     enregistrer_snapshots_cotes(matchs, odds_cache)
             for m in matchs:
-                id_match = f"{m['game_id']}_notified"
-                if match_deja_notifie(id_match):
-                    continue
+                # Max-edge : un seul signal/match. Tous-candidats : dédup par type de pari plus bas.
+                if not NHL_TOUS_CANDIDATS_ACTIF:
+                    id_match_legacy = f"{m['game_id']}_notified"
+                    if match_deja_notifie(id_match_legacy):
+                        continue
 
                 g_ext, g_dom, skaters_ext, skaters_dom, source_roster = get_rosters_avec_fallback(m["game_id"])
                 if not g_ext or not g_dom:
@@ -4337,8 +4884,13 @@ def run_sniper():
                         f"— analyse sans détection d'absences stars."
                     )
 
-                statut_confirmation = get_goalie_confirmation_status(m['game_id'])
-                gardiens_verrouilles = statut_confirmation["away_confirmed"] and statut_confirmation["home_team_confirmed"]
+                gardiens_verrouilles = gardiens_sont_confirmes(m["game_id"], source_roster)
+                if NHL_ATTENDRE_GARDIENS_CONFIRMES and not gardiens_verrouilles:
+                    log_nhl(
+                        f"⏳ Attente confirmation gardiens — {m['away_team']} @ {m['home_team']} "
+                        f"(source={source_roster}) — aucun pari tant que CONFIRMED / boxscore"
+                    )
+                    continue
 
                 home_b2b = m['home_team'] in equipes_en_b2b_hier
                 away_b2b = m['away_team'] in equipes_en_b2b_hier
@@ -4449,13 +5001,24 @@ def run_sniper():
                         m["game_id"], candidats, m, gardiens_verrouilles,
                         gp_moyen=gp_moyen_match,
                     )
-                    best_pari = _choisir_meilleur_pari(candidats)
-
-                    if best_pari:
+                    candidats = filtrer_candidats_line_movement(
+                        m["game_id"], candidats, m, gardiens_verrouilles,
+                        gp_moyen=gp_moyen_match,
+                    )
+                    paris_retenus = _selectionner_paris(candidats)
+                    for pari in paris_retenus:
+                        id_signal = _cle_notification_pari(m["game_id"], pari["type"])
+                        if match_deja_notifie(id_signal):
+                            continue
+                        # Compat ancien format mémoire (un seul signal/match)
+                        if not NHL_TOUS_CANDIDATS_ACTIF and match_deja_notifie(
+                            f"{m['game_id']}_notified"
+                        ):
+                            continue
                         opportunites.append({
                             "m": m,
-                            "id_match": id_match,
-                            "best_pari": best_pari,
+                            "id_match": id_signal,
+                            "best_pari": pari,
                             "cotes_vraies": cotes_vraies,
                             "g_ext": g_ext,
                             "g_dom": g_dom,
@@ -4465,7 +5028,7 @@ def run_sniper():
                             "hia_match": hia_match,
                             "rho": rho_actuel,
                         })
-                    else:
+                    if not paris_retenus:
                         edge_min_dyn = _edge_minimum_dynamique(gp_moyen_match, gardiens_verrouilles)
                         if not gardiens_verrouilles:
                             log_nhl(
@@ -4508,7 +5071,9 @@ def lancer_la_balayeuse():
     with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if row.get("Statut") == "EN ATTENTE":
-                game_id = row["ID_Match"].split("_")[0]
+                # ID_Match = game_id|type_pari (nouveaux) ou game_id_notified (legacy)
+                raw_id = row["ID_Match"]
+                game_id = raw_id.split("|")[0].split("_")[0]
                 res = get_match_result(game_id)
                 if res:
                     modifie = True
@@ -4568,6 +5133,7 @@ def lire_rho_meta():
         "travel_solo_def_pct": NHL_TRAVEL_SOLO_DEF_PCT,
         "gsax_lam_mult": NHL_GSAX_LAM_MULT_DEFAULT,
         "pl_scale": NHL_PL_SCALE_DEFAULT,
+        "ou_mu_scale": NHL_OU_MU_SCALE_DEFAULT,
         "nb_matchs": 0,
     }
     resultat = default
@@ -5105,6 +5671,7 @@ def entrainer_ia_dixon_coles():
             meta_precedent.get("gsax_lam_mult", NHL_GSAX_LAM_MULT_DEFAULT)
         ),
         "pl_scale": float(meta_precedent.get("pl_scale", NHL_PL_SCALE_DEFAULT)),
+        "ou_mu_scale": float(meta_precedent.get("ou_mu_scale", NHL_OU_MU_SCALE_DEFAULT)),
         "nb_matchs": nb,
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }

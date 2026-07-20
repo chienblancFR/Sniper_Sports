@@ -10,6 +10,7 @@ Sauf **demande explicite** de l'utilisateur pour un autre sport, limiter les mod
 ## Fichiers autorisés
 
 - `nhl_sniper_omega.py`
+- `backtest_nhl.py`
 - `dashboard_nhl.py`
 - `env/nhl.env` et `env/nhl.env.example`
 - `env/common.env` et `env/common.env.example` (secrets partagés Odds API, Telegram, PA)
@@ -23,7 +24,7 @@ Sauf **demande explicite** de l'utilisateur pour un autre sport, limiter les mod
 
 ## Sync env obligatoire
 
-Toute nouvelle clé `NHL_*` ou `os.environ.get` ajoutée dans le code NHL → mettre à jour `env/nhl.env` **et** `env/nhl.env.example` (sans secrets dans l'example).
+Toute nouvelle clé `NHL_*` → voir règle `sync-nhl-config.mdc` (blocs thématiques dans `env/nhl.env` + `env/nhl.env.example`).
 
 ## Parité
 

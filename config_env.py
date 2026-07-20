@@ -37,3 +37,43 @@ def env_files_hint(sport: str | None = None) -> str:
     if sport:
         parts.append(f"env/{sport}.env")
     return " + ".join(parts)
+
+
+def ensure_sport_env_key(sport: str, key: str, value: str) -> bool:
+    """
+    Ajoute ou complète une clé vide dans env/{sport}.env.
+    Ne remplace jamais une valeur déjà renseignée (secrets / toggles user).
+    Retourne True si le fichier a été créé ou modifié.
+    """
+    if not value or not key:
+        return False
+
+    path = ENV_DIR / f"{sport}.env"
+    if path.is_file():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    else:
+        example = ENV_DIR / f"{sport}.env.example"
+        lines = example.read_text(encoding="utf-8").splitlines() if example.is_file() else []
+
+    prefix = f"{key}="
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        current = stripped.split("=", 1)[1].strip()
+        if current:
+            return False
+        lines[i] = f"{key}={value}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        return True
+
+    insert_at = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith("# CSV MoneyPuck"):
+            insert_at = i + 1
+            break
+    lines.insert(insert_at, f"{key}={value}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return True
