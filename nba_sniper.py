@@ -1,35 +1,40 @@
 """Sniper NBA — bot value bets moneyline/spread/total (paper trading).
 
-Ce module contient pour l'instant la **couche de collecte + cache PIT**
-(point-in-time, sans look-ahead) :
+Ce module contient :
 
-- Récupération bulk (1 appel/saison/measure_type) des box scores et stats
+- La **couche de collecte + cache PIT** (point-in-time, sans look-ahead) :
+  récupération bulk (1 appel/saison/measure_type) des box scores et stats
   avancées par match via `nba_api` (stats.nba.com) : ``Base`` (score, W/L),
   ``Advanced`` (OFF_RATING/DEF_RATING/PACE/POSS) et ``Four Factors``
-  (EFG%/FTA_RATE/TOV%/OREB% + équivalents adverses).
-- Fusion en un enregistrement par (match, équipe) et construction d'un index
-  PIT walk-forward : pour chaque équipe, la liste chronologique des snapshots
-  de stats cumulées **strictement avant** chaque match (pondérées par
-  possessions), pattern identique au PIT MoneyPuck de `nhl_sniper_omega.py`.
-- Calendrier saison (``ScheduleLeagueV2``, heures de tip-off UTC) et
-  scoreboard du jour (module live cdn.nba.com) pour la fenêtre live à venir.
-- Cache disque JSON (``data/nba/``) : permanent pour les saisons terminées,
-  TTL (``NBA_PIT_CACHE_JOURS``) pour la saison en cours ; retry/backoff sur
-  les appels stats.nba.com (timeouts transitoires observés en exploration).
+  (EFG%/FTA_RATE/TOV%/OREB% + équivalents adverses) ; fusion en un
+  enregistrement par (match, équipe) et index PIT walk-forward (cumul
+  pondéré possessions, strictement avant chaque match, pattern identique au
+  PIT MoneyPuck de `nhl_sniper_omega.py`) ; calendrier saison
+  (``ScheduleLeagueV2``) et scoreboard du jour (module live cdn.nba.com) ;
+  cache disque JSON (``data/nba/``), permanent (saisons terminées) ou TTL
+  (``NBA_PIT_CACHE_JOURS``, saison en cours).
+- Le **moteur mathématique** (ratings ajustés Off/Def + Pace avec
+  décroissance temporelle + shrinkage bayésien vers la moyenne ligue + blend
+  saison N/N-1, ajustements home court/repos/B2B/altitude, distribution
+  bivariée Normale sur la marge et le total, probabilités de marché
+  moneyline/spread/total avec gestion du push sur lignes entières) — voir
+  `calculer_probabilites_match_nba()`. Paramètres calibrables dans
+  `nba_params.py`.
 
-Le moteur mathématique (ratings ajustés/shrinkage, distribution bivariée,
-probabilités de marché), l'intégration Odds API/edge/Kelly et la boucle live
-`run_sniper()` sont des phases ultérieures du plan — pas encore implémentées
-ici.
+L'intégration Odds API/edge/Kelly et la boucle live `run_sniper()` sont des
+phases ultérieures du plan — pas encore implémentées ici.
 """
 import json
 import logging
+import math
 import os
 import time
+from datetime import datetime
 
 from nba_api.stats.endpoints import scheduleleaguev2, teamgamelogs
 from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
 
+import nba_params
 from config_env import load_project_env
 
 load_project_env("nba")
@@ -538,3 +543,415 @@ def fetch_live_scoreboard():
             "score_exterieur": away.get("score"),
         })
     return matchs
+
+
+# ==========================================
+# 6. MOTEUR MATHÉMATIQUE — ratings ajustés, distribution, probabilités marché
+# ==========================================
+#
+# Pipeline (walk-forward strict, aucune donnée >= date_ref utilisée) :
+#
+#   records par équipe (get_dict per-game)
+#       -> stats brutes decay-pondérées (demi-vie NBA_RATING_HALF_LIFE_JOURS)
+#       -> moyenne ligue du jour (cross-section des équipes déjà actives)
+#       -> shrinkage bayésien vers la moyenne ligue (n_prior)
+#       -> blend saison N / saison N-1 (rampe sur GP comptés, NBA_BLEND_GP_PLEIN)
+#       -> mu_home / mu_away (cross Off x Def x Pace/lg_avg)
+#       -> ajustements HCA / repos-B2B / altitude
+#       -> distribution bivariée Normale (sigma_home, sigma_away, rho)
+#       -> probabilités moneyline / spread (avec push) / total (avec push)
+#
+# Analogue au moteur foot (Dixon-Coles + shrink + blend N-1) et NHL (xG +
+# shrink PP/PK + blend N-1 + fatigue calendrier), mais distribution Normale
+# bivariée sur la marge/total plutôt qu'une matrice de score Poisson —
+# justifié par le volume de points NBA (~110-120/équipe, quasi-gaussien par
+# TCL) contre le faible effectif de buts foot/NHL. Voir le plan
+# `sniper_nba_value_bets` (section "Pourquoi pas le pattern Poisson/DC").
+
+
+def _parse_date_nba(date_str):
+    """Parse une date 'YYYY-MM-DD' (ou 'YYYY-MM-DD HH:MM...') → date, ou None."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(str(date_str).strip()[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _decay_poids(age_jours, half_life_jours):
+    """Poids exponentiel selon l'ancienneté (jours) : 0.5^(age/demi_vie).
+    `half_life_jours <= 0` désactive la décroissance (poids uniforme = 1.0)."""
+    if half_life_jours is None or half_life_jours <= 0:
+        return 1.0
+    return 0.5 ** (max(age_jours, 0) / half_life_jours)
+
+
+def _grouper_records_par_equipe(records):
+    """Regroupe les enregistrements fusionnés (`_fusionner_logs_saison`) par
+    équipe, triés chronologiquement (date, game_id)."""
+    par_equipe = {}
+    for r in records:
+        if r.get("poss") is None or r.get("off_rating") is None:
+            continue
+        par_equipe.setdefault(r["team"], []).append(r)
+    for team in par_equipe:
+        par_equipe[team].sort(key=lambda g: (g["date"], g["game_id"]))
+    return par_equipe
+
+
+def _stats_brutes_decay_equipe(games_avant, date_ref, half_life_jours):
+    """Stats brutes (OFF/DEF rating pondérés possessions, Pace) d'une équipe
+    à partir de ses matchs de la saison en cours strictement AVANT
+    `date_ref`, pondérés par décroissance temporelle exponentielle.
+
+    Retourne ``None`` si l'équipe n'a encore aucun match cette saison.
+    `effective_gp` (somme des poids de décroissance, unité "matchs") sert de
+    taille d'échantillon au shrinkage bayésien ; `gp` (compte brut, non
+    pondéré) sert de rampe au blend saison N-1.
+    """
+    if not games_avant:
+        return None
+    ref = _parse_date_nba(date_ref)
+    poids_poss_total = 0.0
+    effective_gp = 0.0
+    off_num = 0.0
+    def_num = 0.0
+    pace_num = 0.0
+    for g in games_avant:
+        d = _parse_date_nba(g.get("date"))
+        age_jours = (ref - d).days if (ref and d) else 0
+        w = _decay_poids(age_jours, half_life_jours)
+        poss = float(g.get("poss") or 0)
+        off_num += w * poss * float(g.get("off_rating") or 0)
+        def_num += w * poss * float(g.get("def_rating") or 0)
+        poids_poss_total += w * poss
+        pace_num += w * float(g.get("pace") or 0)
+        effective_gp += w
+    if poids_poss_total <= 0 or effective_gp <= 0:
+        return None
+    return {
+        "off_rating": off_num / poids_poss_total,
+        "def_rating": def_num / poids_poss_total,
+        "pace": pace_num / effective_gp,
+        "effective_gp": effective_gp,
+        "gp": len(games_avant),
+    }
+
+
+def _snapshot_ligue_decay(par_equipe, date_ref, half_life_jours):
+    """Stats brutes decay-pondérées de chaque équipe à `date_ref` (walk-forward
+    strict : ne regarde que les matchs de `par_equipe` avec `date < date_ref`).
+    Retourne un dict team -> stats (ou ``None`` si l'équipe n'a aucun match)."""
+    snap = {}
+    for team, games in par_equipe.items():
+        games_avant = [g for g in games if g["date"] < date_ref]
+        snap[team] = _stats_brutes_decay_equipe(games_avant, date_ref, half_life_jours)
+    return snap
+
+
+def _moyennes_ligue_depuis_snapshot(snap):
+    """Moyenne ligue (ORtg/DRtg/Pace) = moyenne cross-section des stats brutes
+    des équipes déjà actives à `date_ref` — reste point-in-time car chaque
+    stat d'équipe n'utilise que son propre passé. Retourne ``None`` si aucune
+    équipe n'a encore joué (tout début de saison)."""
+    offs = [s["off_rating"] for s in snap.values() if s]
+    defs_ = [s["def_rating"] for s in snap.values() if s]
+    paces = [s["pace"] for s in snap.values() if s]
+    if not offs:
+        return None
+    return {
+        "off_rating": sum(offs) / len(offs),
+        "def_rating": sum(defs_) / len(defs_),
+        "pace": sum(paces) / len(paces),
+    }
+
+
+def _rating_ajuste_equipe(team, snap, league_avg, prior_n1, n_prior, blend_gp_plein):
+    """Rating ajusté d'une équipe : shrinkage bayésien vers `league_avg`
+    (poids `n_prior`, taille d'échantillon = `effective_gp` decay-pondéré)
+    puis blend avec le rating de fin de saison précédente `prior_n1` (rampe
+    sur GP comptés jusqu'à `blend_gp_plein`, pattern `NHL_BLEND_GP_PLEIN`).
+
+    Sans aucun match cette saison : pur prior N-1 si disponible, sinon
+    moyenne ligue (équipe d'expansion / prior manquant)."""
+    brut = snap.get(team)
+    prior = (prior_n1 or {}).get(team)
+    prior_valide = bool(prior) and prior.get("games_played", 0) > 0 and prior.get("off_rating") is not None
+
+    if not brut:
+        if prior_valide:
+            return {
+                "off_rating": prior["off_rating"],
+                "def_rating": prior["def_rating"],
+                "pace": prior["pace"],
+                "gp": 0,
+            }
+        return {
+            "off_rating": league_avg["off_rating"],
+            "def_rating": league_avg["def_rating"],
+            "pace": league_avg["pace"],
+            "gp": 0,
+        }
+
+    eff_gp = brut["effective_gp"]
+    shrink_off = (eff_gp * brut["off_rating"] + n_prior * league_avg["off_rating"]) / (eff_gp + n_prior)
+    shrink_def = (eff_gp * brut["def_rating"] + n_prior * league_avg["def_rating"]) / (eff_gp + n_prior)
+    shrink_pace = (eff_gp * brut["pace"] + n_prior * league_avg["pace"]) / (eff_gp + n_prior)
+
+    gp = brut["gp"]
+    if prior_valide and blend_gp_plein > 0:
+        w = min(1.0, gp / blend_gp_plein)
+        return {
+            "off_rating": w * shrink_off + (1.0 - w) * prior["off_rating"],
+            "def_rating": w * shrink_def + (1.0 - w) * prior["def_rating"],
+            "pace": w * shrink_pace + (1.0 - w) * prior["pace"],
+            "gp": gp,
+        }
+    return {"off_rating": shrink_off, "def_rating": shrink_def, "pace": shrink_pace, "gp": gp}
+
+
+def _contexte_repos_equipe(games_avant, date_ref):
+    """(is_b2b, rest_jours) d'une équipe à `date_ref`, à partir de son dernier
+    match connu strictement avant. `is_b2b` = match la veille (0 ou 1 jour de
+    repos). Retourne ``(False, None)`` si aucun match antérieur (1er match
+    de la saison pour cette équipe)."""
+    if not games_avant:
+        return False, None
+    dernier = games_avant[-1]
+    d_ref = _parse_date_nba(date_ref)
+    d_last = _parse_date_nba(dernier.get("date"))
+    if not d_ref or not d_last:
+        return False, None
+    diff = (d_ref - d_last).days
+    return diff <= 1, diff
+
+
+def calculer_mu_points(
+    rating_home,
+    rating_away,
+    league_avg,
+    hca=None,
+    home_b2b=False,
+    away_b2b=False,
+    home_rest_jours=None,
+    away_rest_jours=None,
+    altitude_domicile=False,
+):
+    """Points attendus (mu_home, mu_away) — cross-multiplicatif Off x Def x
+    Pace/lg_avg (pattern identique foot/NHL), avec ajustements home
+    court/repos-B2B/altitude appliqués aux ratings avant le cross.
+
+    `rating_*` : dict avec ``off_rating``/``def_rating``/``pace`` (déjà
+    shrink + blend, voir `_rating_ajuste_equipe`). `league_avg` : moyenne
+    ligue ORtg/DRtg/Pace du jour (voir `_moyennes_ligue_depuis_snapshot`).
+    """
+    hca = nba_params.get_hca() if hca is None else hca
+    b2b_atk_pct = nba_params.get_b2b_atk_pct()
+    b2b_def_pct = nba_params.get_b2b_def_pct()
+    rest_bonus_pct = nba_params.get_rest_bonus_pct()
+    altitude_bonus = nba_params.get_altitude_bonus()
+
+    home_off = rating_home["off_rating"] * (1.0 + hca)
+    home_def = rating_home["def_rating"] * (1.0 - hca)
+    away_off = rating_away["off_rating"]
+    away_def = rating_away["def_rating"]
+
+    if altitude_domicile:
+        home_off *= 1.0 + altitude_bonus
+        away_off *= 1.0 - altitude_bonus * 0.5
+
+    if home_b2b:
+        home_off *= 1.0 - b2b_atk_pct
+        home_def *= 1.0 + b2b_def_pct
+    elif home_rest_jours is not None and home_rest_jours >= 2:
+        home_off *= 1.0 + rest_bonus_pct
+
+    if away_b2b:
+        away_off *= 1.0 - b2b_atk_pct
+        away_def *= 1.0 + b2b_def_pct
+    elif away_rest_jours is not None and away_rest_jours >= 2:
+        away_off *= 1.0 + rest_bonus_pct
+
+    lg_rtg = max(league_avg["off_rating"], 1.0)
+    pace_match = (rating_home["pace"] + rating_away["pace"]) / 2.0 / 100.0
+
+    mu_home = (home_off / lg_rtg) * (away_def / lg_rtg) * lg_rtg * pace_match
+    mu_away = (away_off / lg_rtg) * (home_def / lg_rtg) * lg_rtg * pace_match
+    return max(mu_home, 1.0), max(mu_away, 1.0)
+
+
+# ------------------------------------------
+# 6b. Distribution bivariée Normale + probabilités de marché
+# ------------------------------------------
+def _phi(x):
+    """CDF de la loi Normale standard N(0,1)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _sigma_diff(sigma_home, sigma_away, rho):
+    """Écart-type de la marge (home - away) : Var(X-Y) = VarX + VarY - 2*Cov(X,Y)."""
+    variance = sigma_home ** 2 + sigma_away ** 2 - 2.0 * rho * sigma_home * sigma_away
+    return math.sqrt(max(variance, 1e-6))
+
+
+def _sigma_total(sigma_home, sigma_away, rho):
+    """Écart-type du total (home + away) : Var(X+Y) = VarX + VarY + 2*Cov(X,Y)."""
+    variance = sigma_home ** 2 + sigma_away ** 2 + 2.0 * rho * sigma_home * sigma_away
+    return math.sqrt(max(variance, 1e-6))
+
+
+def prob_moneyline_nba(mu_home, mu_away, sigma_home=None, sigma_away=None, rho=None):
+    """P(victoire domicile), P(victoire extérieur) — pas de push : une
+    prolongation tranche toujours un score nul en fin de temps réglementaire."""
+    sigma_home = nba_params.get_sigma_team() if sigma_home is None else sigma_home
+    sigma_away = nba_params.get_sigma_team() if sigma_away is None else sigma_away
+    rho = nba_params.get_rho_scores() if rho is None else rho
+
+    sd = _sigma_diff(sigma_home, sigma_away, rho)
+    p_domicile = _phi((mu_home - mu_away) / sd)
+    return p_domicile, 1.0 - p_domicile
+
+
+def _prob_ligne_normale(mu, sigma, ligne):
+    """P(gagne, push, perdu) pour une variable à valeurs entières (marge ou
+    total de points) approximée par N(mu, sigma), avec correction de
+    continuité. Lignes entières (ex. spread -6, total 220) : push possible.
+    Lignes .5 (ex. -6.5, 220.5) : pas de push, la correction de continuité
+    s'annule exactement avec la ligne (cf. commentaire moteur NBA)."""
+    if sigma <= 0:
+        if mu > ligne:
+            return 1.0, 0.0, 0.0
+        if mu < ligne:
+            return 0.0, 0.0, 1.0
+        return 0.0, 1.0, 0.0
+
+    est_entiere = float(ligne).is_integer()
+    if est_entiere:
+        p_perdu = _phi((ligne - 0.5 - mu) / sigma)
+        p_gagne = 1.0 - _phi((ligne + 0.5 - mu) / sigma)
+        p_push = max(0.0, 1.0 - p_gagne - p_perdu)
+    else:
+        p_gagne = 1.0 - _phi((ligne - mu) / sigma)
+        p_perdu = 1.0 - p_gagne
+        p_push = 0.0
+    return p_gagne, p_push, p_perdu
+
+
+def prob_spread_nba(mu_home, mu_away, ligne_domicile, sigma_home=None, sigma_away=None, rho=None):
+    """P(domicile couvre, push, extérieur couvre) pour une ligne de spread
+    exprimée du point de vue domicile (ex. ``-5.5`` si domicile favori de
+    5.5 pts, ``+3`` si domicile outsider de 3 pts) — convention American
+    spread standard (pas de handicap asiatique multi-lignes comme le foot)."""
+    sigma_home = nba_params.get_sigma_team() if sigma_home is None else sigma_home
+    sigma_away = nba_params.get_sigma_team() if sigma_away is None else sigma_away
+    rho = nba_params.get_rho_scores() if rho is None else rho
+
+    mu_diff = mu_home - mu_away
+    sd = _sigma_diff(sigma_home, sigma_away, rho)
+    # Domicile couvre si marge > -ligne_domicile (ex. ligne -5.5 -> marge > 5.5).
+    return _prob_ligne_normale(mu_diff, sd, -ligne_domicile)
+
+
+def prob_total_nba(mu_home, mu_away, ligne_total, sigma_home=None, sigma_away=None, rho=None):
+    """P(over, push, under) pour une ligne de total de points."""
+    sigma_home = nba_params.get_sigma_team() if sigma_home is None else sigma_home
+    sigma_away = nba_params.get_sigma_team() if sigma_away is None else sigma_away
+    rho = nba_params.get_rho_scores() if rho is None else rho
+
+    mu_total = mu_home + mu_away
+    st = _sigma_total(sigma_home, sigma_away, rho)
+    return _prob_ligne_normale(mu_total, st, ligne_total)
+
+
+# ------------------------------------------
+# 6c. Orchestrateur — moteur complet pour un match
+# ------------------------------------------
+def calculer_probabilites_match_nba(
+    home,
+    away,
+    date_ref,
+    season_year=None,
+    lignes_spread=None,
+    lignes_total=None,
+    force=False,
+):
+    """Moteur mathématique complet pour un match NBA (`home` vs `away`) à
+    `date_ref` (``'YYYY-MM-DD'``) — walk-forward strict, aucune donnée à
+    partir de `date_ref` n'est utilisée.
+
+    `lignes_spread` : itérable de lignes côté domicile (ex. ``[-5.5]``).
+    `lignes_total` : itérable de lignes de total (ex. ``[224.5]``).
+
+    Retourne un dict avec `mu_home`/`mu_away`, `sigma_home`/`sigma_away`,
+    `rho`, les ratings ajustés, le contexte repos/B2B, et les probabilités
+    de marché (moneyline, spread par ligne, total par ligne — push géré sur
+    lignes entières).
+    """
+    season_year = season_year or NBA_SEASON
+    records = _fusionner_logs_saison(season_year, force=force)
+    par_equipe = _grouper_records_par_equipe(records)
+
+    half_life = nba_params.get_rating_half_life_jours()
+    n_prior = nba_params.get_n_prior()
+    blend_gp_plein = nba_params.get_blend_gp_plein()
+
+    snap = _snapshot_ligue_decay(par_equipe, date_ref, half_life)
+    league_avg = _moyennes_ligue_depuis_snapshot(snap) or nba_params.get_league_avg_fallback()
+    prior_n1 = stats_fin_saison_nba(season_year - 1, force=force)
+
+    rating_home = _rating_ajuste_equipe(home, snap, league_avg, prior_n1, n_prior, blend_gp_plein)
+    rating_away = _rating_ajuste_equipe(away, snap, league_avg, prior_n1, n_prior, blend_gp_plein)
+
+    games_home_avant = [g for g in par_equipe.get(home, []) if g["date"] < date_ref]
+    games_away_avant = [g for g in par_equipe.get(away, []) if g["date"] < date_ref]
+    home_b2b, home_rest = _contexte_repos_equipe(games_home_avant, date_ref)
+    away_b2b, away_rest = _contexte_repos_equipe(games_away_avant, date_ref)
+
+    mu_home, mu_away = calculer_mu_points(
+        rating_home,
+        rating_away,
+        league_avg,
+        hca=nba_params.get_hca(home),
+        home_b2b=home_b2b,
+        away_b2b=away_b2b,
+        home_rest_jours=home_rest,
+        away_rest_jours=away_rest,
+        altitude_domicile=nba_params.is_altitude_team(home),
+    )
+
+    sigma_home = nba_params.get_sigma_team(home)
+    sigma_away = nba_params.get_sigma_team(away)
+    rho = nba_params.get_rho_scores()
+
+    p_dom_ml, p_ext_ml = prob_moneyline_nba(mu_home, mu_away, sigma_home, sigma_away, rho)
+
+    spreads = {}
+    for ligne in (lignes_spread or []):
+        p_dom, p_push, p_ext = prob_spread_nba(mu_home, mu_away, ligne, sigma_home, sigma_away, rho)
+        spreads[ligne] = {"domicile": round(p_dom, 4), "push": round(p_push, 4), "exterieur": round(p_ext, 4)}
+
+    totals = {}
+    for ligne in (lignes_total or []):
+        p_over, p_push, p_under = prob_total_nba(mu_home, mu_away, ligne, sigma_home, sigma_away, rho)
+        totals[ligne] = {"over": round(p_over, 4), "push": round(p_push, 4), "under": round(p_under, 4)}
+
+    return {
+        "home": home,
+        "away": away,
+        "date": date_ref,
+        "mu_home": round(mu_home, 2),
+        "mu_away": round(mu_away, 2),
+        "sigma_home": sigma_home,
+        "sigma_away": sigma_away,
+        "rho": rho,
+        "rating_home": rating_home,
+        "rating_away": rating_away,
+        "home_b2b": home_b2b,
+        "away_b2b": away_b2b,
+        "home_rest_jours": home_rest,
+        "away_rest_jours": away_rest,
+        "moneyline": {"domicile": round(p_dom_ml, 4), "exterieur": round(p_ext_ml, 4)},
+        "spread": spreads,
+        "total": totals,
+    }
