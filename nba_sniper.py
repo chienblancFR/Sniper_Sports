@@ -21,21 +21,32 @@ Ce module contient :
   `calculer_probabilites_match_nba()`. Paramètres calibrables dans
   `nba_params.py`.
 
-L'intégration Odds API/edge/Kelly et la boucle live `run_sniper()` sont des
-phases ultérieures du plan — pas encore implémentées ici.
+Intégration Odds API (basketball_nba, Pinnacle) + dévigorage Shin 2-way
+(`odds_devig.py`) + shrink modèle↔marché, edge/Kelly fractionnel + cap %
+bankroll, journal CSV + alertes Telegram (paper trading `NBA_DRY_RUN`), et
+boucle live `run_sniper_nba()` — voir sections 7 à 9 ci-dessous (mirroring
+`nhl_sniper_omega.py`, simplifié : pas de line-movement/steam, pas de Kelly
+dynamique BSS/CLV, pas d'absences stars en v1, documenté comme limite
+connue — voir le plan `sniper_nba_value_bets`).
 """
+import copy
+import csv
 import json
 import logging
 import math
 import os
+import re
 import time
-from datetime import datetime
+import traceback
+from datetime import datetime, timezone
 
+import requests
 from nba_api.stats.endpoints import scheduleleaguev2, teamgamelogs
 from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
 
 import nba_params
 from config_env import load_project_env
+from odds_devig import proba_no_vig_shin_2way
 
 load_project_env("nba")
 
@@ -73,6 +84,79 @@ NBA_PIT_CACHE_JOURS = int(os.environ.get("NBA_PIT_CACHE_JOURS", "1"))
 NBA_API_MAX_RETRIES = int(os.environ.get("NBA_API_MAX_RETRIES", "3"))
 NBA_API_TIMEOUT = int(os.environ.get("NBA_API_TIMEOUT", "30"))
 NBA_API_RETRY_BACKOFF = float(os.environ.get("NBA_API_RETRY_BACKOFF", "2.0"))
+
+# Odds API (secret partagé common.env) + canal Telegram dédié optionnel
+# (pattern MLB_TELEGRAM_* — vide = repli sur le canal commun TELEGRAM_*).
+ODDS_API_KEY = os.environ.get("API_ODDS_KEY", "")
+NBA_TELEGRAM_TOKEN = os.environ.get("NBA_TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_TOKEN", "")
+NBA_TELEGRAM_CHAT_ID = os.environ.get("NBA_TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# Fenêtre de scan live (heures avant tip-off) — matchs du programme du jour.
+NBA_SCAN_HEURES_AVANCE = float(os.environ.get("NBA_SCAN_HEURES_AVANCE", "12"))
+
+# Edge minimum (fraction, ex. 0.03 = 3%) ; dynamique = majoré en début de
+# saison (échantillon faible = incertitude modèle plus grande), pattern
+# NHL_EDGE_DYNAMIQUE_*.
+NBA_EDGE_MIN = float(os.environ.get("NBA_EDGE_MIN", "0.03"))
+NBA_EDGE_DYNAMIQUE_ACTIF = _env_bool("NBA_EDGE_DYNAMIQUE_ACTIF", True)
+NBA_EDGE_DYNAMIQUE_EXTRA = float(os.environ.get("NBA_EDGE_DYNAMIQUE_EXTRA", "0.02"))
+NBA_EDGE_DYNAMIQUE_GP_PLEIN = float(os.environ.get("NBA_EDGE_DYNAMIQUE_GP_PLEIN", "20"))
+
+# Marchés actifs (ML=moneyline, SPREAD=handicap, TOTAL=total points).
+NBA_MARCHES_ACTIFS = {
+    m.strip().upper() for m in os.environ.get("NBA_MARCHES_ACTIFS", "ML,SPREAD,TOTAL").split(",") if m.strip()
+}
+
+# Kelly fractionnel + cap % bankroll (pattern NHL_KELLY_FRACTION / NHL_MISE_MAX_PCT).
+NBA_KELLY_FRACTION = float(os.environ.get("NBA_KELLY_FRACTION", "0.25"))
+NBA_MISE_MAX_PCT = float(os.environ.get("NBA_MISE_MAX_PCT", "2"))
+
+# Shrinkage modèle↔marché (confiance croissante avec le volume de données
+# saison, pattern NHL_MODEL_TRUST_MIN/MAX/GP_PLEIN) — le reste du poids va
+# à la probabilité no-vig Pinnacle (Shin 2-way).
+NBA_MARCHE_SHRINK_ACTIF = _env_bool("NBA_MARCHE_SHRINK_ACTIF", True)
+NBA_MODEL_TRUST_MIN = float(os.environ.get("NBA_MODEL_TRUST_MIN", "0.55"))
+NBA_MODEL_TRUST_MAX = float(os.environ.get("NBA_MODEL_TRUST_MAX", "0.80"))
+NBA_MODEL_TRUST_GP_PLEIN = float(os.environ.get("NBA_MODEL_TRUST_GP_PLEIN", "20"))
+
+# Paper trading — cette saison, aucune mise réelle (voir règle nba-paper-trading).
+NBA_DRY_RUN = _env_bool("NBA_DRY_RUN", True)
+# Paper : tous les candidats edge valides du match (pas seulement le max-edge).
+NBA_TOUS_CANDIDATS_ACTIF = _env_bool("NBA_TOUS_CANDIDATS_ACTIF", True)
+NBA_BANKROLL = float(os.environ.get("NBA_BANKROLL", "1000.0"))
+NBA_ODDS_QUOTA_ALERT = int(os.environ.get("NBA_ODDS_QUOTA_ALERT", "100"))
+
+PA_DATA_DIR = "/home/chienblanc/data"
+JOURNAL_NOM_NBA = "journal_trading_nba.csv"
+FICHIER_JOURNAL_NBA = (
+    os.path.join(PA_DATA_DIR, JOURNAL_NOM_NBA) if os.path.isdir(PA_DATA_DIR) else JOURNAL_NOM_NBA
+)
+FICHIER_MEMOIRE_NBA = "alertes_nba_envoyees.txt"
+JOURNAL_COLONNES_NBA = [
+    "Date", "ID_Match", "Exterieur", "Domicile", "Pari",
+    "Vraie_Cote_Bot", "Cote_Prise", "Cote_CLV",
+    "Mu_Ext", "Mu_Dom", "Edge(%)", "Risque(%)", "Mise_€",
+    "Statut", "P&L", "B2B_Ext", "B2B_Dom", "Confiance_Kelly",
+]
+
+# Mapping tricode nba.com -> nom complet Odds API (basketball_nba, régions eu/us).
+NBA_TEAMS_MAPPING = {
+    "ATL": "Atlanta Hawks", "BOS": "Boston Celtics", "BKN": "Brooklyn Nets",
+    "CHA": "Charlotte Hornets", "CHI": "Chicago Bulls", "CLE": "Cleveland Cavaliers",
+    "DAL": "Dallas Mavericks", "DEN": "Denver Nuggets", "DET": "Detroit Pistons",
+    "GSW": "Golden State Warriors", "HOU": "Houston Rockets", "IND": "Indiana Pacers",
+    "LAC": "LA Clippers", "LAL": "Los Angeles Lakers", "MEM": "Memphis Grizzlies",
+    "MIA": "Miami Heat", "MIL": "Milwaukee Bucks", "MIN": "Minnesota Timberwolves",
+    "NOP": "New Orleans Pelicans", "NYK": "New York Knicks", "OKC": "Oklahoma City Thunder",
+    "ORL": "Orlando Magic", "PHI": "Philadelphia 76ers", "PHX": "Phoenix Suns",
+    "POR": "Portland Trail Blazers", "SAC": "Sacramento Kings", "SAS": "San Antonio Spurs",
+    "TOR": "Toronto Raptors", "UTA": "Utah Jazz", "WAS": "Washington Wizards",
+}
+# Variantes de noms observées côté Odds API (regions eu/us confondues).
+_NBA_ODDS_ALIASES = {
+    "LAC": ["Los Angeles Clippers"],
+}
+_odds_quota_state_nba = {"derniere_alerte": None}
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 NBA_DATA_DIR = os.path.join(_PROJECT_ROOT, "data", "nba")
@@ -955,3 +1039,806 @@ def calculer_probabilites_match_nba(
         "spread": spreads,
         "total": totals,
     }
+
+
+# ==========================================
+# 7. INTEGRATION THE ODDS API (basketball_nba, Pinnacle) + DEVIG + SHRINK
+# ==========================================
+def _cle_nom_odds_nba(nom):
+    """Normalise un nom d'équipe Odds API pour comparaison fuzzy (accents/casse)."""
+    if not nom:
+        return ""
+    return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in str(nom)).split())
+
+
+def _resoudre_tricode_depuis_nom_odds(nom_api):
+    """Résout un nom Odds API ('Los Angeles Lakers') vers notre tricode interne
+    ('LAL'), ou ``None`` si inconnu (déclenche un log de mapping manquant)."""
+    if not nom_api:
+        return None
+    for tricode, full in NBA_TEAMS_MAPPING.items():
+        if full == nom_api:
+            return tricode
+    cle = _cle_nom_odds_nba(nom_api)
+    for tricode, full in NBA_TEAMS_MAPPING.items():
+        if _cle_nom_odds_nba(full) == cle:
+            return tricode
+        for alias in _NBA_ODDS_ALIASES.get(tricode, []):
+            if _cle_nom_odds_nba(alias) == cle:
+                return tricode
+    return None
+
+
+def _parse_pinnacle_game_nba(game):
+    """Parse un événement Odds API (`basketball_nba`) → dict cotes Pinnacle
+    indexé par tricode interne, ou ``None`` si équipes non résolues / pas de
+    cotes Pinnacle h2h disponibles.
+
+    ``spreads`` : ``{ligne_domicile: {"home": cote, "away": cote}}`` — la
+    ligne est déjà exprimée du point de vue domicile (convention identique à
+    `prob_spread_nba`). ``totals`` : ``{ligne: {"over": cote, "under": cote}}``.
+    """
+    home_tri = _resoudre_tricode_depuis_nom_odds(game.get("home_team"))
+    away_tri = _resoudre_tricode_depuis_nom_odds(game.get("away_team"))
+    if not home_tri or not away_tri:
+        return None
+
+    parsed = {"home": home_tri, "away": away_tri, "spreads": {}, "totals": {}}
+    for bookmaker in game.get("bookmakers", []):
+        if bookmaker.get("key") != "pinnacle":
+            continue
+        for market in bookmaker.get("markets", []):
+            key = market.get("key")
+            outcomes = market.get("outcomes", [])
+            if key == "h2h":
+                for o in outcomes:
+                    tri = _resoudre_tricode_depuis_nom_odds(o.get("name"))
+                    if tri == home_tri:
+                        parsed["cote_1"] = float(o["price"])
+                    elif tri == away_tri:
+                        parsed["cote_2"] = float(o["price"])
+            elif key == "spreads":
+                ligne_home, prix_home, prix_away = None, None, None
+                for o in outcomes:
+                    tri = _resoudre_tricode_depuis_nom_odds(o.get("name"))
+                    if tri == home_tri:
+                        ligne_home = o.get("point")
+                        prix_home = o.get("price")
+                    elif tri == away_tri:
+                        prix_away = o.get("price")
+                if ligne_home is not None and prix_home and prix_away:
+                    parsed["spreads"][round(float(ligne_home), 1)] = {
+                        "home": float(prix_home), "away": float(prix_away),
+                    }
+            elif key == "totals":
+                for o in outcomes:
+                    point = o.get("point")
+                    if point is None:
+                        continue
+                    ligne = round(float(point), 1)
+                    side = "over" if str(o.get("name", "")).strip().lower() == "over" else "under"
+                    parsed["totals"].setdefault(ligne, {})[side] = float(o["price"])
+
+    if "cote_1" not in parsed or "cote_2" not in parsed:
+        return None
+    return parsed
+
+
+def _traiter_quota_odds_api_nba(response):
+    """Log le quota mensuel Odds API et alerte Telegram si seuil bas (partagé
+    avec les autres bots du repo, mais loggé/alerté côté canal NBA)."""
+    restant_raw = response.headers.get("x-requests-remaining")
+    if restant_raw is None:
+        return
+    try:
+        restant = int(restant_raw)
+        utilise = int(response.headers.get("x-requests-used", "0"))
+    except ValueError:
+        return
+    log_nba(f"📊 Odds API quota : {restant} restantes ({utilise} utilisées ce mois)")
+    if restant > NBA_ODDS_QUOTA_ALERT:
+        _odds_quota_state_nba["derniere_alerte"] = None
+        return
+    now = datetime.now()
+    last = _odds_quota_state_nba.get("derniere_alerte")
+    if last and (now - last).total_seconds() < 6 * 3600:
+        return
+    _odds_quota_state_nba["derniere_alerte"] = now
+    envoyer_alerte_systeme_nba(
+        f"⚠️ **QUOTA ODDS API BAS**\n\nIl reste **{restant}** requêtes ce mois (seuil {NBA_ODDS_QUOTA_ALERT})."
+    )
+
+
+def fetch_all_pinnacle_odds_nba():
+    """Une seule requête Odds API pour tous les matchs NBA du jour (quota
+    économisé, pattern `fetch_all_pinnacle_odds` NHL)."""
+    if not ODDS_API_KEY:
+        return {}
+    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds/"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "eu",
+        "markets": "h2h,spreads,totals",
+        "bookmakers": "pinnacle",
+        "oddsFormat": "decimal",
+    }
+    cache = {}
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        _traiter_quota_odds_api_nba(response)
+        if response.status_code != 200:
+            log_nba(f"⚠️ Odds API NBA : HTTP {response.status_code}", level="warning")
+            return {}
+        non_resolus = set()
+        for game in response.json():
+            parsed = _parse_pinnacle_game_nba(game)
+            if parsed:
+                cache[(parsed["home"], parsed["away"])] = parsed
+            else:
+                for nom in (game.get("home_team"), game.get("away_team")):
+                    if nom and _resoudre_tricode_depuis_nom_odds(nom) is None:
+                        non_resolus.add(nom)
+        if non_resolus:
+            log_nba(f"⚠️ Noms Odds API NBA non mappés : {', '.join(sorted(non_resolus))}", level="warning")
+        log_nba(f"📡 Odds API NBA : {len(cache)} match(s) Pinnacle indexés")
+        return cache
+    except Exception as e:
+        log_nba(f"⚠️ Erreur Odds API NBA : {e}", level="warning")
+        return {}
+
+
+def get_odds_for_match_nba(home_tricode, away_tricode, odds_cache=None, log_si_absent=False):
+    """Retourne les cotes Pinnacle pour un match (depuis le cache ou une
+    requête dédiée si `odds_cache` est ``None``)."""
+    if odds_cache is None:
+        odds_cache = fetch_all_pinnacle_odds_nba()
+    hit = odds_cache.get((home_tricode, away_tricode))
+    if not hit and log_si_absent:
+        log_nba(f"⚠️ Pas de cotes Pinnacle : {away_tricode} @ {home_tricode}", level="warning")
+    return hit
+
+
+def _poids_confiance_modele_nba(gp_moyen_match):
+    """Confiance modèle croissante avec le volume de données saison (rampe
+    linéaire trust_min → trust_max jusqu'à `NBA_MODEL_TRUST_GP_PLEIN` GP
+    moyen/match) — le reste du poids va à la probabilité no-vig Pinnacle."""
+    if NBA_MODEL_TRUST_GP_PLEIN <= 0:
+        return NBA_MODEL_TRUST_MAX
+    gp = max(gp_moyen_match or 0.0, 0.0)
+    ramp = min(1.0, gp / NBA_MODEL_TRUST_GP_PLEIN)
+    return NBA_MODEL_TRUST_MIN + (NBA_MODEL_TRUST_MAX - NBA_MODEL_TRUST_MIN) * ramp
+
+
+def _blend_proba_marche_nba(p_model_a, p_model_b, cote_a, cote_b, poids_modele):
+    """Blend probabilité modèle / no-vig marché (Shin 2-way), renormalisé à 1."""
+    p_mkt_a, p_mkt_b = proba_no_vig_shin_2way(cote_a, cote_b)
+    if p_mkt_a is None or p_mkt_b is None:
+        return p_model_a, p_model_b
+    p_a = poids_modele * p_model_a + (1.0 - poids_modele) * p_mkt_a
+    p_b = poids_modele * p_model_b + (1.0 - poids_modele) * p_mkt_b
+    total = p_a + p_b
+    if total <= 0:
+        return p_model_a, p_model_b
+    return p_a / total, p_b / total
+
+
+def _blend_avec_push_nba(p_win_model, p_push_model, p_loss_model, cote_win, cote_loss, poids_modele):
+    """Blend modèle/marché pour un marché à 3 issues (win/push/loss, spread ou
+    total sur ligne entière) : le marché (2 prix, sans push explicite) blend
+    la probabilité *conditionnelle* win/loss (hors push) ; `p_push` reste
+    celui du modèle (Pinnacle ne cote pas le push séparément)."""
+    denom = p_win_model + p_loss_model
+    if denom <= 0:
+        return p_win_model, p_push_model, p_loss_model
+    p_win_cond, p_loss_cond = p_win_model / denom, p_loss_model / denom
+    p_win_mkt, p_loss_mkt = proba_no_vig_shin_2way(cote_win, cote_loss)
+    if p_win_mkt is None:
+        return p_win_model, p_push_model, p_loss_model
+    p_win_blend = poids_modele * p_win_cond + (1.0 - poids_modele) * p_win_mkt
+    p_loss_blend = poids_modele * p_loss_cond + (1.0 - poids_modele) * p_loss_mkt
+    s = p_win_blend + p_loss_blend
+    if s <= 0:
+        return p_win_model, p_push_model, p_loss_model
+    scale = 1.0 - p_push_model
+    return (p_win_blend / s) * scale, p_push_model, (p_loss_blend / s) * scale
+
+
+def shrink_probabilites_vers_marche_nba(probas, cotes_match, gp_moyen_match):
+    """Réduit la sur-confiance du modèle en le mélangeant avec la probabilité
+    no-vig Pinnacle (Shin 2-way), pondéré par la maturité de l'échantillon
+    saison (`gp_moyen_match`) — pattern `shrink_cotes_vers_marche` NHL.
+    `mu_home`/`mu_away` restent purs modèle (calibration MLE inchangée)."""
+    if not NBA_MARCHE_SHRINK_ACTIF or not cotes_match:
+        return probas
+    poids = _poids_confiance_modele_nba(gp_moyen_match)
+    resultat = copy.deepcopy(probas)
+
+    if "cote_1" in cotes_match and "cote_2" in cotes_match:
+        p_dom, p_ext = _blend_proba_marche_nba(
+            probas["moneyline"]["domicile"], probas["moneyline"]["exterieur"],
+            cotes_match["cote_1"], cotes_match["cote_2"], poids,
+        )
+        resultat["moneyline"] = {"domicile": round(p_dom, 4), "exterieur": round(p_ext, 4)}
+
+    for ligne, prix in cotes_match.get("spreads", {}).items():
+        probs_ligne = probas.get("spread", {}).get(ligne)
+        if not probs_ligne or "home" not in prix or "away" not in prix:
+            continue
+        p_dom, p_push, p_ext = _blend_avec_push_nba(
+            probs_ligne["domicile"], probs_ligne["push"], probs_ligne["exterieur"],
+            prix["home"], prix["away"], poids,
+        )
+        resultat.setdefault("spread", {})[ligne] = {
+            "domicile": round(p_dom, 4), "push": round(p_push, 4), "exterieur": round(p_ext, 4),
+        }
+
+    for ligne, prix in cotes_match.get("totals", {}).items():
+        probs_ligne = probas.get("total", {}).get(ligne)
+        if not probs_ligne or "over" not in prix or "under" not in prix:
+            continue
+        p_over, p_push, p_under = _blend_avec_push_nba(
+            probs_ligne["over"], probs_ligne["push"], probs_ligne["under"],
+            prix["over"], prix["under"], poids,
+        )
+        resultat.setdefault("total", {})[ligne] = {
+            "over": round(p_over, 4), "push": round(p_push, 4), "under": round(p_under, 4),
+        }
+
+    return resultat
+
+
+# ==========================================
+# 8. EDGE / KELLY / SELECTION DES CANDIDATS
+# ==========================================
+def _edge_minimum_dynamique_nba(gp_moyen):
+    """Edge minimum majoré en début de saison (échantillon faible = incertitude
+    modèle plus grande), rampe linéaire jusqu'à `NBA_EDGE_DYNAMIQUE_GP_PLEIN`
+    GP moyen/match — pattern `_edge_minimum_dynamique` NHL."""
+    if not NBA_EDGE_DYNAMIQUE_ACTIF or NBA_EDGE_DYNAMIQUE_GP_PLEIN <= 0:
+        return NBA_EDGE_MIN
+    gp = max(gp_moyen or 0.0, 0.0)
+    ramp = max(0.0, 1.0 - min(gp, NBA_EDGE_DYNAMIQUE_GP_PLEIN) / NBA_EDGE_DYNAMIQUE_GP_PLEIN)
+    return NBA_EDGE_MIN + NBA_EDGE_DYNAMIQUE_EXTRA * ramp
+
+
+def calculate_kelly_nba(true_prob, book_odds, bankroll, kelly_mult=1.0, gp_moyen=None, edge_min_override=None):
+    """Kelly fractionnel + cap % bankroll — pattern `calculate_kelly` NHL
+    (sans les composantes gardiens, non applicables en NBA v1)."""
+    if book_odds is None or book_odds <= 1.0 or true_prob is None or true_prob <= 0.01 or true_prob >= 0.99:
+        return None
+    edge = true_prob - (1.0 / book_odds)
+    edge_min = _edge_minimum_dynamique_nba(gp_moyen)
+    if edge_min_override is not None:
+        edge_min = max(edge_min, float(edge_min_override))
+    if edge <= edge_min:
+        return None
+    b = book_odds - 1.0
+    fraction_kelly = NBA_KELLY_FRACTION * max(kelly_mult, 0.0)
+    safe_kelly = ((b * true_prob - (1.0 - true_prob)) / b) * fraction_kelly
+    mise_brute = bankroll * safe_kelly
+    if NBA_MISE_MAX_PCT > 0:
+        mise = round(min(mise_brute, bankroll * (NBA_MISE_MAX_PCT / 100.0)), 2)
+    else:
+        mise = round(mise_brute, 2)
+    if mise <= 0:
+        return None
+    pct_effectif = round((mise / bankroll) * 100, 2) if bankroll > 0 else 0.0
+    return {"edge": round(edge * 100, 2), "pct_bankroll": pct_effectif, "mise": mise}
+
+
+def _construire_candidats_pari_nba(m, probas, cotes_match, bankroll, gp_moyen=None, kelly_mult=1.0):
+    """Évalue ML / SPREAD / TOTAL selon `NBA_MARCHES_ACTIFS`, à partir des
+    probabilités déjà shrink (`shrink_probabilites_vers_marche_nba`) et des
+    cotes Pinnacle (`get_odds_for_match_nba`)."""
+    candidats = []
+    kelly_kw = dict(bankroll=bankroll, kelly_mult=kelly_mult, gp_moyen=gp_moyen)
+
+    def _ajouter(marche, type_pari, inv, cote_book, cote_vraie):
+        if not inv:
+            return
+        candidats.append({
+            "type": type_pari, "inv": inv, "cote_book": cote_book, "cote_vraie": cote_vraie, "marche": marche,
+        })
+
+    if "ML" in NBA_MARCHES_ACTIFS and "cote_1" in cotes_match and "cote_2" in cotes_match:
+        p_dom = probas["moneyline"]["domicile"]
+        p_ext = probas["moneyline"]["exterieur"]
+        inv = calculate_kelly_nba(p_dom, cotes_match["cote_1"], **kelly_kw)
+        _ajouter("ML", f"Victoire {m['home']}", inv, cotes_match["cote_1"], round(1 / max(p_dom, 0.001), 2))
+        inv = calculate_kelly_nba(p_ext, cotes_match["cote_2"], **kelly_kw)
+        _ajouter("ML", f"Victoire {m['away']}", inv, cotes_match["cote_2"], round(1 / max(p_ext, 0.001), 2))
+
+    if "SPREAD" in NBA_MARCHES_ACTIFS:
+        for ligne, prix in cotes_match.get("spreads", {}).items():
+            probs_ligne = probas.get("spread", {}).get(ligne)
+            if not probs_ligne:
+                continue
+            if "home" in prix:
+                inv = calculate_kelly_nba(probs_ligne["domicile"], prix["home"], **kelly_kw)
+                _ajouter(
+                    "SPREAD", f"{m['home']} {ligne:+g}", inv, prix["home"],
+                    round(1 / max(probs_ligne["domicile"], 0.001), 2),
+                )
+            if "away" in prix:
+                inv = calculate_kelly_nba(probs_ligne["exterieur"], prix["away"], **kelly_kw)
+                _ajouter(
+                    "SPREAD", f"{m['away']} {-ligne:+g}", inv, prix["away"],
+                    round(1 / max(probs_ligne["exterieur"], 0.001), 2),
+                )
+
+    if "TOTAL" in NBA_MARCHES_ACTIFS:
+        for ligne, prix in cotes_match.get("totals", {}).items():
+            probs_ligne = probas.get("total", {}).get(ligne)
+            if not probs_ligne:
+                continue
+            if "over" in prix:
+                inv = calculate_kelly_nba(probs_ligne["over"], prix["over"], **kelly_kw)
+                _ajouter(
+                    "TOTAL", f"OVER {ligne:g}", inv, prix["over"], round(1 / max(probs_ligne["over"], 0.001), 2),
+                )
+            if "under" in prix:
+                inv = calculate_kelly_nba(probs_ligne["under"], prix["under"], **kelly_kw)
+                _ajouter(
+                    "TOTAL", f"UNDER {ligne:g}", inv, prix["under"], round(1 / max(probs_ligne["under"], 0.001), 2),
+                )
+
+    return candidats
+
+
+def _choisir_meilleur_pari_nba(candidats):
+    best, max_edge = None, 0.0
+    for cand in candidats:
+        inv = cand.get("inv")
+        if inv and inv["edge"] > max_edge:
+            max_edge = inv["edge"]
+            best = cand
+    return best
+
+
+def _selectionner_paris_nba(candidats):
+    """Max-edge seul, ou tous les candidats (paper trading — `NBA_TOUS_CANDIDATS_ACTIF`)."""
+    if not candidats:
+        return []
+    if NBA_TOUS_CANDIDATS_ACTIF:
+        return list(candidats)
+    best = _choisir_meilleur_pari_nba(candidats)
+    return [best] if best else []
+
+
+# ==========================================
+# 9. JOURNAL DE TRADING, TELEGRAM & BOUCLE LIVE
+# ==========================================
+def match_deja_notifie_nba(id_match):
+    if not os.path.exists(FICHIER_MEMOIRE_NBA):
+        return False
+    with open(FICHIER_MEMOIRE_NBA, "r", encoding="utf-8") as f:
+        return id_match in f.read()
+
+
+def enregistrer_notification_nba(id_match):
+    with open(FICHIER_MEMOIRE_NBA, "a", encoding="utf-8") as f:
+        f.write(id_match + "\n")
+
+
+def publier_journal_dashboard_nba():
+    """Upload FTP optionnel du journal vers PythonAnywhere (pattern NHL/foot) —
+    no-op si le journal est déjà écrit directement dans `PA_DATA_DIR`."""
+    if os.path.isdir(PA_DATA_DIR) and FICHIER_JOURNAL_NBA.startswith(PA_DATA_DIR):
+        return
+    if not os.path.exists(FICHIER_JOURNAL_NBA):
+        return
+    ftp_user = os.environ.get("PA_FTP_USER", "")
+    ftp_pass = os.environ.get("PA_FTP_PASSWORD", "")
+    if not ftp_user or not ftp_pass:
+        return
+    import ftplib
+    ftp_host = os.environ.get("PA_FTP_HOST", "ftp.pythonanywhere.com")
+    remote_dir = os.environ.get("PA_FTP_REMOTE_DIR", "/home/chienblanc/data")
+    remote_name = os.path.basename(FICHIER_JOURNAL_NBA)
+    try:
+        with ftplib.FTP(ftp_host, timeout=30) as ftp:
+            ftp.login(ftp_user, ftp_pass)
+            ftp.cwd(remote_dir)
+            with open(FICHIER_JOURNAL_NBA, "rb") as f:
+                ftp.storbinary(f"STOR {remote_name}", f)
+        log_nba(f"📤 Journal NBA uploadé → {ftp_host}{remote_dir}/{remote_name}")
+    except Exception as e:
+        log_nba(f"⚠️ Upload FTP journal NBA échoué : {e}", level="warning")
+
+
+def enregistrer_transaction_nba(
+    id_match, ext, dom, type_pari, vraie_cote_pari, investissement, cote_bookmaker,
+    mu_ext=None, mu_dom=None, b2b_ext=False, b2b_dom=False,
+):
+    fichier_existe = os.path.isfile(FICHIER_JOURNAL_NBA)
+    row = {
+        "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "ID_Match": id_match,
+        "Exterieur": ext,
+        "Domicile": dom,
+        "Pari": type_pari,
+        "Vraie_Cote_Bot": vraie_cote_pari,
+        "Cote_Prise": cote_bookmaker,
+        "Cote_CLV": cote_bookmaker,
+        "Mu_Ext": mu_ext,
+        "Mu_Dom": mu_dom,
+        "Edge(%)": investissement["edge"],
+        "Risque(%)": investissement["pct_bankroll"],
+        "Mise_€": investissement["mise"],
+        "Statut": "EN ATTENTE",
+        "P&L": "0.00",
+        "B2B_Ext": "OUI" if b2b_ext else "NON",
+        "B2B_Dom": "OUI" if b2b_dom else "NON",
+        "Confiance_Kelly": 1.0,
+    }
+    with open(FICHIER_JOURNAL_NBA, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA, extrasaction="ignore")
+        if not fichier_existe:
+            writer.writeheader()
+        writer.writerow(row)
+    publier_journal_dashboard_nba()
+
+
+def envoyer_alerte_systeme_nba(message):
+    if not NBA_TELEGRAM_TOKEN or not NBA_TELEGRAM_CHAT_ID:
+        log_nba(f"⚠️ Alerte système NBA (Telegram absent) : {message}", level="warning")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{NBA_TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": NBA_TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+    except Exception as e:
+        log_nba(f"⚠️ Erreur Telegram système NBA : {e}", level="warning")
+
+
+def envoyer_alerte_nba(ext, dom, vraie_cote_pari, investissement, type_pari, dry_run=False):
+    if not NBA_TELEGRAM_TOKEN or not NBA_TELEGRAM_CHAT_ID:
+        log_nba("⚠️ Telegram NBA non configuré — alerte non envoyée.", level="warning")
+        return
+    prefix = "🧪 **[DRY RUN — SIMULATION]**\n\n" if dry_run else ""
+    msg = (
+        prefix + f"🚨 **SNIPER NBA DÉCLENCHÉ** 🚨\n\nExt: 🏀 **{ext}**\nDom: 🏠 **{dom}**\n"
+        f"──────────────\n🎯 **ORDRE : PARIER {type_pari}**\n"
+        f"🔥 Edge : **+{investissement['edge']}%**\n⚖️ Kelly : **{investissement['pct_bankroll']}%**\n"
+        f"💵 **MISE : {investissement['mise']} €**\n──────────────\n📊 True Odds: {vraie_cote_pari}"
+    )
+    if dry_run:
+        msg += "\n\n_(Paper / DRY RUN — journal écrit, pas de mise réelle)_"
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{NBA_TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": NBA_TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+    except Exception as e:
+        log_nba(f"⚠️ Erreur Telegram NBA : {e}", level="warning")
+
+
+def compter_paris_en_attente_nba():
+    if not os.path.exists(FICHIER_JOURNAL_NBA):
+        return 0
+    try:
+        with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+            return sum(1 for row in csv.DictReader(f) if row.get("Statut") == "EN ATTENTE")
+    except Exception:
+        return 0
+
+
+def _extraire_cote_clv_nba(home, away, type_pari, cote_actuelle, odds_cache=None):
+    """Cote Pinnacle actuelle pour un pari en attente — approximation v1 par
+    parsing du libellé `Pari` (pas de ligne stockée séparément dans le journal)."""
+    cotes = get_odds_for_match_nba(home, away, odds_cache)
+    if not cotes:
+        return cote_actuelle
+    tp = str(type_pari).strip()
+    tp_upper = tp.upper()
+
+    if tp_upper.startswith("OVER") or tp_upper.startswith("UNDER"):
+        m = re.search(r"[-+]?\d+\.?\d*", tp)
+        if not m:
+            return cote_actuelle
+        ligne = round(float(m.group()), 1)
+        side = "over" if tp_upper.startswith("OVER") else "under"
+        prix = cotes.get("totals", {}).get(ligne)
+        return str(prix[side]) if prix and side in prix else cote_actuelle
+
+    if tp_upper.startswith("VICTOIRE"):
+        if home in tp and "cote_1" in cotes:
+            return str(cotes["cote_1"])
+        if away in tp and "cote_2" in cotes:
+            return str(cotes["cote_2"])
+        return cote_actuelle
+
+    m = re.search(r"[-+]\d+\.?\d*$", tp)
+    if not m:
+        return cote_actuelle
+    ligne = float(m.group())
+    if home in tp:
+        prix = cotes.get("spreads", {}).get(round(ligne, 1))
+        return str(prix["home"]) if prix and "home" in prix else cote_actuelle
+    if away in tp:
+        prix = cotes.get("spreads", {}).get(round(-ligne, 1))
+        return str(prix["away"]) if prix and "away" in prix else cote_actuelle
+    return cote_actuelle
+
+
+def traquer_et_actualiser_clv_nba():
+    if not os.path.exists(FICHIER_JOURNAL_NBA):
+        return
+    odds_cache = fetch_all_pinnacle_odds_nba()
+    rows, maj = [], False
+    with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("Statut") == "EN ATTENTE":
+                dom, ext, type_pari = row.get("Domicile"), row.get("Exterieur"), row.get("Pari")
+                nv_cote = _extraire_cote_clv_nba(dom, ext, type_pari, row.get("Cote_CLV"), odds_cache)
+                if nv_cote != row.get("Cote_CLV"):
+                    row["Cote_CLV"] = nv_cote
+                    maj = True
+            rows.append(row)
+    if maj:
+        with open(FICHIER_JOURNAL_NBA, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        publier_journal_dashboard_nba()
+
+
+def calculer_bankroll_dynamique_nba(capital_de_base=None):
+    capital_de_base = NBA_BANKROLL if capital_de_base is None else capital_de_base
+    if not os.path.exists(FICHIER_JOURNAL_NBA):
+        return capital_de_base
+    profit_total = 0.0
+    try:
+        with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("Statut") in ("GAGNÉ", "PERDU"):
+                    profit_total += float(row["P&L"])
+        return round(max(capital_de_base + profit_total, 10.0), 2)
+    except Exception as e:
+        log_nba(f"⚠️ Erreur calcul bankroll NBA : {e}", level="warning")
+        return capital_de_base
+
+
+def get_match_result_nba(game_id):
+    """Score final `(score_away, score_home)` si le match est terminé
+    (`gameStatus == 3`, module live cdn.nba.com), sinon ``None``."""
+    try:
+        from nba_api.live.nba.endpoints import boxscore as live_boxscore
+        r = live_boxscore.BoxScore(game_id=str(game_id), timeout=15)
+        d = r.get_dict()
+        game = d.get("game", {})
+        if game.get("gameStatus") != 3:
+            return None
+        home = game.get("homeTeam", {})
+        away = game.get("awayTeam", {})
+        return int(away.get("score", 0)), int(home.get("score", 0))
+    except Exception:
+        return None
+
+
+def regler_pari_nba(pari, home, away, score_home, score_away):
+    """Règle un pari (libellé `Pari` du journal) selon le score final — pure
+    fonction réutilisée par le bot live (`lancer_la_balayeuse_nba`) ET le
+    backtest (`backtest_nba.py`), garantissant la parité de règlement.
+
+    Retourne ``(gagne: bool, push: bool)``.
+    """
+    pari_upper = str(pari).upper()
+    if pari_upper.startswith("VICTOIRE"):
+        gagne = (score_home > score_away and home in pari) or (score_away > score_home and away in pari)
+        return gagne, False
+
+    if pari_upper.startswith("OVER") or pari_upper.startswith("UNDER"):
+        m = re.search(r"[-+]?\d+\.?\d*", pari)
+        cut = float(m.group()) if m else None
+        total_pts = score_home + score_away
+        if cut is None:
+            return False, False
+        if total_pts == cut:
+            return False, True
+        if pari_upper.startswith("OVER"):
+            return total_pts > cut, False
+        return total_pts < cut, False
+
+    m = re.search(r"[-+]\d+\.?\d*$", pari)
+    ligne = float(m.group()) if m else None
+    if ligne is None:
+        return False, False
+    marge = (score_home - score_away) if home in pari else (score_away - score_home)
+    couverture = marge + ligne
+    if couverture == 0:
+        return False, True
+    return couverture > 0, False
+
+
+def lancer_la_balayeuse_nba():
+    """Règle les paris `EN ATTENTE` dont le match est terminé (ML/SPREAD/TOTAL,
+    avec gestion du push) — pattern `lancer_la_balayeuse` NHL."""
+    if not os.path.exists(FICHIER_JOURNAL_NBA):
+        return
+    rows, modifie = [], False
+    with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("Statut") != "EN ATTENTE":
+                rows.append(row)
+                continue
+            game_id = str(row["ID_Match"]).split("|")[0]
+            res = get_match_result_nba(game_id)
+            if not res:
+                rows.append(row)
+                continue
+            modifie = True
+            score_ext, score_dom = res
+            ext, dom, pari = row["Exterieur"], row["Domicile"], row["Pari"]
+            mise, cote_book = float(row["Mise_€"]), float(row["Cote_Prise"])
+            gagne, push = regler_pari_nba(pari, dom, ext, score_dom, score_ext)
+
+            if push:
+                row["Statut"] = "PUSH"
+                row["P&L"] = "0.00"
+            else:
+                row["Statut"] = "GAGNÉ" if gagne else "PERDU"
+                row["P&L"] = f"{round(mise * (cote_book - 1), 2) if gagne else -mise}"
+            rows.append(row)
+    if modifie:
+        with open(FICHIER_JOURNAL_NBA, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        publier_journal_dashboard_nba()
+
+
+def _parse_utc_nba(date_str):
+    if not date_str:
+        return None
+    try:
+        return datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def get_nba_games_today():
+    """Programme du jour (module live cdn.nba.com), filtré aux matchs pas
+    encore terminés et dans la fenêtre `NBA_SCAN_HEURES_AVANCE`."""
+    matchs = fetch_live_scoreboard()
+    if not matchs:
+        return []
+    maintenant = datetime.now(timezone.utc)
+    eligibles = []
+    for m in matchs:
+        if "final" in str(m.get("statut", "")).strip().lower():
+            continue
+        date_utc = _parse_utc_nba(m.get("date_utc"))
+        if date_utc and (date_utc - maintenant).total_seconds() / 3600.0 > NBA_SCAN_HEURES_AVANCE:
+            continue
+        eligibles.append(m)
+    return eligibles
+
+
+def _executer_opportunite_nba(opp):
+    """Envoie Telegram + journal pour une opportunité validée."""
+    home, away = opp["home"], opp["away"]
+    best = opp["best_pari"]
+    log_nba(
+        f"🎯 Edge {best['inv']['edge']}% [{best.get('marche', '?')}] — "
+        f"{best['type']} ({away} @ {home}) mise {best['inv']['mise']} €"
+        + (" [DRY RUN]" if NBA_DRY_RUN else "")
+    )
+    envoyer_alerte_nba(away, home, best["cote_vraie"], best["inv"], best["type"], dry_run=NBA_DRY_RUN)
+    enregistrer_transaction_nba(
+        opp["id_match"], away, home, best["type"], best["cote_vraie"], best["inv"], best["cote_book"],
+        mu_ext=opp.get("mu_away"), mu_dom=opp.get("mu_home"),
+        b2b_ext=opp.get("away_b2b", False), b2b_dom=opp.get("home_b2b", False),
+    )
+    enregistrer_notification_nba(opp["id_match"])
+
+
+def run_sniper_nba():
+    """Boucle live principale — scan du programme du jour, cotes Pinnacle,
+    moteur mathématique + shrink marché, edge/Kelly, journal + Telegram
+    (paper trading `NBA_DRY_RUN`, pattern `run_sniper` NHL)."""
+    mode = "DRY RUN (paper trading)" if NBA_DRY_RUN else "LIVE"
+    log_nba(f"🤖 Lancement Sniper NBA — mode {mode}")
+    if NBA_DRY_RUN:
+        log_nba("🧪 NBA_DRY_RUN actif : Telegram paper + écriture journal (pas de mise réelle).")
+    if NBA_TOUS_CANDIDATS_ACTIF:
+        log_nba("📚 Tous candidats actifs — chaque edge valide est pris (pas seulement le max du match).")
+    cap_label = f"{NBA_MISE_MAX_PCT}% bankroll" if NBA_MISE_MAX_PCT > 0 else "Kelly pur (pas de cap %)"
+    log_nba(f"💶 Cap mise : {cap_label} | journal → {FICHIER_JOURNAL_NBA}")
+    log_nba(
+        f"🎯 Marchés actifs : {', '.join(sorted(NBA_MARCHES_ACTIFS)) or 'aucun'} | "
+        f"edge min {NBA_EDGE_MIN:.0%}"
+        + (
+            f" + dynamique jusqu'à +{NBA_EDGE_DYNAMIQUE_EXTRA:.0%} à 0 GP → plein à "
+            f"{NBA_EDGE_DYNAMIQUE_GP_PLEIN:.0f} GP moy./match" if NBA_EDGE_DYNAMIQUE_ACTIF else ""
+        )
+    )
+    if NBA_MARCHE_SHRINK_ACTIF:
+        log_nba(
+            f"⚖️ Shrinkage marché actif — confiance modèle {NBA_MODEL_TRUST_MIN:.0%} à 0 GP → "
+            f"{NBA_MODEL_TRUST_MAX:.0%} à {NBA_MODEL_TRUST_GP_PLEIN:.0f}+ GP (reste : no-vig Pinnacle Shin)"
+        )
+
+    while True:
+        try:
+            lancer_la_balayeuse_nba()
+            _invalider_pit_index_memo()
+
+            nb_attente = compter_paris_en_attente_nba()
+            log_nba(f"🕵️ Tracking CLV ({nb_attente} pari(s) en attente)...")
+            traquer_et_actualiser_clv_nba()
+
+            bankroll_actuelle = calculer_bankroll_dynamique_nba()
+            log_nba(f"💰 Capital Dynamique Disponible : {bankroll_actuelle} €")
+
+            odds_cache = fetch_all_pinnacle_odds_nba()
+            matchs = get_nba_games_today()
+            opportunites = []
+
+            if not matchs:
+                log_nba("🏀 Aucun match NBA éligible dans la fenêtre de scan — veille active.")
+            else:
+                log_nba(f"🏀 {len(matchs)} match(s) dans la fenêtre de scan.")
+
+            for m in matchs:
+                home, away = m.get("domicile"), m.get("exterieur")
+                if not home or not away:
+                    continue
+                cotes_match = get_odds_for_match_nba(home, away, odds_cache, log_si_absent=True)
+                if not cotes_match:
+                    continue
+
+                date_ref = (m.get("date_utc") or datetime.now(timezone.utc).isoformat())[:10]
+                lignes_spread = list(cotes_match.get("spreads", {}).keys())
+                lignes_total = list(cotes_match.get("totals", {}).keys())
+                probas = calculer_probabilites_match_nba(
+                    home, away, date_ref, lignes_spread=lignes_spread, lignes_total=lignes_total,
+                )
+                gp_moyen = (probas["rating_home"].get("gp", 0) + probas["rating_away"].get("gp", 0)) / 2.0
+                probas_shrink = shrink_probabilites_vers_marche_nba(probas, cotes_match, gp_moyen)
+
+                candidats = _construire_candidats_pari_nba(
+                    {"home": home, "away": away}, probas_shrink, cotes_match, bankroll_actuelle, gp_moyen,
+                )
+                paris_retenus = _selectionner_paris_nba(candidats)
+                if not paris_retenus:
+                    log_nba(
+                        f"— Pas d'edge ≥ {_edge_minimum_dynamique_nba(gp_moyen):.0%} "
+                        f"(GP moy {gp_moyen:.0f}) — {away} @ {home}"
+                    )
+                    continue
+
+                for pari in paris_retenus:
+                    id_signal = f"{m['game_id']}|{pari['type']}"
+                    if match_deja_notifie_nba(id_signal):
+                        continue
+                    opportunites.append({
+                        "home": home, "away": away, "id_match": id_signal, "best_pari": pari,
+                        "mu_home": probas.get("mu_home"), "mu_away": probas.get("mu_away"),
+                        "home_b2b": probas.get("home_b2b", False), "away_b2b": probas.get("away_b2b", False),
+                    })
+
+            for opp in opportunites:
+                _executer_opportunite_nba(opp)
+
+            time.sleep(900)
+        except Exception as e:
+            log_nba(f"⚠️ Erreur système NBA : {e}", level="error")
+            traceback.print_exc()
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    manquants = []
+    if not ODDS_API_KEY:
+        manquants.append("API_ODDS_KEY")
+    if not NBA_TELEGRAM_TOKEN:
+        manquants.append("NBA_TELEGRAM_TOKEN/TELEGRAM_TOKEN")
+    if not NBA_TELEGRAM_CHAT_ID:
+        manquants.append("NBA_TELEGRAM_CHAT_ID/TELEGRAM_CHAT_ID")
+    if manquants:
+        log_nba(f"⚠️ Variables manquantes ({', '.join(manquants)}) — vérifier {load_project_env}", level="warning")
+    run_sniper_nba()
