@@ -188,6 +188,35 @@ Un seul palier restant avant le niveau max.
 
 ---
 
+## 🔫 SOR-556 MK2 (Fusil d'assaut) — Niveau 27
+
+*#8 Long Range, A-Tier. Le build méta officiel nécessite le niveau 28 (canon) et 38 (silencieux) — substituts temporaires ci-dessous.*
+
+### Build adapté niveau 27
+
+| Slot | Attachement | Coût | Niveau |
+|---|---|---|---|
+| Canon | 18" US-LB (substitut) | ~10 | 9 |
+| Poignée | 6H64 Vertical | 25 | 8 |
+| Munitions | FMJ | 5 | 0 |
+| Bouche | Standard Suppressor (substitut) | 20 | 7 |
+| Chargeur | 36RND Magazine | 15 | 12 |
+| Ergonomie | Rail Cover | 5 | Défi Season 1 HW2 |
+| Optique | Baker 3.00x | 10 | 15 |
+| **Total** | | **~90 / 100** | |
+
+### Reste à débloquer (priorité)
+
+| Niveau | Attachement | Intérêt |
+|---|---|---|
+| **28** | **18" Custom** | À 1 niveau seulement — remplace 18" US-LB immédiatement |
+| 30 | Full Angled / Polymer Case | Alternatives poignée/munitions |
+| 33 | Classic Vertical | Meilleur contrôle pur |
+| 34 | Long Suppressor | Silencieux intermédiaire |
+| **38** | **Lightened Suppressor** | Objectif final du build méta complet |
+
+---
+
 ## 🔫 M87A1 (Shotgun — Assaut) — Niveau 9
 
 ### Build unique (identique BR/Ranked/Big Maps/Small Maps)
