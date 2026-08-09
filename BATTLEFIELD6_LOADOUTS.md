@@ -88,6 +88,42 @@ Récapitulatif des configurations optimales pour chaque arme, avec le budget de 
 
 ---
 
+## 🔫 DRS-IAR (LMG — Support) — Niveau max (40)
+
+*#1 Long Range, tier META. Tous les attachements du jeu sont débloqués pour cette arme.*
+
+### Build Conquête / Grandes cartes (recommandé)
+
+| Slot | Attachement | Coût | Niveau |
+|---|---|---|---|
+| Canon | 20" SDM-R | 10 | 14 |
+| Poignée | Stippled Stubby | 35 | 36 |
+| Munitions | FMJ | 5 | 0 |
+| Bouche | Standard Suppressor | 20 | 24 |
+| Chargeur | 36 RND | 15 | 12 |
+| Ergonomie | Rail Cover | 5 | Défi Season 1 HW2 |
+| Optique | RO-M 1.75x | 10 | 2 |
+| **Total** | | **100 / 100** | |
+
+### Build polyvalent (Multijoueur générique / Ranked)
+
+| Slot | Attachement | Coût | Niveau |
+|---|---|---|---|
+| Canon | 20" SDM-R | 10 | 14 |
+| Poignée | 6H64 Vertical | 25 | 13 |
+| Munitions | FMJ | 5 | 0 |
+| Bouche | Lightened Suppressor | 30 | 39 |
+| Chargeur | 36 RND | 15 | 12 |
+| Ergonomie | Rail Cover | 5 | Défi Season 1 HW2 |
+| Optique | Baker 3.00x | 10 | 17 |
+| **Total** | | **100 / 100** | |
+
+### Reste à débloquer
+
+**Rien** — arme au niveau maximum, tous les attachements sont accessibles. Seul `Rail Cover` dépend d'un défi (Season 1 Hardware 2) plutôt que du niveau ; si non complété, retirer ce slot (build à 95/100, impact mineur).
+
+---
+
 ## 🔫 M87A1 (Shotgun — Assaut) — Niveau 9
 
 ### Build unique (identique BR/Ranked/Big Maps/Small Maps)
