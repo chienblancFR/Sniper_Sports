@@ -124,6 +124,32 @@ Récapitulatif des configurations optimales pour chaque arme, avec le budget de 
 
 ---
 
+## 🔫 M39 EMR (DMR semi-auto) — Niveau max (40)
+
+*#2 Long Range, A-Tier. Build identique sur tous les modes (BR/Ranked/Big Maps/Small Maps) — pas de variante Conquête spécifique nécessaire.*
+
+### Build optimal
+
+| Slot | Attachement | Coût | Niveau |
+|---|---|---|---|
+| Canon | Extended | 5 | 0 |
+| Poignée | Low-Profile Stubby | 45 | 32 |
+| Munitions | FMJ | 5 | 0 |
+| Bouche | Lightened Suppressor | 30 | 6 |
+| Chargeur | 20RND Magazine | 5 | 0 |
+| Optique | Baker 3.00x | 10 | 5 |
+| **Total** | | **100 / 100** | |
+
+### Alternative "Lowest Recoil / Fastest ADS" (nécessite défis saisonniers)
+
+Remplace `Lightened Suppressor` (30) par `Flash Comp` (20, défi Season 2 HW3) + `50 MW Violet` (10, défi Season 2 HW1) — meilleur contrôle pur au prix de la discrétion.
+
+### Reste à débloquer
+
+**Rien** — arme au niveau maximum, tous les attachements sont accessibles.
+
+---
+
 ## 🔫 M87A1 (Shotgun — Assaut) — Niveau 9
 
 ### Build unique (identique BR/Ranked/Big Maps/Small Maps)
