@@ -150,6 +150,44 @@ Remplace `Lightened Suppressor` (30) par `Flash Comp` (20, défi Season 2 HW3) +
 
 ---
 
+## 🔫 M433 (Fusil d'assaut) — Niveau 39
+
+*#9 Long Range, A-Tier.*
+
+### Build Conquête / Grandes cartes (recommandé, nécessite un défi)
+
+| Slot | Attachement | Coût | Niveau |
+|---|---|---|---|
+| Canon | 18.9" Prototype | 5 | 5 |
+| Poignée | Low-Profile Stubby | 45 | 30 |
+| Munitions | FMJ | 5 | 0 |
+| Bouche | Flash Comp | 20 | Défi Season 2 HW3 |
+| Chargeur | 36RND Magazine | 15 | 31 |
+| Optique | RO-S 1.25x | 10 | 29 |
+| **Total** | | **100 / 100** | |
+
+### Build alternatif (100% débloqué par niveau, sans défi requis)
+
+| Slot | Attachement | Coût | Niveau |
+|---|---|---|---|
+| Canon | 18.9" Prototype | 5 | 5 |
+| Poignée | Classic Vertical | 35 | 1 |
+| Munitions | FMJ | 5 | 0 |
+| Bouche | Lightened Suppressor | 30 | 35 |
+| Chargeur | 36RND Magazine | 15 | 31 |
+| Optique | RO-M 1.75x | 10 | 21 |
+| **Total** | | **100 / 100** | |
+
+### Reste à débloquer (niveau max 40)
+
+| Niveau | Attachement |
+|---|---|
+| 40 | GRIM 1.50X (dernière optique) |
+
+Un seul palier restant avant le niveau max.
+
+---
+
 ## 🔫 M87A1 (Shotgun — Assaut) — Niveau 9
 
 ### Build unique (identique BR/Ranked/Big Maps/Small Maps)
