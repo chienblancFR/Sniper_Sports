@@ -5,28 +5,28 @@ Référence complète de l'arsenal BF4 (~95 armes) : base + China Rising, Second
 ## Méthodologie (comment lire)
 
 - **Déblocage** : contrairement à BF6, pas de budget de points. Les accessoires se débloquent **par kills avec l'arme** (paliers ~10 kills, ordre fixe par arme) + **battlepacks d'arme** (drops aléatoires qui peuvent avancer le build). Tant qu'un accessoire n'est pas dispo, garde le slot de base — l'impact est mineur sauf pour le grip et le canon.
-- **4 slots** : Optique / Accessoire (rail supérieur : laser, viseur incliné, zoom variable…) / Canon (bouche) / Sous-canon (poignées, bipied). Fusils à pompe : le slot canon = choke, + choix de munitions.
+- **4 slots** : Optique / Accessoire (rail supérieur : Laser, Canted Ironsights, Variable Zoom…) / Canon (bouche) / Sous-canon (grips, Bipod). Fusils à pompe : le slot canon = choke, + choix de munitions.
 - Optique : question de goût pour le point rouge (**Reflex / Kobra / Coyote** = équivalents). Je note "RDS" ; mets celui que tu préfères.
 
 ### Effets clés des accessoires (équilibrage final)
 
 | Accessoire | Effet | Contrepartie |
 |---|---|---|
-| **Compensateur** | Réduit fortement le recul horizontal | Légère perte de précision ADS |
-| **Frein de bouche (Muzzle Brake)** | Réduit le recul vertical | Légère perte de précision en rafale |
-| **Canon lourd (Heavy Barrel)** | Précision ADS maximale (tap / burst longue distance) | Recul un peu plus fort |
-| **Silencieux** | Invisible minimap, flash caché | Portée / vélocité réduites (malus faible sur PDW) |
-| **Cache-flash** | Cache le flash, quasi sans malus | Reste visible minimap |
-| **Poignée inclinée (Angled)** | −33 % recul du premier tir → tap fire / burst | — |
-| **Poignée trapue (Stubby)** | Moins de dispersion en full auto | — |
-| **Poignée ergo / pliante** | Précision ADS en mouvement | — |
-| **Poignée verticale** | Meilleur tir à la hanche | — |
-| **Laser** | Tir à la hanche resserré (~ −25 %) | Visible (désactivable touche T) |
+| **Compensator** | Réduit fortement le recul horizontal | Légère perte de précision ADS |
+| **Muzzle Brake** | Réduit le recul vertical | Légère perte de précision en rafale |
+| **Heavy Barrel** | Précision ADS maximale (tap / burst longue distance) | Recul un peu plus fort |
+| **Suppressor** | Invisible minimap, flash caché | Portée / vélocité réduites (malus faible sur PDW) |
+| **Flash Hider** | Cache le flash, quasi sans malus | Reste visible minimap |
+| **Angled Grip** | −33 % recul du premier tir → tap fire / burst | — |
+| **Stubby Grip** | Moins de dispersion en full auto | — |
+| **Ergo / Folding Grip** | Précision ADS en mouvement | — |
+| **Vertical Grip** | Meilleur tir à la hanche | — |
+| **Laser Sight** | Tir à la hanche resserré (~ −25 %) | Visible (désactivable touche T) |
 
 **Les 3 combos méta :**
-1. **Full auto spam (CQB / ROF élevé)** → Compensateur + Stubby + Laser
-2. **Tap / burst mi-longue** → Canon lourd + Angled + optique 3.4x/4x
-3. **Furtif** → Silencieux + Stubby/Angled + laser off
+1. **Full auto spam (CQB / ROF élevé)** → Compensator + Stubby + Laser
+2. **Tap / burst mi-longue** → Heavy Barrel + Angled + optique 3.4x/4x
+3. **Furtif** → Suppressor + Stubby/Angled + laser off
 
 ---
 
@@ -68,13 +68,13 @@ Référence complète de l'arsenal BF4 (~95 armes) : base + China Rising, Second
 | PDW-R | PDW | A | Portée PDW |
 | MP7 | PDW | A | CQB |
 | SR-2 | PDW | A | CQB |
-| AS VAL | PDW | A | Furtif (silencieux fixe) |
+| AS VAL | PDW | A | Furtif (suppressor fixe) |
 | UMP-45 | PDW | B+ | Dégâts lents |
 | CBJ-MS | PDW | B | — |
 | JS2 | PDW | B | — |
 | UMP-9 | PDW | B | — |
 | PP-2000 | PDW | B | — |
-| Groza-4 | PDW | B | Furtif (silencieux fixe) |
+| Groza-4 | PDW | B | Furtif (suppressor fixe) |
 | AWS | LMG | **S** | LMG-SMG 1000 RPM |
 | U-100 MK5 | LMG | A | Précision chargeur |
 | M240B | LMG | A | Suppression 950 RPM |
@@ -134,14 +134,14 @@ Référence complète de l'arsenal BF4 (~95 armes) : base + China Rising, Second
 
 ## 🔫 Fusils d'assaut (Assaut)
 
-**Méta catégorie** : Compensateur + Stubby sur tout ce qui tire vite ; Canon lourd + Angled sur les armes précises / burst.
+**Méta catégorie** : Compensator + Stubby sur tout ce qui tire vite ; Heavy Barrel + Angled sur les armes précises / burst.
 
 ### ACE 23 — S, le meilleur AR du jeu
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS (Reflex/Kobra) | ACOG 4x longue carte |
-| Canon | Compensateur | Canon lourd (tap fire) |
+| Canon | Compensator | Heavy Barrel (tap fire) |
 | Sous-canon | Stubby | Angled |
 | Accessoire | Laser | — |
 
@@ -152,18 +152,18 @@ Précis, rapide (770 RPM), chargeur 30 : il fait tout. Le build laser polyvalent
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | HD-33 1x |
-| Canon | Compensateur | — (obligatoire) |
+| Canon | Compensator | — (obligatoire) |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
-900 RPM, recul violent : Compensateur + Stubby non négociables. Mortel à courte-moyenne portée.
+900 RPM, recul violent : Compensator + Stubby non négociables. Mortel à courte-moyenne portée.
 
 ### M416 — A, polyvalent fiable
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | ACOG 4x |
-| Canon | Compensateur | Canon lourd |
+| Canon | Compensator | Heavy Barrel |
 | Sous-canon | Stubby | Angled |
 | Accessoire | Laser | — |
 
@@ -174,7 +174,7 @@ Précis, rapide (770 RPM), chargeur 30 : il fait tout. Le build laser polyvalent
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | Kobra |
-| Canon | Compensateur | Frein de bouche |
+| Canon | Compensator | Muzzle Brake |
 | Sous-canon | Stubby | Angled |
 | Accessoire | Laser | — |
 
@@ -185,18 +185,18 @@ Recul horizontal déjà faible ; le mode burst 3 coups est très propre à dista
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / ACOG 4x | HD-33 |
-| Canon | Frein de bouche | Canon lourd |
+| Canon | Muzzle Brake | Heavy Barrel |
 | Sous-canon | Angled | Stubby |
 | Accessoire | Laser | — |
 
-Calibre 7.62 : tue en 3-4 balles. Recul vertical fort → frein de bouche + tirs courts.
+Calibre 7.62 : tue en 3-4 balles. Recul vertical fort → Muzzle Brake + tirs courts.
 
 ### FAMAS — A, mixeur 1000 RPM
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -207,29 +207,29 @@ TTK monstrueux mais chargeur 25 + reload lent : engage propre, un ennemi à la f
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / ACOG 4x | PRISM 3.4x |
-| Canon | Canon lourd | Compensateur |
+| Canon | Heavy Barrel | Compensator |
 | Sous-canon | Stubby | Angled |
 | Accessoire | Laser | — |
 
-Bullpup stable, très bon en burst mi-longue avec canon lourd.
+Bullpup stable, très bon en burst mi-longue avec Heavy Barrel.
 
 ### M16A4 — B, burst only
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | ACOG 4x | RDS |
-| Canon | Canon lourd | — |
+| Canon | Heavy Barrel | — |
 | Sous-canon | Angled | — |
-| Accessoire | Viseur incliné (canted) | Laser |
+| Accessoire | Canted Ironsights | Laser |
 
-Burst 3 coups précis. Canted irons pour le close range où le burst pénalise.
+Burst 3 coups précis. Canted Ironsights pour le close range où le burst pénalise.
 
 ### SAR-21 — B+, laser longue distance
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | ACOG 4x | PRISM 3.4x |
-| Canon | Canon lourd | Compensateur |
+| Canon | Heavy Barrel | Compensator |
 | Sous-canon | Angled | Stubby |
 | Accessoire | Laser | — |
 
@@ -240,7 +240,7 @@ Le plus précis des AR full auto à distance ; lent (600 RPM) donc évite le CQB
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -251,7 +251,7 @@ Rien ne le distingue ; joue-le en attendant de débloquer mieux.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | ACOG 4x |
-| Canon | Compensateur | Canon lourd |
+| Canon | Compensator | Heavy Barrel |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -262,7 +262,7 @@ Rien ne le distingue ; joue-le en attendant de débloquer mieux.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | Vertical (full hipfire) |
 | Accessoire | Laser | — |
 
@@ -273,7 +273,7 @@ Rien ne le distingue ; joue-le en attendant de débloquer mieux.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / ACOG 4x | — |
-| Canon | Canon lourd | Compensateur |
+| Canon | Heavy Barrel | Compensator |
 | Sous-canon | Stubby | Angled |
 | Accessoire | Laser | — |
 
@@ -284,7 +284,7 @@ Réhabilité par le Spring Patch : très stable en tirs courts à moyenne porté
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | ACOG 4x |
-| Canon | Compensateur | Canon lourd |
+| Canon | Compensator | Heavy Barrel |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -295,7 +295,7 @@ Réhabilité par le Spring Patch : très stable en tirs courts à moyenne porté
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | Frein de bouche |
+| Canon | Compensator | Muzzle Brake |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -306,11 +306,11 @@ Réhabilité par le Spring Patch : très stable en tirs courts à moyenne porté
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | ACOG 4x |
-| Canon | Canon lourd | — |
+| Canon | Heavy Barrel | — |
 | Sous-canon | Angled | — |
-| Accessoire | Viseur incliné | Laser |
+| Accessoire | Canted Ironsights | Laser |
 
-Le combo classique canon lourd + RDS : burst 2 coups à 1200 RPM, chirurgical à distance. Passe en auto uniquement en panique.
+Le combo classique Heavy Barrel + RDS : burst 2 coups à 1200 RPM, chirurgical à distance. Passe en auto uniquement en panique.
 
 ---
 
@@ -323,7 +323,7 @@ Le combo classique canon lourd + RDS : burst 2 coups à 1200 RPM, chirurgical à
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | ACOG 4x |
-| Canon | Frein de bouche | Compensateur |
+| Canon | Muzzle Brake | Compensator |
 | Sous-canon | Angled | Stubby |
 | Accessoire | Laser | — |
 
@@ -334,7 +334,7 @@ Le combo classique canon lourd + RDS : burst 2 coups à 1200 RPM, chirurgical à
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -345,7 +345,7 @@ Le combo classique canon lourd + RDS : burst 2 coups à 1200 RPM, chirurgical à
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -356,7 +356,7 @@ ROF élevé, recul faible : très facile à jouer en full auto.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -367,7 +367,7 @@ Correct sans plus ; dépasse-la dès que l'AK 5C est débloquée.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | Kobra |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -378,7 +378,7 @@ Comme l'AK-12 avec plus de mobilité, moins de portée. Très saine.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -389,7 +389,7 @@ Bullpup rapide, très bonne en intérieur / métro.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / PRISM 3.4x | — |
-| Canon | Canon lourd | Compensateur |
+| Canon | Heavy Barrel | Compensator |
 | Sous-canon | Stubby | Angled |
 | Accessoire | Laser | — |
 
@@ -400,9 +400,9 @@ Bullpup rapide, très bonne en intérieur / métro.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / ACOG 4x | — |
-| Canon | Canon lourd | — |
+| Canon | Heavy Barrel | — |
 | Sous-canon | Angled | — |
-| Accessoire | Viseur incliné | Laser |
+| Accessoire | Canted Ironsights | Laser |
 
 Semi/burst uniquement : joue-la comme un mini M16A4.
 
@@ -411,7 +411,7 @@ Semi/burst uniquement : joue-la comme un mini M16A4.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -422,7 +422,7 @@ Version 5.56 de l'ACE 52 : moins de punch, plus facile.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -433,7 +433,7 @@ Bullpup correct, rien d'exceptionnel.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | Vertical |
 | Accessoire | Laser | — |
 
@@ -444,24 +444,24 @@ Bullpup correct, rien d'exceptionnel.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | Silencieux |
+| Canon | Compensator | Suppressor |
 | Sous-canon | — (grip vertical intégré, non modifiable) | — |
 | Accessoire | Laser | — |
 
-Poignée intégrée : pas de slot sous-canon. Chargeur 31, bonne en close ; évite la longue distance.
+Grip intégré : pas de slot sous-canon. Chargeur 31, bonne en close ; évite la longue distance.
 
 ---
 
 ## 🔫 PDW (Ingénieur)
 
-**Méta catégorie** : rois du tir à la hanche. **Laser quasi obligatoire**, silencieux à malus réduit sur cette classe → builds furtifs très viables.
+**Méta catégorie** : rois du tir à la hanche. **Laser quasi obligatoire**, suppressor à malus réduit sur cette classe → builds furtifs très viables.
 
 ### P90 — S, 1000 RPM hipfire
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | Silencieux (furtif) |
+| Canon | Compensator | Suppressor (furtif) |
 | Sous-canon | — (pas de slot) | — |
 | Accessoire | Laser | — |
 
@@ -472,7 +472,7 @@ Poignée intégrée : pas de slot sous-canon. Chargeur 31, bonne en close ; évi
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | Silencieux |
+| Canon | Compensator | Suppressor |
 | Sous-canon | Stubby | Vertical |
 | Accessoire | Laser | — |
 
@@ -483,7 +483,7 @@ Poignée intégrée : pas de slot sous-canon. Chargeur 31, bonne en close ; évi
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | Silencieux |
+| Canon | Compensator | Suppressor |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -494,7 +494,7 @@ Poignée intégrée : pas de slot sous-canon. Chargeur 31, bonne en close ; évi
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Vertical | Stubby |
 | Accessoire | Laser | — |
 
@@ -505,7 +505,7 @@ Bon hipfire, dégâts moyens. Dépannage honnête.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Silencieux | Compensateur |
+| Canon | Suppressor | Compensator |
 | Sous-canon | Stubby | Angled |
 | Accessoire | Laser | — |
 
@@ -516,7 +516,7 @@ Bon hipfire, dégâts moyens. Dépannage honnête.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | Silencieux |
+| Canon | Compensator | Suppressor |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -527,7 +527,7 @@ L'UMP en 9mm : plus de ROF, moins de punch par balle.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -538,7 +538,7 @@ Chargeur 50 sympa, le reste est moyen.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / PRISM 3.4x | — |
-| Canon | Canon lourd | Compensateur |
+| Canon | Heavy Barrel | Compensator |
 | Sous-canon | Angled | Stubby |
 | Accessoire | Laser | — |
 
@@ -549,7 +549,7 @@ Le PDW le plus précis à distance : joue-le comme une carabine légère.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -560,7 +560,7 @@ Correct en CQB, vite remplacé.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | Silencieux |
+| Canon | Compensator | Suppressor |
 | Sous-canon | Stubby | Vertical |
 | Accessoire | Laser | — |
 
@@ -571,18 +571,18 @@ Correct en CQB, vite remplacé.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / PK-A 3.4x | — |
-| Canon | — (silencieux intégré) | — |
+| Canon | — (suppressor intégré) | — |
 | Sous-canon | Stubby | Angled |
 | Accessoire | Laser | — |
 
-900 RPM + silencieux fixe + gros dégâts : TTK d'élite, mais chargeur 20 et vélocité faible. Flank, tue, recharge.
+900 RPM + suppressor fixe + gros dégâts : TTK d'élite, mais chargeur 20 et vélocité faible. Flank, tue, recharge.
 
 ### SR-2 — A (Naval Strike)
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | Silencieux |
+| Canon | Compensator | Suppressor |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -593,25 +593,25 @@ Correct en CQB, vite remplacé.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | — (silencieux intégré) | — |
+| Canon | — (suppressor intégré) | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
-AS VAL du pauvre : silencieux fixe, chargeur 20. Sympa en infiltration.
+AS VAL du pauvre : suppressor fixe, chargeur 20. Sympa en infiltration.
 
 ---
 
 ## 🔫 LMG (Soutien)
 
-**Méta catégorie** : Compensateur + Stubby en mobile ; Canon lourd + **bipied** en poste fixe (le bipied rend ces armes laser). Les mag-fed (chargeur) rechargent vite et se jouent comme des AR ; les belt-fed (bande) suppriment et tiennent les lignes.
+**Méta catégorie** : Compensator + Stubby en mobile ; Heavy Barrel + **bipod** en poste fixe (le bipod rend ces armes laser). Les mag-fed (chargeur) rechargent vite et se jouent comme des AR ; les belt-fed (bande) suppriment et tiennent les lignes.
 
 ### U-100 MK5 — A, mag-fed précis
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | PRISM 3.4x |
-| Canon | Compensateur | Canon lourd |
-| Sous-canon | Stubby | Bipied |
+| Canon | Compensator | Heavy Barrel |
+| Sous-canon | Stubby | Bipod |
 | Accessoire | Laser | — |
 
 La LMG la plus précise en mouvement. Se joue comme un gros AR.
@@ -621,8 +621,8 @@ La LMG la plus précise en mouvement. Se joue comme un gros AR.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
-| Sous-canon | Bipied | Stubby |
+| Canon | Compensator | — |
+| Sous-canon | Bipod | Stubby |
 | Accessoire | Laser | — |
 
 Faible sur tous les plans ; passe vite à la suite.
@@ -632,8 +632,8 @@ Faible sur tous les plans ; passe vite à la suite.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / PRISM 3.4x | — |
-| Canon | Compensateur | Canon lourd |
-| Sous-canon | Stubby | Bipied |
+| Canon | Compensator | Heavy Barrel |
+| Sous-canon | Stubby | Bipod |
 | Accessoire | Laser | — |
 
 Recul très gérable, belt-fed : excellente hybride attaque/défense.
@@ -643,8 +643,8 @@ Recul très gérable, belt-fed : excellente hybride attaque/défense.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | PK-A 3.4x |
-| Canon | Compensateur | Frein de bouche |
-| Sous-canon | Stubby | Bipied |
+| Canon | Compensator | Muzzle Brake |
+| Sous-canon | Stubby | Bipod |
 | Accessoire | Laser | — |
 
 7.62 qui punit : gros recul vertical, mais 3-4 balles suffisent.
@@ -654,8 +654,8 @@ Recul très gérable, belt-fed : excellente hybride attaque/défense.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
-| Sous-canon | Stubby | Bipied |
+| Canon | Compensator | — |
+| Sous-canon | Stubby | Bipod |
 | Accessoire | Laser | — |
 
 Mag-fed correct, éclipsé par l'U-100.
@@ -665,19 +665,19 @@ Mag-fed correct, éclipsé par l'U-100.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
-| Sous-canon | Stubby | Bipied |
+| Canon | Compensator | — |
+| Sous-canon | Stubby | Bipod |
 | Accessoire | Laser | — |
 
-950 RPM en 7.62 : DPS énorme, recul énorme. Tirs courts ou bipied.
+950 RPM en 7.62 : DPS énorme, recul énorme. Tirs courts ou bipod.
 
 ### MG4 — B, arroseuse
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
-| Sous-canon | Stubby | Bipied |
+| Canon | Compensator | — |
+| Sous-canon | Stubby | Bipod |
 | Accessoire | Laser | — |
 
 Belt-fed rapide standard, correcte partout, exceptionnelle nulle part.
@@ -687,8 +687,8 @@ Belt-fed rapide standard, correcte partout, exceptionnelle nulle part.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
-| Sous-canon | Stubby | Bipied |
+| Canon | Compensator | — |
+| Sous-canon | Stubby | Bipod |
 | Accessoire | Laser | — |
 
 Même rôle que la MG4 : spam de suppression sur objectif.
@@ -698,7 +698,7 @@ Même rôle que la MG4 : spam de suppression sur objectif.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -709,8 +709,8 @@ Même rôle que la MG4 : spam de suppression sur objectif.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / PK-A 3.4x | — |
-| Canon | Canon lourd | Compensateur |
-| Sous-canon | Stubby | Bipied |
+| Canon | Heavy Barrel | Compensator |
+| Sous-canon | Stubby | Bipod |
 | Accessoire | Laser | — |
 
 Mag-fed stable, très bonne en tirs contrôlés mi-longue.
@@ -720,8 +720,8 @@ Mag-fed stable, très bonne en tirs contrôlés mi-longue.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | PK-A 3.4x | RDS |
-| Canon | Canon lourd | — |
-| Sous-canon | Bipied | Stubby |
+| Canon | Heavy Barrel | — |
+| Sous-canon | Bipod | Stubby |
 | Accessoire | Laser | — |
 
 Précise et douce : un AR de Soutien pour tenir un angle.
@@ -731,18 +731,18 @@ Précise et douce : un AR de Soutien pour tenir un angle.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Frein de bouche | Compensateur |
-| Sous-canon | Bipied | Stubby |
+| Canon | Muzzle Brake | Compensator |
+| Sous-canon | Bipod | Stubby |
 | Accessoire | Laser | — |
 
-Lent mais chaque balle fait mal. Poste défensif au bipied = zone interdite.
+Lent mais chaque balle fait mal. Poste défensif au bipod = zone interdite.
 
 ### L86A2 — A (Weapons Crate), run & gun
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS | — |
-| Canon | Compensateur | — |
+| Canon | Compensator | — |
 | Sous-canon | Stubby | — |
 | Accessoire | Laser | — |
 
@@ -752,16 +752,16 @@ Mag-fed mobile pensée pour avancer avec les Assauts. Stubby recommandé officie
 
 ## 🎯 DMR (toutes classes)
 
-**Méta catégorie** : PRISM 3.4x ou ACOG 4x + **Angled** (premier tir) + frein de bouche. Viseur incliné (canted) pour survivre en close. 2 balles poitrine ou 1 tête à mi-distance.
+**Méta catégorie** : PRISM 3.4x ou ACOG 4x + **Angled** (premier tir) + Muzzle Brake. Canted Ironsights pour survivre en close. 2 balles poitrine ou 1 tête à mi-distance.
 
 ### RFB — B
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | PRISM 3.4x | ACOG 4x |
-| Canon | Frein de bouche | Cache-flash |
-| Sous-canon | Angled | Bipied |
-| Accessoire | Viseur incliné | Laser |
+| Canon | Muzzle Brake | Flash Hider |
+| Sous-canon | Angled | Bipod |
+| Accessoire | Canted Ironsights | Laser |
 
 Bullpup correct, recul un peu sale ; dépassé par le M39.
 
@@ -770,18 +770,18 @@ Bullpup correct, recul un peu sale ; dépassé par le M39.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | PRISM 3.4x / 4x | — |
-| Canon | Frein de bouche | Silencieux |
-| Sous-canon | Angled | Bipied |
-| Accessoire | Viseur incliné | — |
+| Canon | Muzzle Brake | Suppressor |
+| Sous-canon | Angled | Bipod |
+| Accessoire | Canted Ironsights | — |
 
-Équilibré partout, très bon avec silencieux en flanc.
+Équilibré partout, très bon avec suppressor en flanc.
 
 ### SKS — A, le DMR de rush
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | RDS / 1x | PRISM 3.4x |
-| Canon | Frein de bouche | Compensateur |
+| Canon | Muzzle Brake | Compensator |
 | Sous-canon | Angled | Vertical |
 | Accessoire | Laser | — |
 
@@ -792,9 +792,9 @@ ROF le plus haut de la classe et bon hipfire : un semi-auto agressif, pas un sni
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | PRISM 3.4x / 4x | — |
-| Canon | Frein de bouche | — |
-| Sous-canon | Angled | Bipied |
-| Accessoire | Viseur incliné | — |
+| Canon | Muzzle Brake | — |
+| Sous-canon | Angled | Bipod |
+| Accessoire | Canted Ironsights | — |
 
 Le Dragunov modernisé : honnête, sans éclat.
 
@@ -803,9 +803,9 @@ Le Dragunov modernisé : honnête, sans éclat.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | PRISM 3.4x | — |
-| Canon | Frein de bouche | — |
-| Sous-canon | Angled | Bipied |
-| Accessoire | Viseur incliné | — |
+| Canon | Muzzle Brake | — |
+| Sous-canon | Angled | Bipod |
+| Accessoire | Canted Ironsights | — |
 
 Précis mais dégâts un cran en dessous.
 
@@ -814,9 +814,9 @@ Précis mais dégâts un cran en dessous.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | ACOG 4x | 6x (Rifle Scope) |
-| Canon | Frein de bouche | Canon lourd |
-| Sous-canon | Angled | Bipied |
-| Accessoire | Viseur incliné | Range finder |
+| Canon | Muzzle Brake | Heavy Barrel |
+| Sous-canon | Angled | Bipod |
+| Accessoire | Canted Ironsights | Range Finder |
 
 Vélocité et précision au top : le meilleur pour le tir à longue distance en semi-auto.
 
@@ -825,9 +825,9 @@ Vélocité et précision au top : le meilleur pour le tir à longue distance en 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | PRISM 3.4x / 4x | — |
-| Canon | Frein de bouche | — |
+| Canon | Muzzle Brake | — |
 | Sous-canon | Angled | — |
-| Accessoire | Viseur incliné | — |
+| Accessoire | Canted Ironsights | — |
 
 L'ACE en DMR : maniement doux, très polyvalent.
 
@@ -836,9 +836,9 @@ L'ACE en DMR : maniement doux, très polyvalent.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | PRISM 3.4x | RDS |
-| Canon | Frein de bouche | — |
+| Canon | Muzzle Brake | — |
 | Sous-canon | Angled | — |
-| Accessoire | Viseur incliné | Laser |
+| Accessoire | Canted Ironsights | Laser |
 
 Le plus "carabine" des DMR : excellent entre 20 et 80 m.
 
@@ -846,16 +846,16 @@ Le plus "carabine" des DMR : excellent entre 20 et 80 m.
 
 ## 🎯 Snipers (Reconnaissance)
 
-**Méta catégorie** : lunette 8x (Rifle Scope) + **zoom variable 14x** ou canted irons ; **cache-flash** (le silencieux tue la vélocité) ; **bipied** si poste fixe. En BF4 tu restes zoomé en réarmant — pas de straight pull à équiper. One-shot poitrine à courte distance (selon arme), sinon vise la tête.
+**Méta catégorie** : lunette 8x (Rifle Scope) + **Variable Zoom 14x** ou Canted Ironsights ; **Flash Hider** (le suppressor tue la vélocité) ; **bipod** si poste fixe. En BF4 tu restes zoomé en réarmant — pas de straight pull à équiper. One-shot poitrine à courte distance (selon arme), sinon vise la tête.
 
 ### CS-LR4 — A, défaut excellent
 
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 8x | 7x/8x au choix |
-| Accessoire | Zoom variable | Canted irons |
-| Canon | Cache-flash | Frein de bouche |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | Canted Ironsights |
+| Canon | Flash Hider | Muzzle Brake |
+| Sous-canon | Bipod | — |
 
 Rien à jeter : reste dessus tant que la GOL n'est pas là.
 
@@ -864,9 +864,9 @@ Rien à jeter : reste dessus tant que la GOL n'est pas là.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 8x | — |
-| Accessoire | Zoom variable | Range finder |
-| Canon | Cache-flash | — |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | Range Finder |
+| Canon | Flash Hider | — |
+| Sous-canon | Bipod | — |
 
 Fiable, sans particularité. Bon fusil d'apprentissage.
 
@@ -875,9 +875,9 @@ Fiable, sans particularité. Bon fusil d'apprentissage.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 4x / 6x | 8x |
-| Accessoire | Canted irons | Laser |
-| Canon | Cache-flash | Silencieux |
-| Sous-canon | — | Bipied |
+| Accessoire | Canted Ironsights | Laser |
+| Canon | Flash Hider | Suppressor |
+| Sous-canon | — | Bipod |
 
 Léger, ADS rapide : pour l'éclaireur qui bouge avec l'équipe.
 
@@ -886,9 +886,9 @@ Léger, ADS rapide : pour l'éclaireur qui bouge avec l'équipe.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 8x | — |
-| Accessoire | Zoom variable | — |
-| Canon | Cache-flash | — |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | — |
+| Canon | Flash Hider | — |
+| Sous-canon | Bipod | — |
 
 Milieu de gamme sans défaut majeur.
 
@@ -897,9 +897,9 @@ Milieu de gamme sans défaut majeur.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 8x | 14x fixe |
-| Accessoire | Zoom variable | Range finder |
-| Canon | Cache-flash | — |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | Range Finder |
+| Canon | Flash Hider | — |
+| Sous-canon | Bipod | — |
 
 Grosse vélocité : moins de correction sur cibles mobiles.
 
@@ -908,9 +908,9 @@ Grosse vélocité : moins de correction sur cibles mobiles.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 6x / 8x | — |
-| Accessoire | Zoom variable | Canted irons |
-| Canon | Cache-flash | — |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | Canted Ironsights |
+| Canon | Flash Hider | — |
+| Sous-canon | Bipod | — |
 
 Semi-auto en calibre magnum : follow-up shot immédiat, parfait mi-longue.
 
@@ -919,9 +919,9 @@ Semi-auto en calibre magnum : follow-up shot immédiat, parfait mi-longue.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 8x | 14x |
-| Accessoire | Zoom variable | Range finder |
-| Canon | Cache-flash | — |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | Range Finder |
+| Canon | Flash Hider | — |
+| Sous-canon | Bipod | — |
 
 .338 : one-shot poitrine plus loin que les autres. Lourd mais dévastateur.
 
@@ -930,9 +930,9 @@ Semi-auto en calibre magnum : follow-up shot immédiat, parfait mi-longue.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 8x | 14x |
-| Accessoire | Zoom variable | Range finder |
-| Canon | Cache-flash | — |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | Range Finder |
+| Canon | Flash Hider | — |
+| Sous-canon | Bipod | — |
 
 Vélocité la plus haute du jeu : la balistique la plus simple pour toucher loin.
 
@@ -941,9 +941,9 @@ Vélocité la plus haute du jeu : la balistique la plus simple pour toucher loin
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 8x | — |
-| Accessoire | Zoom variable | — |
-| Canon | Cache-flash | — |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | — |
+| Canon | Flash Hider | — |
+| Sous-canon | Bipod | — |
 
 Correct, redondant avec mieux ailleurs.
 
@@ -952,9 +952,9 @@ Correct, redondant avec mieux ailleurs.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 8x | 6x agressif |
-| Accessoire | Zoom variable | Canted irons |
-| Canon | Cache-flash | Silencieux (flanc) |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | Canted Ironsights |
+| Canon | Flash Hider | Suppressor (flanc) |
+| Sous-canon | Bipod | — |
 
 Réarmement le plus rapide des bolts + très bonne vélocité : le sniper compétitif.
 
@@ -963,9 +963,9 @@ Réarmement le plus rapide des bolts + très bonne vélocité : le sniper compé
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 8x | — |
-| Accessoire | Zoom variable | — |
-| Canon | Cache-flash | — |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | — |
+| Canon | Flash Hider | — |
+| Sous-canon | Bipod | — |
 
 Le classique britannique : équilibré, très bon partout.
 
@@ -974,9 +974,9 @@ Le classique britannique : équilibré, très bon partout.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 4x / PRISM 3.4x | 6x |
-| Accessoire | Canted irons | Laser |
-| Canon | Frein de bouche | Cache-flash |
-| Sous-canon | Angled | Bipied |
+| Accessoire | Canted Ironsights | Laser |
+| Canon | Muzzle Brake | Flash Hider |
+| Sous-canon | Angled | Bipod |
 
 Semi-auto .338 jouable comme un super-DMR : 2 balles max à mi-distance.
 
@@ -985,17 +985,17 @@ Semi-auto .338 jouable comme un super-DMR : 2 balles max à mi-distance.
 | Slot | Attachement | Alternative |
 |---|---|---|
 | Optique | 6x | 8x |
-| Accessoire | Zoom variable | Range finder |
-| Canon | — (silencieux intégré) | — |
-| Sous-canon | Bipied | — |
+| Accessoire | Variable Zoom | Range Finder |
+| Canon | — (suppressor intégré) | — |
+| Sous-canon | Bipod | — |
 
-Silencieux fixe, vélocité faible : sniper d'infiltration courte-moyenne, invisible minimap.
+Suppressor fixe, vélocité faible : sniper d'infiltration courte-moyenne, invisible minimap.
 
 ---
 
 ## 🔫 Fusils à pompe (toutes classes)
 
-**Méta catégorie** : **Full choke** (gerbe resserrée en ADS) + **Buckshot** en standard ; **Slugs** + 4x pour jouer "sniper de pompe" ; Flechette pour percer le bois/tôle. Laser toujours utile, RDS pour le confort.
+**Méta catégorie** : **Full Choke** (gerbe resserrée en ADS) + **Buckshot** en standard ; **Slugs** + 4x pour jouer "sniper de pompe" ; Flechette pour percer le bois/tôle. Laser toujours utile, RDS pour le confort.
 
 ### 870 MCS — S, le roi pump
 
@@ -1003,7 +1003,7 @@ Silencieux fixe, vélocité faible : sniper d'infiltration courte-moyenne, invis
 |---|---|---|
 | Optique | RDS | — |
 | Accessoire | Laser | — |
-| Canon | Full choke | Duckbill |
+| Canon | Full Choke | Duckbill |
 | Munitions | Buckshot | Slugs (longue) |
 
 One-shot fiable à bout portant, pompe rapide. LE fusil des Opérations Métro / Locker.
@@ -1014,7 +1014,7 @@ One-shot fiable à bout portant, pompe rapide. LE fusil des Opérations Métro /
 |---|---|---|
 | Optique | RDS | — |
 | Accessoire | Laser | — |
-| Canon | Full choke | — |
+| Canon | Full Choke | — |
 | Munitions | Buckshot | Flechette |
 
 Pump correct, juste moins bon que le 870.
@@ -1025,7 +1025,7 @@ Pump correct, juste moins bon que le 870.
 |---|---|---|
 | Optique | RDS | — |
 | Accessoire | Laser | — |
-| Canon | Full choke | Modified choke |
+| Canon | Full Choke | Modified Choke |
 | Munitions | Buckshot | Flechette |
 
 Enchaîne les coups : pardonne un premier tir raté, contrairement au 870.
@@ -1036,7 +1036,7 @@ Enchaîne les coups : pardonne un premier tir raté, contrairement au 870.
 |---|---|---|
 | Optique | RDS | — |
 | Accessoire | Laser | — |
-| Canon | Full choke | — |
+| Canon | Full Choke | — |
 | Munitions | Buckshot | Slugs |
 
 Recharge par chargeur = pression constante. Très bon en rush d'objectif.
@@ -1047,7 +1047,7 @@ Recharge par chargeur = pression constante. Très bon en rush d'objectif.
 |---|---|---|
 | Optique | RDS | — |
 | Accessoire | Laser | — |
-| Canon | Full choke | — |
+| Canon | Full Choke | — |
 | Munitions | Buckshot | Slugs |
 
 Pump précis avec bonne portée de gerbe : le compromis 870/M1014.
@@ -1058,7 +1058,7 @@ Pump précis avec bonne portée de gerbe : le compromis 870/M1014.
 |---|---|---|
 | Optique | RDS | — |
 | Accessoire | Laser | — |
-| Canon | Full choke | Duckbill |
+| Canon | Full Choke | Duckbill |
 | Munitions | Buckshot | — |
 
 Double tube = énorme réserve avant recharge. Pump un peu lent.
@@ -1069,7 +1069,7 @@ Double tube = énorme réserve avant recharge. Pump un peu lent.
 |---|---|---|
 | Optique | RDS | — |
 | Accessoire | Laser | — |
-| Canon | Full choke | — |
+| Canon | Full Choke | — |
 | Munitions | Buckshot | Flechette |
 
 Cadence élevée en semi : très bon nettoyeur de pièces.
@@ -1080,7 +1080,7 @@ Cadence élevée en semi : très bon nettoyeur de pièces.
 |---|---|---|
 | Optique | RDS | — |
 | Accessoire | Laser | — |
-| Canon | Full choke | — |
+| Canon | Full Choke | — |
 | Munitions | Buckshot | Flechette |
 
 Saiga améliorée : semi + chargeur + maniement doux. Top tier CQB.
@@ -1091,7 +1091,7 @@ Saiga améliorée : semi + chargeur + maniement doux. Top tier CQB.
 |---|---|---|
 | Optique | RDS | — |
 | Accessoire | Laser | — |
-| Canon | Full choke | Duckbill |
+| Canon | Full Choke | Duckbill |
 | Munitions | Buckshot | Frag (spam) |
 
 10 coups sans recharge, mais recharge complète interminable. Fun en défense de point.
@@ -1131,7 +1131,7 @@ Saiga améliorée : semi + chargeur + maniement doux. Top tier CQB.
 
 ## Rappel rapide selon ta cible
 
-- **Tu débarques / reprises** : ACE 23 (Assaut), AK 5C (toutes classes), MX4 (Ingé), U-100 (Soutien), CS-LR4 (Recon) — tous avec Compensateur + Stubby + RDS + Laser.
+- **Tu débarques / reprises** : ACE 23 (Assaut), AK 5C (toutes classes), MX4 (Ingé), U-100 (Soutien), CS-LR4 (Recon) — tous avec Compensator + Stubby + RDS + Laser.
 - **Métro / Locker** : AEK-971, FAMAS, AWS, 870 MCS, MTAR-21.
 - **Grandes cartes** : SAR-21, AN-94, M39 EMR, SRR-61, ACE 52 CQB.
-- **Furtif** : AS VAL, UMP-45 silencieux, CS5, GOL silencieux.
+- **Furtif** : AS VAL, UMP-45 + Suppressor, CS5, GOL + Suppressor.
