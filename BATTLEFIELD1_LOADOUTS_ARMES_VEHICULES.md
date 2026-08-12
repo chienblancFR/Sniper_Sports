@@ -26,6 +26,22 @@ Référence complète de l'arsenal BF1 (~53 armes principales) : base + They Sha
 | **Hunter / Sweeper / Backbored / Slug** | (Pompes) gerbe resserrée / cadence / gerbe large / balle unique |
 | **Experimental / Extended** | Gimmick propre à l'arme (ex. M1903 pistolet-mitrailleur, chargeur agrandi) |
 
+### Zoom & réticules (menu de personnalisation, par arme)
+
+Chaque viseur propose **4 grossissements** et **4 réticules**. Le zoom ne change pas la vitesse d'ADS, mais un fort zoom réduit ta vision périphérique (et les lunettes Sniper ont un **reflet visible** quel que soit le grossissement).
+
+| Type de viseur | Sur quelles variantes | Options | **Zoom recommandé** |
+|---|---|---|---|
+| **Lens Sight** | Optical, Carbine, Slug, Defensive | 1.25x / 1.50x / 2.00x / 2.50x | **1.50x** (garde la vision) ; 2.00x si tu joues plus posé |
+| **Telescopic** | Marksman (Scout), Telescopic (LMG) | 2.50x / 3.00x / 3.50x / 4.00x | **3.00x** ; 4.00x sur très grande carte |
+| **Sniper Scope** | Sniper (fusils à verrou) | 5x / 6x / 8x / 10x | **5x-6x** (10x = inutilisable sous 100 m) |
+| **Patrol Scope** | Sniper Médecin, Patrol (2018) | 2.50x / 3.00x / 3.50x / 4.00x | **3.00x** |
+| **Suppressive** | Suppressive (LMG) | 2.00x / 2.50x / 3.00x / 3.50x | **2.50x** (tu dois voir tes tracers) |
+
+**Réticules** : **Beam** (trait vertical fin, rien au-dessus de la cible → le meilleur pour les headshots, surtout sniper), **Cross** (croix classique, bon partout), **Dot** (point minimal — top sur Lens Sight en CQB), **Ring** (cercle — pompes/hipfire), **Chevron / Post** (goût personnel, plus chargés).
+
+**Zeroing (touche Z, snipers)** : règle la distance de compensation (75 / 100 / 150 m) selon ta position — indispensable au-delà de 100 m.
+
 **Règle d'or BF1 :** la précision des armes automatiques se **dégrade à chaque balle** (spread) et se reset à l'arrêt du tir → tire en **rafales courtes** dès que la cible dépasse ~20 m, sur toutes les classes.
 
 ---
