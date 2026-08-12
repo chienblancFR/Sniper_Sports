@@ -902,6 +902,19 @@ En face d'un behemoth : AA/canons de campagne + Attack Plane Airship Buster (Zep
 
 ---
 
+## 🎖️ Spécialisations (3 slots, update Tsar)
+
+Tu démarres avec **Flak / Cover / Quick Regen** ; le reste se débloque via les **Service Assignments**. Règles : Flak quasi obligatoire (−10-15 % dégâts d'explosifs), Cover = le plus faible des défauts → à remplacer en premier. Pépites génériques : **Quick Unspot** (spotté 2 s de moins) et **Inconspicuous / Camouflage** (invisible aux fusées de spot à l'arrêt ou en mouvement lent).
+
+| Classe | Slots recommandés | Pourquoi |
+|---|---|---|
+| **Assaut** | Flak + Juggernaut + Quick Regen | Juggernaut **se cumule avec Flak** : masque à gaz = −20 % d'explosifs en plus. Parfait dans l'enfer grenades/chars |
+| **Médecin** | Flak + Concealed Rescue + Quick Regen | Concealed Rescue = fumée auto sur les alliés à terre (20 m) : machine à revives en Opérations, meilleur perk de classe du jeu |
+| **Soutien** | Flak + Unbreakable + Quick Unspot | Unbreakable (−75 % suppression au bipied) pour les LMG posées ; sinon Quick Regen à la place |
+| **Éclaireur** | Flak + Quick Unspot + Inconspicuous | Combo anti-contre-snipe : tu disparais vite de la minimap et les fusées ne te révèlent pas. Perimeter Alarm si jeu défensif aux trip mines |
+
+---
+
 ## Rappel rapide
 
 - **Opérations (attaque)** : Automatico Storm ou Hellriegel + grenades fumigènes mentales (avance dans la fumée des autres), Médecin Fedorov Trench qui ressuscite TOUT, Soutien BAR Storm, Scout Russian 1895 Trench + flares. Char lourd Breakthrough plein, Flame Trooper dès qu'il apparaît.
