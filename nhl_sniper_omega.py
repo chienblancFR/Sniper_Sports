@@ -203,6 +203,8 @@ MONEYPUCK_SHOTS_ZIP_URL = (
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 _pit_teams_csv_resolu = ""
 _pit_goalies_csv_resolu = ""
+_goalies_shots_build_echec = False  # anti-boucle téléchargements shots sur PA
+GOALIES_SHOTS_FAIL_MARKER = os.path.join(_PROJECT_ROOT, "data", "moneypuck", ".all_goalies_shots_fail")
 HIA_TEAM_META_FILE = "hia_equipes_meta.json"
 # Préférence colonnes xG MoneyPuck (score/venue > flurry > brut)
 XG_FOR_COLONNES = (
@@ -502,6 +504,58 @@ def _dates_gameid_depuis_teams_csv():
     return out
 
 
+def _dates_gameid_depuis_nhl_api(season_starts):
+    """
+    Remplit gameId → date via schedules NHL (club-schedule-season).
+    Utile sur PA quand all_teams.csv / DB backtest absents.
+    """
+    cache_path = os.path.join(_PROJECT_ROOT, "data", "moneypuck", "nhl_game_dates_cache.json")
+    out = {}
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if isinstance(cached, dict) and cached:
+                log_nhl(f"📅 Cache dates NHL API — {len(cached)} matchs")
+                return {str(k): v for k, v in cached.items()}
+        except Exception:
+            pass
+
+    abbrevs = sorted(NHL_TEAMS_MAPPING.keys())
+    log_nhl(
+        f"📅 Dates matchs via NHL API — {len(abbrevs)} clubs × {len(season_starts)} saisons "
+        f"(une fois, puis cache)…"
+    )
+    for ys in season_starts:
+        season_key = f"{int(ys)}{int(ys) + 1}"
+        for ab in abbrevs:
+            url = f"https://api-web.nhle.com/v1/club-schedule-season/{ab}/{season_key}"
+            try:
+                resp = requests.get(url, timeout=20)
+                if resp.status_code != 200:
+                    continue
+                for game in resp.json().get("games") or []:
+                    gid = game.get("id")
+                    if gid is None:
+                        continue
+                    date_str = _normaliser_date_iso(
+                        game.get("gameDate") or str(game.get("startTimeUTC") or "")[:10]
+                    )
+                    if date_str:
+                        out[str(gid)] = date_str
+            except Exception:
+                continue
+    if out:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(out, f)
+            log_nhl(f"📅 Cache dates NHL écrit — {len(out)} matchs → {cache_path}")
+        except Exception as e:
+            log_nhl(f"⚠️ Cache dates NHL non écrit : {e}", level="warning")
+    return out
+
+
 def _mp_shots_game_id_vers_nhl(season_label, mp_game_id, is_playoff=False):
     """
     MoneyPuck shots game_id (ex. 20001) → NHL (ex. 2024020001).
@@ -524,7 +578,7 @@ def construire_all_goalies_csv_depuis_shots(annees_shots=None, out_path=None, fo
     Agrège les zips shots MoneyPuck (peter-tanner) → all_goalies.csv compatible PIT.
     Pas d'all_goalies natif chez MoneyPuck ; les shots restent téléchargeables.
     """
-    global NHL_PIT_GBG_GOALIES_CSV, _pit_goalies_csv_resolu
+    global NHL_PIT_GBG_GOALIES_CSV, _pit_goalies_csv_resolu, _goalies_shots_build_echec
     if annees_shots is None:
         # BT saisons 2023-2026 → shots 2022-2025 (+1 an pour prior PIT)
         annees_shots = [2022, 2023, 2024, 2025]
@@ -532,6 +586,20 @@ def construire_all_goalies_csv_depuis_shots(annees_shots=None, out_path=None, fo
         out_path = os.path.join(_PROJECT_ROOT, "data", "moneypuck", "all_goalies.csv")
     if os.path.isfile(out_path) and not force:
         return out_path
+    if _goalies_shots_build_echec and not force:
+        return None
+    if not force and os.path.isfile(GOALIES_SHOTS_FAIL_MARKER):
+        try:
+            age_h = (time.time() - os.path.getmtime(GOALIES_SHOTS_FAIL_MARKER)) / 3600.0
+            if age_h < 24:
+                _goalies_shots_build_echec = True
+                log_nhl(
+                    "ℹ️ Construction all_goalies depuis shots déjà en échec (<24h) — skip "
+                    "(placez data/moneypuck/all_goalies.csv ou relancez avec force)."
+                )
+                return None
+        except Exception:
+            pass
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     dates_par_gid = _dates_gameid_depuis_teams_csv()
@@ -549,6 +617,11 @@ def construire_all_goalies_csv_depuis_shots(annees_shots=None, out_path=None, fo
             conn.close()
         except Exception as e:
             log_nhl(f"⚠️ Dates nhl_games pour gardiens : {e}", level="warning")
+    if len(dates_par_gid) < 500:
+        api_dates = _dates_gameid_depuis_nhl_api(annees_shots)
+        dates_par_gid.update(api_dates)
+        log_nhl(f"📅 Dates disponibles pour gardiens PIT : {len(dates_par_gid)} matchs")
+
     # (season_bt, game_id, name) → agg
     agg = {}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -636,13 +709,14 @@ def construire_all_goalies_csv_depuis_shots(annees_shots=None, out_path=None, fo
         shots_par_game_team[key] = shots_par_game_team.get(key, 0) + b["shots"]
 
     rows_out = []
+    sans_date = 0
     for (season_bt, gid, name), b in agg.items():
         team_shots = shots_par_game_team.get((season_bt, gid, b["team"]), b["shots"])
         share = b["shots"] / max(team_shots, 1)
         icetime = max(600, min(3600, int(round(3600 * share))))
         date_str = b.get("gameDate") or dates_par_gid.get(gid, "")
         if not date_str:
-            # date proxy depuis game_id NHL (YYYYMM… non fiable) — skip sans date
+            sans_date += 1
             continue
         rows_out.append({
             "season": season_bt,
@@ -657,7 +731,19 @@ def construire_all_goalies_csv_depuis_shots(annees_shots=None, out_path=None, fo
         })
 
     if not rows_out:
-        log_nhl("⚠️ Aucune ligne gardien construite depuis les shots", level="warning")
+        _goalies_shots_build_echec = True
+        try:
+            os.makedirs(os.path.dirname(GOALIES_SHOTS_FAIL_MARKER), exist_ok=True)
+            with open(GOALIES_SHOTS_FAIL_MARKER, "w", encoding="utf-8") as f:
+                f.write(f"failed {datetime.now().isoformat()} agg={len(agg)} sans_date={sans_date}\n")
+        except Exception:
+            pass
+        log_nhl(
+            f"⚠️ Aucune ligne gardien construite depuis les shots "
+            f"(agg={len(agg)}, sans date={sans_date}). "
+            f"Uploadez data/moneypuck/all_goalies.csv sur PA — pas de re-téléchargement 24h.",
+            level="warning",
+        )
         return None
 
     fieldnames = [
@@ -673,6 +759,12 @@ def construire_all_goalies_csv_depuis_shots(annees_shots=None, out_path=None, fo
     os.environ["NHL_PIT_GBG_GOALIES_CSV"] = abs_path
     NHL_PIT_GBG_GOALIES_CSV = abs_path
     _pit_goalies_csv_resolu = abs_path
+    _goalies_shots_build_echec = False
+    if os.path.isfile(GOALIES_SHOTS_FAIL_MARKER):
+        try:
+            os.remove(GOALIES_SHOTS_FAIL_MARKER)
+        except Exception:
+            pass
     ensure_sport_env_key("nhl", "NHL_PIT_GBG_GOALIES_CSV", abs_path)
     log_nhl(f"🥅 all_goalies.csv écrit — {len(rows_out)} lignes → {abs_path}")
     return abs_path
