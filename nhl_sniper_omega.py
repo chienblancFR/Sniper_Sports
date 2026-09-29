@@ -127,6 +127,11 @@ NHL_OPS_ALERTES_ACTIF = _env_bool("NHL_OPS_ALERTES_ACTIF", True)
 NHL_OPS_ALERTE_COOLDOWN_H = float(os.environ.get("NHL_OPS_ALERTE_COOLDOWN_H", "6"))
 NHL_LIGUE_CALIB_BOOTSTRAP_DEMARRAGE = _env_bool("NHL_LIGUE_CALIB_BOOTSTRAP_DEMARRAGE", True)
 NHL_BLEND_GP_PLEIN = float(os.environ.get("NHL_BLEND_GP_PLEIN", "20"))
+# Prior pré-saison (quand MoneyPuck N absent ou GP bas) : N-1/N-2 + régression ligue
+NHL_PROJ_PRIOR_ACTIF = _env_bool("NHL_PROJ_PRIOR_ACTIF", True)
+NHL_PROJ_PRIOR_SAISONS = max(1, int(os.environ.get("NHL_PROJ_PRIOR_SAISONS", "2")))
+NHL_PROJ_PRIOR_POIDS_N1 = float(os.environ.get("NHL_PROJ_PRIOR_POIDS_N1", "0.70"))
+NHL_PROJ_PRIOR_REGRESSION = float(os.environ.get("NHL_PROJ_PRIOR_REGRESSION", "0.25"))
 NHL_PP_PK_SHRINK_GP = float(os.environ.get("NHL_PP_PK_SHRINK_GP", "20"))
 # MoneyPuck fournit nativement des CSV "forme récente" (10 ou 20 derniers matchs)
 NHL_GSAX_RECENT_WINDOW = int(os.environ.get("NHL_GSAX_RECENT_WINDOW", "10"))
@@ -720,24 +725,34 @@ def _fetch_moneypuck_csv(kind, season):
 
 
 def verifier_moneypuck_saison(season=None):
-    """Vérifie que teams.csv MoneyPuck est disponible (saison N puis N-1)."""
+    """Vérifie teams.csv MoneyPuck (saison N / N-1) ou prior projeté en secours."""
     season = season or NHL_SEASON
     texte, saison_utilisee = _fetch_moneypuck_csv("teams", season)
     starts = _moneypuck_summary_start_years(season)
-    if not texte:
-        return (
-            False,
-            f"teams.csv indisponible pour dossiers MoneyPuck {starts[0]} et {starts[1]} "
-            f"(NHL_SEASON fin={season})",
-            None,
-        )
-    teams = _parser_team_stats_csv(texte)
-    if not teams:
-        return False, f"teams.csv vide pour saison fin {saison_utilisee}", saison_utilisee
+    if texte:
+        teams = _parser_team_stats_csv(texte)
+        if teams:
+            if saison_utilisee and saison_utilisee < season:
+                return (
+                    True,
+                    f"{len(teams)} équipes via dossier fin {saison_utilisee} "
+                    f"(saison {season} pas encore publiée — prior projeté au scan)",
+                    saison_utilisee,
+                )
+            return (
+                True,
+                f"{len(teams)} équipes (MoneyPuck dossier {saison_utilisee - 1} = saison fin {saison_utilisee})",
+                saison_utilisee,
+            )
+    if NHL_PROJ_PRIOR_ACTIF:
+        prior = construire_prior_equipes(season)
+        if prior:
+            return True, f"prior projeté OK ({len(prior)} équipes) — MoneyPuck N absent", None
     return (
-        True,
-        f"{len(teams)} équipes (MoneyPuck dossier {saison_utilisee - 1} = saison fin {saison_utilisee})",
-        saison_utilisee,
+        False,
+        f"teams.csv indisponible pour dossiers MoneyPuck {starts[0]} et {starts[1]} "
+        f"(NHL_SEASON fin={season})",
+        None,
     )
 
 
@@ -843,6 +858,65 @@ def _blend_team_stats(teams_courant, teams_precedent, poids_courant):
             merged[key] = round(poids_courant * v_n + (1 - poids_courant) * v_n1, prec)
         blended.append(merged)
     return blended
+
+
+def _regression_vers_ligue(teams, regression):
+    """Shrink rates vers moyenne ligue : (1-r)*équipe + r*ligue."""
+    r = min(max(float(regression), 0.0), 1.0)
+    if r <= 0 or not teams:
+        return [dict(t) for t in teams]
+    keys = ("xGF_per_game", "xGA_per_game", "xGF_PP", "xGA_PK", "fo_pct")
+    means = {}
+    for key in keys:
+        vals = [t.get(key) for t in teams if t.get(key) is not None]
+        means[key] = (sum(vals) / len(vals)) if vals else 0.0
+    out = []
+    for t in teams:
+        row = dict(t)
+        for key in keys:
+            prec = 4 if key == "fo_pct" else 3
+            v = row.get(key, means[key])
+            row[key] = round((1.0 - r) * v + r * means[key], prec)
+        out.append(row)
+    return out
+
+
+def construire_prior_equipes(season=None):
+    """
+    Prior pré-saison équipes : blend N-1 (+ N-2) MoneyPuck + régression ligue.
+    GP forcé à 0 pour ne pas être pris pour du live saison N.
+    """
+    season = season or NHL_SEASON
+    if not NHL_PROJ_PRIOR_ACTIF:
+        return None
+
+    saisons = []
+    for k in range(1, NHL_PROJ_PRIOR_SAISONS + 1):
+        texte, s_fin = _fetch_moneypuck_csv("teams", season - k)
+        if not texte:
+            continue
+        parsed = _parser_team_stats_csv(texte)
+        if parsed:
+            saisons.append((s_fin or (season - k), parsed))
+
+    if not saisons:
+        return None
+
+    # Base = saison la plus récente dispo (N-1)
+    prior = [dict(t) for t in saisons[0][1]]
+    if len(saisons) >= 2:
+        w_n1 = min(max(NHL_PROJ_PRIOR_POIDS_N1, 0.0), 1.0)
+        prior = _blend_team_stats(prior, saisons[1][1], w_n1)
+
+    prior = _regression_vers_ligue(prior, NHL_PROJ_PRIOR_REGRESSION)
+    for t in prior:
+        t["games_played"] = 0
+    labels = "+".join(str(s) for s, _ in saisons)
+    log_nhl(
+        f"📐 Prior équipes projeté — saisons fin {labels} "
+        f"(poids N-1={NHL_PROJ_PRIOR_POIDS_N1:.0%}, régression ligue {NHL_PROJ_PRIOR_REGRESSION:.0%})"
+    )
+    return _shrink_special_teams(prior)
 
 
 def _blend_team_recent_form(teams, teams_recent):
@@ -1441,31 +1515,62 @@ def _teams_data_snapshot_pit(pit_index, date_str, teams_n1=None):
 def get_team_stats(season=None, blend=True):
     if season is None:
         season = NHL_SEASON
-    """Aspire les xG score/venue-adjusted (5v5 + PP/PK), blend N/N-1 en début de saison,
+    """Aspire les xG score/venue-adjusted (5v5 + PP/PK), blend N/prior en début de saison,
     puis blend de forme récente (teams_{N}.csv) par-dessus."""
     try:
         texte, saison_utilisee = _fetch_moneypuck_csv("teams", season)
+        prior = construire_prior_equipes(season) if (blend and NHL_PROJ_PRIOR_ACTIF) else None
+
+        # Saison N absente → prior projeté (ou repli N-1 régressé)
         if not texte:
+            if prior:
+                log_nhl(
+                    f"ℹ️ MoneyPuck saison {season} absente — prior projeté utilisé "
+                    f"({len(prior)} équipes)"
+                )
+                return prior
             return []
+
         if saison_utilisee != season:
-            log_nhl(f"ℹ️ MoneyPuck équipes : repli sur la saison {saison_utilisee}")
+            log_nhl(f"ℹ️ MoneyPuck équipes : repli sur la saison fin {saison_utilisee}")
+
         teams = _shrink_special_teams(_parser_team_stats_csv(texte))
         if not teams:
-            return []
+            return prior or []
+
+        # Si on a seulement les stats d'une saison antérieure (GP ~82),
+        # ce n'est PAS du live N → utiliser le prior (évite poids_n=100%).
+        repli_complet = saison_utilisee is not None and saison_utilisee < season
+        if repli_complet:
+            if prior:
+                log_nhl(
+                    f"📐 Début de saison — prior projeté à la place du CSV fin {saison_utilisee} brut"
+                )
+                return prior
+            teams = _regression_vers_ligue(teams, NHL_PROJ_PRIOR_REGRESSION)
+            for t in teams:
+                t["games_played"] = 0
+            return teams
 
         if blend and NHL_BLEND_GP_PLEIN > 0:
             gp_values = [t["games_played"] for t in teams if t.get("games_played", 0) > 0]
-            gp_moyen = sum(gp_values) / len(gp_values) if gp_values else NHL_BLEND_GP_PLEIN
-            poids_n = min(1.0, gp_moyen / NHL_BLEND_GP_PLEIN)
+            gp_moyen = sum(gp_values) / len(gp_values) if gp_values else 0.0
+            poids_n = min(1.0, gp_moyen / NHL_BLEND_GP_PLEIN) if gp_values else 0.0
             if poids_n < 1.0:
-                texte_n1, _ = _fetch_moneypuck_csv("teams", season - 1)
-                teams_n1 = _shrink_special_teams(_parser_team_stats_csv(texte_n1)) if texte_n1 else None
-                if teams_n1:
+                base_prior = prior
+                if not base_prior:
+                    texte_n1, _ = _fetch_moneypuck_csv("teams", season - 1)
+                    base_prior = (
+                        _shrink_special_teams(_parser_team_stats_csv(texte_n1))
+                        if texte_n1 else None
+                    )
+                if base_prior:
+                    label = "prior projeté" if prior else f"saison {season - 1}"
                     log_nhl(
                         f"🔀 Blend MoneyPuck : {round(poids_n * 100)}% saison {season} / "
-                        f"{round((1 - poids_n) * 100)}% {season - 1} (GP moyen {gp_moyen:.1f})"
+                        f"{round((1 - poids_n) * 100)}% {label} (GP moyen {gp_moyen:.1f})"
                     )
-                    teams = _blend_team_stats(teams, teams_n1, poids_n)
+                    teams = _blend_team_stats(teams, base_prior, poids_n)
 
         if NHL_TEAM_RECENT_WINDOW > 0:
             kind_recent = f"teams_{NHL_TEAM_RECENT_WINDOW}"
@@ -1478,7 +1583,7 @@ def get_team_stats(season=None, blend=True):
                 teams_recent = _shrink_special_teams(_parser_team_stats_csv(texte_recent))
                 teams = _blend_team_recent_form(teams, teams_recent)
             else:
-                log_nhl("ℹ️ Forme récente équipes indisponible — saison seule", level="warning")
+                log_nhl("ℹ️ Forme récente équipes indisponible — saison / prior seul", level="warning")
 
         return teams
     except Exception as e:
@@ -4704,7 +4809,12 @@ def run_sniper():
     if "OU" in NHL_MARCHES_ACTIFS and NHL_OU_TRUST_CAP > 0:
         log_nhl(f"📉 Shrink totaux — trust modèle plafonné à {NHL_OU_TRUST_CAP:.2f}")
     if NHL_BLEND_GP_PLEIN > 0:
-        log_nhl(f"🔀 Blend MoneyPuck N/N-1 jusqu'à {NHL_BLEND_GP_PLEIN:.0f} GP moyen/ligue")
+        log_nhl(f"🔀 Blend MoneyPuck N/prior jusqu'à {NHL_BLEND_GP_PLEIN:.0f} GP moyen/ligue")
+    if NHL_PROJ_PRIOR_ACTIF:
+        log_nhl(
+            f"📐 Prior pré-saison actif — {NHL_PROJ_PRIOR_SAISONS} saison(s), "
+            f"poids N-1 {NHL_PROJ_PRIOR_POIDS_N1:.0%}, régression ligue {NHL_PROJ_PRIOR_REGRESSION:.0%}"
+        )
     if NHL_PP_PK_SHRINK_GP > 0:
         log_nhl(f"📉 Shrinkage PP/PK vers moyenne ligue jusqu'à {NHL_PP_PK_SHRINK_GP:.0f} GP/équipe")
     if NHL_GSAX_RECENT_WINDOW > 0:
