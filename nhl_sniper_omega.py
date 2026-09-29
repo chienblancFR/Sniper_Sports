@@ -673,30 +673,49 @@ def construire_all_goalies_csv_depuis_shots(annees_shots=None, out_path=None, fo
     return abs_path
 
 
+def _moneypuck_summary_start_years(season_fin):
+    """
+    MoneyPuck seasonSummary utilise l'année de début :
+      2025-2026 → dossier 2025
+    Notre NHL_SEASON / PIT utilise l'année de fin :
+      2026-27 → NHL_SEASON=2027
+    Donc summary_start = season_fin - 1 ; repli N-1 = season_fin - 2.
+    """
+    s = int(season_fin)
+    return (s - 1, s - 2)
+
+
 def _fetch_moneypuck_csv(kind, season):
-    """Télécharge un CSV MoneyPuck seasonSummary (saison N, puis N-1 si échec)."""
+    """Télécharge un CSV MoneyPuck seasonSummary (saison N, puis N-1 si échec).
+
+    `season` = année de fin (convention bot). Retourne (texte, saison_fin_utilisee).
+    """
+    start_years = _moneypuck_summary_start_years(season)
     if NHL_MONEYPUCK_DATA_DIR:
-        for s in (season, season - 1):
+        for start in start_years:
             path = os.path.join(
                 NHL_MONEYPUCK_DATA_DIR,
                 "seasonSummary",
-                str(s),
+                str(start),
                 "regular",
                 f"{kind}.csv",
             )
             texte = _lire_csv_fichier_local(path)
             if texte:
-                return texte, s
+                return texte, start + 1
     headers = {"User-Agent": "Mozilla/5.0"}
-    for s in (season, season - 1):
-        url = f"https://moneypuck.com/moneypuck/playerData/seasonSummary/{s}/regular/{kind}.csv"
+    for start in start_years:
+        url = (
+            f"https://moneypuck.com/moneypuck/playerData/seasonSummary/"
+            f"{start}/regular/{kind}.csv"
+        )
         try:
             response = requests.get(url, headers=headers, timeout=15)
             if response.status_code == 200 and response.text.strip():
-                return response.text, s
-            print(f"⚠️ MoneyPuck {kind} saison {s} : HTTP {response.status_code}")
+                return response.text, start + 1
+            print(f"⚠️ MoneyPuck {kind} saison {start} (fin {start + 1}) : HTTP {response.status_code}")
         except Exception as e:
-            print(f"⚠️ MoneyPuck {kind} saison {s} : {e}")
+            print(f"⚠️ MoneyPuck {kind} saison {start} (fin {start + 1}) : {e}")
     return None, None
 
 
@@ -704,12 +723,22 @@ def verifier_moneypuck_saison(season=None):
     """Vérifie que teams.csv MoneyPuck est disponible (saison N puis N-1)."""
     season = season or NHL_SEASON
     texte, saison_utilisee = _fetch_moneypuck_csv("teams", season)
+    starts = _moneypuck_summary_start_years(season)
     if not texte:
-        return False, f"teams.csv indisponible pour saison {season} et {season - 1}", None
+        return (
+            False,
+            f"teams.csv indisponible pour dossiers MoneyPuck {starts[0]} et {starts[1]} "
+            f"(NHL_SEASON fin={season})",
+            None,
+        )
     teams = _parser_team_stats_csv(texte)
     if not teams:
-        return False, f"teams.csv vide pour saison {saison_utilisee}", saison_utilisee
-    return True, f"{len(teams)} équipes (saison MoneyPuck {saison_utilisee})", saison_utilisee
+        return False, f"teams.csv vide pour saison fin {saison_utilisee}", saison_utilisee
+    return (
+        True,
+        f"{len(teams)} équipes (MoneyPuck dossier {saison_utilisee - 1} = saison fin {saison_utilisee})",
+        saison_utilisee,
+    )
 
 
 def _resoudre_colonnes_xg(fieldnames):
