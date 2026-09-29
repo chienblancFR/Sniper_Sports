@@ -1801,28 +1801,35 @@ def get_goalie_stats(season=None):
     try:
         texte, saison_utilisee = _fetch_moneypuck_csv("goalies", season)
         if not texte:
+            log_nhl(
+                f"⚠️ MoneyPuck gardiens indisponible (saison {season} et repli) — GSAx=0 ce cycle",
+                level="warning",
+            )
             return []
         if saison_utilisee != season:
-            print(f"ℹ️ MoneyPuck gardiens : repli sur la saison {saison_utilisee}")
+            log_nhl(
+                f"ℹ️ MoneyPuck gardiens : repli sur la saison fin {saison_utilisee} "
+                f"(normal en début de saison {season})"
+            )
         goalies = _parser_goalie_season_csv(texte)
         if not goalies:
+            log_nhl("⚠️ CSV gardiens MoneyPuck sans lignes exploitables — GSAx=0", level="warning")
             return []
 
-        if NHL_GSAX_RECENT_WINDOW > 0:
+        # Forme récente seulement si on est vraiment sur la saison N
+        if NHL_GSAX_RECENT_WINDOW > 0 and saison_utilisee == season:
             kind_recent = f"goalies_{int(NHL_GSAX_RECENT_WINDOW)}"
             texte_recent, saison_recent = _fetch_moneypuck_csv(kind_recent, season)
-            if texte_recent:
-                if saison_recent != season:
-                    log_nhl(f"ℹ️ MoneyPuck gardiens forme récente : repli saison {saison_recent}")
+            if texte_recent and saison_recent == season:
                 recent_map = _parser_goalie_recent_csv(texte_recent)
                 goalies = _appliquer_blend_gsax_recent(goalies, recent_map)
             else:
-                log_nhl("ℹ️ GSAx forme récente indisponible — saison seule", level="warning")
+                log_nhl("ℹ️ GSAx forme récente indisponible — saison / prior seul", level="warning")
 
         goalies = _shrink_gsax_echantillon(goalies)
         return goalies
     except Exception as e:
-        print(f"⚠️ Erreur extracteur gardiens: {e}")
+        log_nhl(f"⚠️ Erreur extracteur gardiens: {e}", level="warning")
         return []
 
 
@@ -5033,18 +5040,29 @@ def run_sniper():
             log_nhl("📡 Synchronisation bases de données...")
             teams, goalies, stars_vip = get_team_stats(), get_goalie_stats(), get_stars_impact()
 
-            if not teams or not goalies:
+            # En début de saison : prior équipes suffit ; gardiens N-1 ou GSAx=0 OK pour paper.
+            if not teams:
                 log_nhl(
-                    f"⚠️ Données MoneyPuck indisponibles (saison {NHL_SEASON}). Nouvelle tentative dans 5 min...",
+                    f"⚠️ Stats équipes indisponibles (saison {NHL_SEASON}, prior vide). "
+                    f"Nouvelle tentative dans 5 min...",
                     level="warning",
                 )
                 _ops_alerte_envoyer(
                     "moneypuck_indisponible",
-                    f"⚠️ **MoneyPuck indisponible**\n\n"
+                    f"⚠️ **MoneyPuck équipes indisponibles**\n\n"
                     f"Saison {NHL_SEASON} — bot en veille 5 min.",
                 )
                 time.sleep(300)
                 continue
+            if not goalies:
+                log_nhl(
+                    "ℹ️ Aucun GSAx saison gardiens — poursuite avec GSAx=0 "
+                    "(prior équipes actif ; normal si MoneyPuck goalies N absent)",
+                    level="warning",
+                )
+                goalies = []
+            if not stars_vip:
+                stars_vip = {}
 
             if NHL_LIGUE_CALIB_ACTIF:
                 actualiser_historique_ligue(teams)
