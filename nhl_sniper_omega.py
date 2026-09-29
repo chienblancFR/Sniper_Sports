@@ -14,7 +14,14 @@ import traceback
 import zipfile
 from scipy.optimize import minimize
 from scipy.stats import nbinom
-from config_env import env_files_hint, ensure_sport_env_key, load_project_env
+from config_env import env_files_hint, load_project_env
+
+try:
+    from config_env import ensure_sport_env_key
+except ImportError:
+    # Ancien config_env.py sur PA / déploiement partiel — no-op (PIT CSV paths non auto-écrits)
+    def ensure_sport_env_key(sport: str, key: str, value: str) -> bool:
+        return False
 
 load_project_env("nhl")
 
