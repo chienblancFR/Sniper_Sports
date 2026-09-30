@@ -955,21 +955,48 @@ def _shrink_special_teams(teams):
 
 
 def _blend_team_stats(teams_courant, teams_precedent, poids_courant):
+    """
+    Blend saison N × prior. Les équipes absentes du CSV N (début de saison,
+    MoneyPuck partiel) sont conservées à 100 % prior — sinon le bot skip
+    tous les matchs hors des ~10 clubs déjà listés.
+    """
     prev_map = {t["team"]: t for t in teams_precedent}
     blended = []
+    seen = set()
     for team in teams_courant:
-        prev = prev_map.get(team["team"])
+        ab = team["team"]
+        seen.add(ab)
+        prev = prev_map.get(ab)
         if not prev:
             blended.append(team)
             continue
-        merged = {"team": team["team"], "games_played": team.get("games_played", 0)}
+        merged = {"team": ab, "games_played": team.get("games_played", 0)}
         for key in ("xGF_per_game", "xGA_per_game", "xGF_PP", "xGA_PK", "fo_pct"):
             v_n = team.get(key, 0.0)
             v_n1 = prev.get(key, v_n)
             prec = 4 if key == "fo_pct" else 3
             merged[key] = round(poids_courant * v_n + (1 - poids_courant) * v_n1, prec)
         blended.append(merged)
+    for prev in teams_precedent:
+        if prev["team"] in seen:
+            continue
+        row = dict(prev)
+        blended.append(row)
     return blended
+
+
+def _completer_equipes_depuis_prior(teams, prior):
+    """Ajoute les clubs du prior absents de la liste courante (CSV N partiel)."""
+    if not prior:
+        return teams
+    have = {t["team"] for t in teams}
+    extra = [dict(t) for t in prior if t["team"] not in have]
+    if extra:
+        log_nhl(
+            f"📐 Complément prior — {len(extra)} équipe(s) absentes du CSV saison "
+            f"ajoutées ({len(teams) + len(extra)} total)"
+        )
+    return list(teams) + extra
 
 
 def _regression_vers_ligue(teams, regression):
@@ -1683,6 +1710,11 @@ def get_team_stats(season=None, blend=True):
                         f"{round((1 - poids_n) * 100)}% {label} (GP moyen {gp_moyen:.1f})"
                     )
                     teams = _blend_team_stats(teams, base_prior, poids_n)
+            elif prior:
+                # CSV N encore partiel (ex. 10 clubs) alors que GP moyen déjà « plein »
+                teams = _completer_equipes_depuis_prior(teams, prior)
+        elif prior:
+            teams = _completer_equipes_depuis_prior(teams, prior)
 
         if NHL_TEAM_RECENT_WINDOW > 0:
             kind_recent = f"teams_{NHL_TEAM_RECENT_WINDOW}"
@@ -5395,7 +5427,13 @@ def run_sniper():
                 home_base = next((t for t in teams_match if t['team'] == m['home_team']), None)
                 away_base = next((t for t in teams_match if t['team'] == m['away_team']), None)
                 if not home_base or not away_base:
-                    log_nhl(f"⚠️ Skip stats MoneyPuck — {m['away_team']} @ {m['home_team']}", level="warning")
+                    log_nhl(
+                        f"⚠️ Skip stats MoneyPuck — {m['away_team']} @ {m['home_team']} "
+                        f"(dom={'ok' if home_base else 'ABSENT'}, "
+                        f"vis={'ok' if away_base else 'ABSENT'}, "
+                        f"{len(teams)} équipes en mémoire)",
+                        level="warning",
+                    )
                     continue
 
                 adj_xgf_ext, adj_xga_ext = apply_star_absence_penalty(
