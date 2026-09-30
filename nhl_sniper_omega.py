@@ -5061,7 +5061,12 @@ def run_sniper():
     if NHL_ATTENDRE_GARDIENS_CONFIRMES:
         log_nhl(
             "🛡️ Attente gardiens confirmés — aucun pari sur simple « probable » "
-            "(boxscore / NHL CONFIRMED / ESPN Confirmed requis)"
+            "(boxscore / NHL CONFIRMED / ESPN Confirmed / manuel requis)"
+        )
+    else:
+        log_nhl(
+            f"⚠️ Paris sur gardiens probables autorisés — edge min {NHL_EDGE_MIN_PROBABLE:.0%}, "
+            f"Kelly ÷2 ({KELLY_FRACTION_GARDIEN_INCERTAIN})"
         )
     if NHL_ESPN_GOALIES_ACTIF:
         log_nhl(
@@ -5071,11 +5076,6 @@ def run_sniper():
         log_nhl(
             f"✍️ Override gardiens manuel — {len(NHL_GOALIES_MANUEL)} équipe(s) "
             f"({', '.join(sorted(NHL_GOALIES_MANUEL.keys()))})"
-        )
-    else:
-        log_nhl(
-            f"⚠️ Paris sur gardiens probables autorisés — edge min {NHL_EDGE_MIN_PROBABLE:.0%}, "
-            f"Kelly ÷2 ({KELLY_FRACTION_GARDIEN_INCERTAIN})"
         )
     cap_label = f"{NHL_MISE_MAX_PCT}% bankroll" if NHL_MISE_MAX_PCT > 0 else "Kelly pur (pas de cap %)"
     log_nhl(f"💶 Cap mise : {cap_label} | journal → {FICHIER_JOURNAL}")
