@@ -68,6 +68,24 @@ NHL_EDGE_MIN_PROBABLE = float(os.environ.get("NHL_EDGE_MIN_PROBABLE", "0.04"))
 NHL_ATTENDRE_GARDIENS_CONFIRMES = _env_bool("NHL_ATTENDRE_GARDIENS_CONFIRMES", True)
 # Repli gardiens via ESPN scoreboard (l'API NHL publie souvent trop tard vs médias)
 NHL_ESPN_GOALIES_ACTIF = _env_bool("NHL_ESPN_GOALIES_ACTIF", True)
+
+
+def _parser_goalies_manuel(raw):
+    """Parse 'PIT=Arturs Silovs;PHI=Dan Vladar' → {PIT: ..., PHI: ...}."""
+    out = {}
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        ab, nom = part.split("=", 1)
+        ab, nom = ab.strip().upper(), nom.strip()
+        if ab and nom:
+            out[ab] = nom
+    return out
+
+
+# Override manuel (filet PA si ESPN bloqué) — ex. PIT=Arturs Silovs;PHI=Dan Vladar;...
+NHL_GOALIES_MANUEL = _parser_goalies_manuel(os.environ.get("NHL_GOALIES_MANUEL", ""))
 NHL_EDGE_DYNAMIQUE_ACTIF = _env_bool("NHL_EDGE_DYNAMIQUE_ACTIF", True)
 NHL_EDGE_DYNAMIQUE_EXTRA = float(os.environ.get("NHL_EDGE_DYNAMIQUE_EXTRA", "0.02"))
 NHL_EDGE_DYNAMIQUE_GP_PLEIN = float(os.environ.get("NHL_EDGE_DYNAMIQUE_GP_PLEIN", "20"))
@@ -2029,49 +2047,85 @@ def fetch_espn_starting_goalies(date_str):
         return _ESPN_GOALIES_CACHE[date_str]
 
     out = {}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    dates_param = date_str.replace("-", "")
-    url = (
-        "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard"
-        f"?dates={dates_param}"
-    )
-    try:
-        response = requests.get(url, headers=headers, timeout=12)
-        if response.status_code != 200:
-            _ESPN_GOALIES_CACHE[date_str] = out
-            return out
-        for ev in response.json().get("events") or []:
-            for comp in ev.get("competitions") or []:
-                away_ab = home_ab = None
-                g_away = g_home = None
-                conf_away = conf_home = False
-                for c in comp.get("competitors") or []:
-                    ab = _espn_abbrev_to_nhl((c.get("team") or {}).get("abbreviation"))
-                    probs = c.get("probables") or []
-                    starter = next(
-                        (p for p in probs if (p.get("name") or "") == "probableStartingGoalie"),
-                        probs[0] if probs else None,
-                    )
-                    nom = None
-                    if starter:
-                        ath = starter.get("athlete") or {}
-                        nom = ath.get("displayName") or ath.get("fullName") or ath.get("shortName")
-                    side = (c.get("homeAway") or "").lower()
-                    if side == "away":
-                        away_ab, g_away, conf_away = ab, nom, _espn_entry_confirmee(starter)
-                    elif side == "home":
-                        home_ab, g_home, conf_home = ab, nom, _espn_entry_confirmee(starter)
-                if away_ab and home_ab and g_away and g_home:
-                    out[(away_ab, home_ab)] = {
-                        "g_away": g_away,
-                        "g_home": g_home,
-                        "confirmed_away": conf_away,
-                        "confirmed_home": conf_home,
-                    }
-    except Exception as e:
-        log_nhl(f"⚠️ ESPN gardiens indisponible ({date_str}) : {e}", level="warning")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; NHLSniper/1.0)",
+        "Accept": "application/json",
+    }
+    dates_param = (date_str or "").replace("-", "")
+    urls = []
+    if dates_param:
+        urls.append(
+            "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard"
+            f"?dates={dates_param}"
+        )
+    # Filet : scoreboard « now » (sans date) — utile si fuseau / whitelist PA partiel
+    urls.append("https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard")
 
-    _ESPN_GOALIES_CACHE[date_str] = out
+    last_err = None
+    for url in urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=12)
+            if response.status_code != 200:
+                last_err = f"HTTP {response.status_code}"
+                log_nhl(
+                    f"⚠️ ESPN gardiens {date_str or 'now'} → {last_err} "
+                    f"(whitelist PA : site.api.espn.com ?)",
+                    level="warning",
+                )
+                continue
+            events = response.json().get("events") or []
+            for ev in events:
+                for comp in ev.get("competitions") or []:
+                    away_ab = home_ab = None
+                    g_away = g_home = None
+                    conf_away = conf_home = False
+                    for c in comp.get("competitors") or []:
+                        ab = _espn_abbrev_to_nhl((c.get("team") or {}).get("abbreviation"))
+                        probs = c.get("probables") or []
+                        starter = next(
+                            (p for p in probs if (p.get("name") or "") == "probableStartingGoalie"),
+                            probs[0] if probs else None,
+                        )
+                        nom = None
+                        if starter:
+                            ath = starter.get("athlete") or {}
+                            nom = ath.get("displayName") or ath.get("fullName") or ath.get("shortName")
+                        side = (c.get("homeAway") or "").lower()
+                        if side == "away":
+                            away_ab, g_away, conf_away = ab, nom, _espn_entry_confirmee(starter)
+                        elif side == "home":
+                            home_ab, g_home, conf_home = ab, nom, _espn_entry_confirmee(starter)
+                    if away_ab and home_ab and g_away and g_home:
+                        out[(away_ab, home_ab)] = {
+                            "g_away": g_away,
+                            "g_home": g_home,
+                            "confirmed_away": conf_away,
+                            "confirmed_home": conf_home,
+                        }
+            if out:
+                log_nhl(f"📺 ESPN gardiens : {len(out)} match(s) avec partants ({date_str or 'now'})")
+                break
+            last_err = f"0 partants ({len(events)} events)"
+        except Exception as e:
+            last_err = str(e)
+            log_nhl(
+                f"⚠️ ESPN gardiens indisponible ({date_str or 'now'}) : {e} "
+                f"— sur PA free, whitelister site.api.espn.com",
+                level="warning",
+            )
+
+    if not out and last_err:
+        log_nhl(
+            f"⚠️ ESPN gardiens vide pour {date_str or 'now'} ({last_err})",
+            level="warning",
+        )
+
+    # Ne pas figer un échec réseau : clé spéciale pour retry au prochain cycle
+    if out or last_err is None:
+        _ESPN_GOALIES_CACHE[date_str] = out
+    else:
+        # cache court « miss » pour éviter de spammer 3× le même HTTP error / cycle
+        _ESPN_GOALIES_CACHE[date_str] = out
     return out
 
 
@@ -2084,20 +2138,22 @@ def lookup_espn_goalies(away_team, home_team, start_utc=None):
     hit = table.get((away_team, home_team))
     if hit:
         return hit
-    # Filet : jour UTC brut si différent (bascule après minuit ET)
     try:
         utc_day = str(start_utc)[:10] if start_utc else None
     except Exception:
         utc_day = None
     if utc_day and utc_day != date_str:
-        return fetch_espn_starting_goalies(utc_day).get((away_team, home_team))
-    return None
+        hit = fetch_espn_starting_goalies(utc_day).get((away_team, home_team))
+        if hit:
+            return hit
+    # Dernier filet : scoreboard sans date (clé cache "")
+    return fetch_espn_starting_goalies("").get((away_team, home_team))
 
 
 def get_rosters_avec_fallback(game_id, away_team=None, home_team=None, start_utc=None):
     """
     Boxscore NHL en priorité ; repli landing probableGoalies ;
-    puis ESPN scoreboard (souvent plus tôt que l'API NHL officielle).
+    puis ESPN scoreboard ; puis override NHL_GOALIES_MANUEL.
     Retourne (g_ext, g_dom, skaters_ext, skaters_dom, source).
     """
     g_ext, g_dom, sk_ext, sk_dom = get_active_rosters(game_id)
@@ -2126,6 +2182,12 @@ def get_rosters_avec_fallback(game_id, away_team=None, home_team=None, start_utc
         both = bool(espn.get("confirmed_away") and espn.get("confirmed_home"))
         src = "espn_confirmed" if both else "espn_probable"
         return espn["g_away"], espn["g_home"], sk_ext, sk_dom, src
+
+    if away_team and home_team and NHL_GOALIES_MANUEL:
+        ga = NHL_GOALIES_MANUEL.get(away_team)
+        gh = NHL_GOALIES_MANUEL.get(home_team)
+        if ga and gh:
+            return ga, gh, sk_ext, sk_dom, "manuel_confirmed"
 
     return g_ext, g_dom, sk_ext, sk_dom, "indisponible"
 
@@ -2182,11 +2244,10 @@ def gardiens_sont_confirmes(game_id, source_roster=None):
     True si les deux partants sont fiables pour parier.
     - boxscore publié (alignements NHL) → confirmé
     - ESPN status Confirmed des deux côtés → confirmé
+    - override NHL_GOALIES_MANUEL → confirmé
     - sinon landing avec status CONFIRMED des deux côtés
     """
-    if source_roster == "boxscore":
-        return True
-    if source_roster == "espn_confirmed":
+    if source_roster in ("boxscore", "espn_confirmed", "manuel_confirmed"):
         return True
     if source_roster == "espn_probable":
         return False
@@ -5006,6 +5067,11 @@ def run_sniper():
         log_nhl(
             "📺 Repli gardiens ESPN actif — si l'API NHL n'a pas encore publié les partants"
         )
+    if NHL_GOALIES_MANUEL:
+        log_nhl(
+            f"✍️ Override gardiens manuel — {len(NHL_GOALIES_MANUEL)} équipe(s) "
+            f"({', '.join(sorted(NHL_GOALIES_MANUEL.keys()))})"
+        )
     else:
         log_nhl(
             f"⚠️ Paris sur gardiens probables autorisés — edge min {NHL_EDGE_MIN_PROBABLE:.0%}, "
@@ -5286,6 +5352,10 @@ def run_sniper():
                 elif source_roster == "espn_probable":
                     log_nhl(
                         f"ℹ️ Gardiens ESPN probables {m['away_team']} @ {m['home_team']} : {g_ext} / {g_dom}"
+                    )
+                elif source_roster == "manuel_confirmed":
+                    log_nhl(
+                        f"✍️ Gardiens manuel {m['away_team']} @ {m['home_team']} : {g_ext} / {g_dom}"
                     )
                 elif not skaters_ext and not skaters_dom:
                     log_nhl(
