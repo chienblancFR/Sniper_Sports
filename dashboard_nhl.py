@@ -461,13 +461,24 @@ st.caption(
 )
 
 df_cal = preparer_calibration_journal(df_termines)
-if "Type_Marche" in df_termines.columns and "Type_Marche" not in df_cal.columns:
-    df_cal = df_cal.merge(
-        df_termines[["Date", "Pari", "Type_Marche", "Gardiens_Confirmes", "Contexte_B2B"]],
-        on=["Date", "Pari"],
-        how="left",
-        suffixes=("", "_dup"),
-    )
+# preparer_calibration renvoie un DF vide (0 colonnes) s'il n'y a pas encore
+# de GAGNÉ/PERDU — ne pas merger dans ce cas (KeyError Date/Pari).
+if (
+    not df_cal.empty
+    and "Type_Marche" in df_termines.columns
+    and "Type_Marche" not in df_cal.columns
+):
+    cols_meta = ["Date", "Pari", "Type_Marche"]
+    for c in ("Gardiens_Confirmes", "Contexte_B2B"):
+        if c in df_termines.columns:
+            cols_meta.append(c)
+    if all(c in df_cal.columns for c in ("Date", "Pari")):
+        df_cal = df_cal.merge(
+            df_termines[cols_meta].drop_duplicates(subset=["Date", "Pari"]),
+            on=["Date", "Pari"],
+            how="left",
+            suffixes=("", "_dup"),
+        )
 
 if len(df_cal) >= NHL_CALIB_MIN:
     brier = calculer_brier_score(df_cal)
