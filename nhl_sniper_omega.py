@@ -66,8 +66,11 @@ EDGE_MINIMUM = float(os.environ.get("NHL_EDGE_MIN", "0.02"))
 NHL_EDGE_MIN_PROBABLE = float(os.environ.get("NHL_EDGE_MIN_PROBABLE", "0.04"))
 # true = aucun pari tant que les partants ne sont pas confirmés (comme lineups MLB)
 NHL_ATTENDRE_GARDIENS_CONFIRMES = _env_bool("NHL_ATTENDRE_GARDIENS_CONFIRMES", True)
-# Repli gardiens via ESPN scoreboard (l'API NHL publie souvent trop tard vs médias)
-NHL_ESPN_GOALIES_ACTIF = _env_bool("NHL_ESPN_GOALIES_ACTIF", True)
+# Repli gardiens via ESPN scoreboard (souvent bloqué Akamai depuis PA)
+NHL_ESPN_GOALIES_ACTIF = _env_bool("NHL_ESPN_GOALIES_ACTIF", False)
+# Repli gardiens SportsData.io (whitelist PA OK) — clé dans NHL_SPORTSDATA_KEY
+NHL_SPORTSDATA_GOALIES_ACTIF = _env_bool("NHL_SPORTSDATA_GOALIES_ACTIF", True)
+NHL_SPORTSDATA_KEY = (os.environ.get("NHL_SPORTSDATA_KEY") or "").strip()
 
 
 def _parser_goalies_manuel(raw):
@@ -84,7 +87,7 @@ def _parser_goalies_manuel(raw):
     return out
 
 
-# Override manuel (filet PA si ESPN bloqué) — ex. PIT=Arturs Silovs;PHI=Dan Vladar;...
+# Override manuel (filet si APIs vides) — ex. PIT=Arturs Silovs;PHI=Dan Vladar;...
 NHL_GOALIES_MANUEL = _parser_goalies_manuel(os.environ.get("NHL_GOALIES_MANUEL", ""))
 NHL_EDGE_DYNAMIQUE_ACTIF = _env_bool("NHL_EDGE_DYNAMIQUE_ACTIF", True)
 NHL_EDGE_DYNAMIQUE_EXTRA = float(os.environ.get("NHL_EDGE_DYNAMIQUE_EXTRA", "0.02"))
@@ -2021,20 +2024,27 @@ def _extraire_nom_gardien(probable_entry):
     return name
 
 
-# ESPN utilise parfois des abréviations différentes de l'API NHL
+# ESPN / SportsData utilisent parfois des abréviations différentes de l'API NHL
 _ESPN_ABBREV_TO_NHL = {
     "LA": "LAK", "NJ": "NJD", "TB": "TBL", "SJ": "SJS",
     "WAS": "WSH", "MON": "MTL", "CLS": "CBJ", "NAS": "NSH",
     "CAL": "CGY", "VEG": "VGK", "LV": "VGK",
 }
 _ESPN_GOALIES_CACHE = {}  # date YYYY-MM-DD → {(away, home): {...}}
+_SPORTSDATA_GOALIES_CACHE = {}  # idem
+_sportsdata_key_warned = False
 
 
-def _espn_abbrev_to_nhl(abbrev):
+def _externe_abbrev_to_nhl(abbrev):
     ab = (abbrev or "").upper().strip()
     if ab in NHL_TEAMS_MAPPING:
         return ab
     return _ESPN_ABBREV_TO_NHL.get(ab, ab)
+
+
+def _espn_abbrev_to_nhl(abbrev):
+    """Alias historique — même mapping ESPN/SportsData → NHL."""
+    return _externe_abbrev_to_nhl(abbrev)
 
 
 def _date_match_depuis_start_utc(start_utc):
@@ -2057,6 +2067,120 @@ def _date_match_depuis_start_utc(start_utc):
             return str(start_utc)[:10]
         except Exception:
             return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _date_sportsdata(date_str):
+    """YYYY-MM-DD → 2026-OCT-01 (format SportsDataIO)."""
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y-%b-%d").upper()
+    except Exception:
+        return None
+
+
+def _nom_gardien_sportsdata(entry):
+    if not entry or not isinstance(entry, dict):
+        return None
+    first = (entry.get("FirstName") or "").strip()
+    last = (entry.get("LastName") or "").strip()
+    nom = f"{first} {last}".strip()
+    return nom or None
+
+
+def fetch_sportsdata_starting_goalies(date_str):
+    """
+    SportsDataIO StartingGoaltendersByDate → partants confirmés / projetés.
+    Retourne {(away, home): {g_away, g_home, confirmed_away, confirmed_home}}.
+    """
+    global _sportsdata_key_warned
+    if date_str in _SPORTSDATA_GOALIES_CACHE:
+        return _SPORTSDATA_GOALIES_CACHE[date_str]
+
+    out = {}
+    if not NHL_SPORTSDATA_GOALIES_ACTIF:
+        _SPORTSDATA_GOALIES_CACHE[date_str] = out
+        return out
+    if not NHL_SPORTSDATA_KEY:
+        if not _sportsdata_key_warned:
+            _sportsdata_key_warned = True
+            log_nhl(
+                "⚠️ SportsData gardiens actif mais NHL_SPORTSDATA_KEY vide — "
+                "ajouter la clé dans env/nhl.env",
+                level="warning",
+            )
+        _SPORTSDATA_GOALIES_CACHE[date_str] = out
+        return out
+
+    sd_date = _date_sportsdata(date_str)
+    if not sd_date:
+        _SPORTSDATA_GOALIES_CACHE[date_str] = out
+        return out
+
+    url = (
+        "https://api.sportsdata.io/v3/nhl/projections/json/"
+        f"StartingGoaltendersByDate/{sd_date}"
+    )
+    try:
+        response = requests.get(
+            url,
+            params={"key": NHL_SPORTSDATA_KEY},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; NHLSniper/1.0)"},
+            timeout=12,
+        )
+        if response.status_code != 200:
+            log_nhl(
+                f"⚠️ SportsData gardiens {sd_date} → HTTP {response.status_code} "
+                f"({(response.text or '')[:120]})",
+                level="warning",
+            )
+            _SPORTSDATA_GOALIES_CACHE[date_str] = out
+            return out
+        rows = response.json()
+        if not isinstance(rows, list):
+            rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            away_ab = _externe_abbrev_to_nhl(row.get("AwayTeam"))
+            home_ab = _externe_abbrev_to_nhl(row.get("HomeTeam"))
+            away_g = row.get("AwayGoaltender") or {}
+            home_g = row.get("HomeGoaltender") or {}
+            g_away = _nom_gardien_sportsdata(away_g)
+            g_home = _nom_gardien_sportsdata(home_g)
+            if not (away_ab and home_ab and g_away and g_home):
+                continue
+            out[(away_ab, home_ab)] = {
+                "g_away": g_away,
+                "g_home": g_home,
+                "confirmed_away": bool(away_g.get("Confirmed")),
+                "confirmed_home": bool(home_g.get("Confirmed")),
+            }
+        if out:
+            log_nhl(f"📡 SportsData gardiens : {len(out)} match(s) ({sd_date})")
+        else:
+            log_nhl(f"ℹ️ SportsData gardiens : 0 partant pour {sd_date}")
+    except Exception as e:
+        log_nhl(f"⚠️ SportsData gardiens indisponible ({sd_date}) : {e}", level="warning")
+
+    _SPORTSDATA_GOALIES_CACHE[date_str] = out
+    return out
+
+
+def lookup_sportsdata_goalies(away_team, home_team, start_utc=None):
+    """Cherche les partants SportsData pour un match NHL."""
+    if not NHL_SPORTSDATA_GOALIES_ACTIF or not away_team or not home_team:
+        return None
+    date_str = _date_match_depuis_start_utc(start_utc)
+    table = fetch_sportsdata_starting_goalies(date_str)
+    hit = table.get((away_team, home_team))
+    if hit:
+        return hit
+    try:
+        utc_day = str(start_utc)[:10] if start_utc else None
+    except Exception:
+        utc_day = None
+    if utc_day and utc_day != date_str:
+        return fetch_sportsdata_starting_goalies(utc_day).get((away_team, home_team))
+    return None
 
 
 def _espn_entry_confirmee(prob_entry):
@@ -2185,7 +2309,7 @@ def lookup_espn_goalies(away_team, home_team, start_utc=None):
 def get_rosters_avec_fallback(game_id, away_team=None, home_team=None, start_utc=None):
     """
     Boxscore NHL en priorité ; repli landing probableGoalies ;
-    puis ESPN scoreboard ; puis override NHL_GOALIES_MANUEL.
+    puis SportsData ; puis ESPN ; puis override NHL_GOALIES_MANUEL.
     Retourne (g_ext, g_dom, skaters_ext, skaters_dom, source).
     """
     g_ext, g_dom, sk_ext, sk_dom = get_active_rosters(game_id)
@@ -2208,6 +2332,12 @@ def get_rosters_avec_fallback(game_id, away_team=None, home_team=None, start_utc
                 return g_ext, g_dom, sk_ext, sk_dom, "landing_probable"
     except Exception:
         pass
+
+    sd = lookup_sportsdata_goalies(away_team, home_team, start_utc)
+    if sd and sd.get("g_away") and sd.get("g_home"):
+        both = bool(sd.get("confirmed_away") and sd.get("confirmed_home"))
+        src = "sportsdata_confirmed" if both else "sportsdata_probable"
+        return sd["g_away"], sd["g_home"], sk_ext, sk_dom, src
 
     espn = lookup_espn_goalies(away_team, home_team, start_utc)
     if espn and espn.get("g_away") and espn.get("g_home"):
@@ -2274,14 +2404,17 @@ def get_goalie_confirmation_status(game_id):
 def gardiens_sont_confirmes(game_id, source_roster=None):
     """
     True si les deux partants sont fiables pour parier.
-    - boxscore publié (alignements NHL) → confirmé
-    - ESPN status Confirmed des deux côtés → confirmé
-    - override NHL_GOALIES_MANUEL → confirmé
-    - sinon landing avec status CONFIRMED des deux côtés
+    - boxscore / SportsData Confirmed / ESPN Confirmed / manuel → confirmé
+    - sinon landing NHL avec status CONFIRMED des deux côtés
     """
-    if source_roster in ("boxscore", "espn_confirmed", "manuel_confirmed"):
+    if source_roster in (
+        "boxscore",
+        "sportsdata_confirmed",
+        "espn_confirmed",
+        "manuel_confirmed",
+    ):
         return True
-    if source_roster == "espn_probable":
+    if source_roster in ("sportsdata_probable", "espn_probable"):
         return False
     statut = get_goalie_confirmation_status(game_id)
     return bool(statut.get("away_confirmed") and statut.get("home_team_confirmed"))
@@ -5093,16 +5226,28 @@ def run_sniper():
     if NHL_ATTENDRE_GARDIENS_CONFIRMES:
         log_nhl(
             "🛡️ Attente gardiens confirmés — aucun pari sur simple « probable » "
-            "(boxscore / NHL CONFIRMED / ESPN Confirmed / manuel requis)"
+            "(boxscore / NHL CONFIRMED / SportsData / ESPN / manuel requis)"
         )
     else:
         log_nhl(
             f"⚠️ Paris sur gardiens probables autorisés — edge min {NHL_EDGE_MIN_PROBABLE:.0%}, "
             f"Kelly ÷2 ({KELLY_FRACTION_GARDIEN_INCERTAIN})"
         )
+    if NHL_SPORTSDATA_GOALIES_ACTIF:
+        if NHL_SPORTSDATA_KEY:
+            log_nhl(
+                "📡 Repli gardiens SportsData actif — StartingGoaltendersByDate "
+                "(clé configurée)"
+            )
+        else:
+            log_nhl(
+                "⚠️ SportsData gardiens ON mais NHL_SPORTSDATA_KEY manquante "
+                "(env/nhl.env)",
+                level="warning",
+            )
     if NHL_ESPN_GOALIES_ACTIF:
         log_nhl(
-            "📺 Repli gardiens ESPN actif — si l'API NHL n'a pas encore publié les partants"
+            "📺 Repli gardiens ESPN actif — souvent bloqué depuis PA (Akamai 403)"
         )
     if NHL_GOALIES_MANUEL:
         log_nhl(
@@ -5328,7 +5473,8 @@ def run_sniper():
             equipes_en_b2b_hier = get_teams_played_yesterday()
             derniers_lieux = get_team_last_game_venues()
             odds_cache = fetch_all_pinnacle_odds()
-            _ESPN_GOALIES_CACHE.clear()  # rafraîchir partants ESPN à chaque cycle
+            _ESPN_GOALIES_CACHE.clear()
+            _SPORTSDATA_GOALIES_CACHE.clear()  # rafraîchir partants à chaque cycle
 
             matchs = get_nhl_games_today()
             opportunites = []
@@ -5384,6 +5530,14 @@ def run_sniper():
                 elif source_roster == "espn_probable":
                     log_nhl(
                         f"ℹ️ Gardiens ESPN probables {m['away_team']} @ {m['home_team']} : {g_ext} / {g_dom}"
+                    )
+                elif source_roster == "sportsdata_confirmed":
+                    log_nhl(
+                        f"✅ Gardiens SportsData confirmés {m['away_team']} @ {m['home_team']} : {g_ext} / {g_dom}"
+                    )
+                elif source_roster == "sportsdata_probable":
+                    log_nhl(
+                        f"ℹ️ Gardiens SportsData probables {m['away_team']} @ {m['home_team']} : {g_ext} / {g_dom}"
                     )
                 elif source_roster == "manuel_confirmed":
                     log_nhl(
