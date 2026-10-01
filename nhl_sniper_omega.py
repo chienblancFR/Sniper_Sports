@@ -8,6 +8,7 @@ import os
 import logging
 import ftplib
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from io import BytesIO, StringIO, TextIOWrapper
 import traceback
@@ -5024,11 +5025,24 @@ def _ecrire_journal(rows):
 
 
 def publier_journal_dashboard():
-    """Journal déjà sur PA, ou upload FTP optionnel depuis une machine locale."""
-    if os.path.isdir(PA_DATA_DIR) and FICHIER_JOURNAL.startswith(PA_DATA_DIR):
-        return
+    """
+    Rend le journal visible pour Streamlit via l'URL PA /data/...
+
+    Sur PythonAnywhere, le static `/data/` pointe souvent sur `~/` et non `~/data/`.
+    Le bot écrit le canonique dans `~/data/` ; on mirroir aussi vers `~/JOURNAL_NOM`.
+    """
     if not os.path.exists(FICHIER_JOURNAL):
         return
+
+    if os.path.isdir(PA_DATA_DIR) and FICHIER_JOURNAL.startswith(PA_DATA_DIR):
+        legacy = os.path.join(os.path.expanduser("~"), JOURNAL_NOM)
+        try:
+            if os.path.abspath(FICHIER_JOURNAL) != os.path.abspath(legacy):
+                shutil.copy2(FICHIER_JOURNAL, legacy)
+        except OSError as e:
+            log_nhl(f"⚠️ Miroir journal static (~/) échoué : {e}", level="warning")
+        return
+
     ftp_user = os.environ.get("PA_FTP_USER", "")
     ftp_pass = os.environ.get("PA_FTP_PASSWORD", "")
     if not ftp_user or not ftp_pass:
@@ -5042,7 +5056,14 @@ def publier_journal_dashboard():
             ftp.cwd(remote_dir)
             with open(FICHIER_JOURNAL, "rb") as f:
                 ftp.storbinary(f"STOR {remote_name}", f)
-        log_nhl(f"📤 Journal uploadé → {ftp_host}{remote_dir}/{remote_name}")
+            # Miroir home (static /data/ → ~/)
+            try:
+                ftp.cwd("/home/chienblanc")
+                with open(FICHIER_JOURNAL, "rb") as f:
+                    ftp.storbinary(f"STOR {remote_name}", f)
+            except Exception:
+                pass
+        log_nhl(f"📤 Journal uploadé → {ftp_host} ({remote_name})")
     except Exception as e:
         log_nhl(f"⚠️ Upload FTP journal échoué : {e}", level="warning")
 
