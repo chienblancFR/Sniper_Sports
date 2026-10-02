@@ -5177,6 +5177,36 @@ def _extraire_cote_clv(home_abbr, away_abbr, type_pari, cote_actuelle, odds_cach
     return cote_actuelle
 
 
+def _etat_match_nhl(game_id):
+    """gameState NHL (FUT/PRE/LIVE/CRIT/OFF/…) ou None."""
+    try:
+        response = requests.get(
+            f"https://api-web.nhle.com/v1/gamecenter/{game_id}/landing",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if response.status_code != 200:
+            return None
+        return str(response.json().get("gameState") or "").upper() or None
+    except Exception:
+        return None
+
+
+def _cote_clv_plausible(cote_prise, cote_clv, max_dev_rel=0.45):
+    """
+    Rejette les cotes 'live blowout' (ex. ML 2.14 → 8.13) qui ne sont pas une
+    vraie closing line pré-match.
+    """
+    try:
+        prise = float(cote_prise)
+        clv = float(cote_clv)
+    except (TypeError, ValueError):
+        return False
+    if prise <= 1.0 or clv <= 1.0:
+        return False
+    return abs(clv - prise) / prise <= max_dev_rel
+
+
 def compter_paris_en_attente():
     if not os.path.exists(FICHIER_JOURNAL):
         return 0
@@ -5187,7 +5217,37 @@ def compter_paris_en_attente():
         return 0
 
 
+def _reparer_clv_aberrants():
+    """
+    Remet Cote_CLV = Cote_Prise si l'écart est absurde (CLV live post-puck).
+    CLV affiché ≈ 0 % = closing inconnue plutôt qu'une fausse −70 %.
+    """
+    if not os.path.exists(FICHIER_JOURNAL):
+        return
+    migrer_journal_si_besoin()
+    rows, modifie, n = [], False, 0
+    with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            prise, clv = row.get("Cote_Prise"), row.get("Cote_CLV")
+            if prise and clv and not _cote_clv_plausible(prise, clv):
+                row["Cote_CLV"] = prise
+                modifie = True
+                n += 1
+            rows.append(row)
+    if modifie:
+        _ecrire_journal(rows)
+        publier_journal_dashboard()
+        log_nhl(
+            f"🛠️ CLV réparé — {n} ligne(s) avec Cote_CLV aberrante "
+            f"(écart >45 % vs prise) → reset à Cote_Prise"
+        )
+
+
 def traquer_et_actualiser_clv():
+    """
+    Met à jour Cote_CLV uniquement en pré-match (FUT/PRE).
+    Une fois le puck droppé (LIVE/CRIT/OFF), la closing est figée.
+    """
     if not os.path.exists(FICHIER_JOURNAL):
         return
     migrer_journal_si_besoin()
@@ -5196,11 +5256,24 @@ def traquer_et_actualiser_clv():
     with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if row.get("Statut") == "EN ATTENTE":
+                raw_id = row.get("ID_Match") or ""
+                game_id = raw_id.split("|")[0].split("_")[0]
+                etat = _etat_match_nhl(game_id) if game_id else None
+                # Ne plus bouger la closing une fois le match commencé / fini
+                if etat and etat not in ETATS_MATCH_PRIORITAIRES:
+                    rows.append(row)
+                    continue
                 ext, dom, type_pari = row["Visiteur"], row["Local"], row["Pari"]
                 nv_cote = _extraire_cote_clv(dom, ext, type_pari, row["Cote_CLV"], odds_cache)
-                if nv_cote != row["Cote_CLV"]:
+                if nv_cote != row["Cote_CLV"] and _cote_clv_plausible(row.get("Cote_Prise"), nv_cote):
                     row["Cote_CLV"] = nv_cote
                     mise_a_jour_effectuee = True
+                elif nv_cote != row["Cote_CLV"] and not _cote_clv_plausible(row.get("Cote_Prise"), nv_cote):
+                    log_nhl(
+                        f"⚠️ CLV ignoré (écart trop fort) {ext}@{dom} {type_pari} : "
+                        f"prise {row.get('Cote_Prise')} → {nv_cote} (état={etat or '?'})",
+                        level="warning",
+                    )
             rows.append(row)
     if mise_a_jour_effectuee:
         _ecrire_journal(rows)
@@ -5436,6 +5509,7 @@ def run_sniper():
     while True:
         try:
             lancer_la_balayeuse()
+            _reparer_clv_aberrants()
             _invalider_rho_meta_cache()
             _invalider_pit_index_memo()
             _invalider_goalie_pit_index_memo()
