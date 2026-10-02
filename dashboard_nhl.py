@@ -145,9 +145,12 @@ def enrichir_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if "Pari" in df.columns:
         df["Type_Marche"] = df["Pari"].apply(extraire_type_pari)
     if "Cote_Prise" in df.columns and "Cote_CLV" in df.columns:
-        mask = (df["Cote_Prise"] > 1) & (df["Cote_CLV"] > 1)
-        df["CLV"] = None
-        df.loc[mask, "CLV"] = df.loc[mask, "Cote_Prise"] / df.loc[mask, "Cote_CLV"] - 1
+        cote_p = pd.to_numeric(df["Cote_Prise"], errors="coerce")
+        cote_c = pd.to_numeric(df["Cote_CLV"], errors="coerce")
+        mask = (cote_p > 1) & (cote_c > 1)
+        df["CLV"] = pd.NA
+        df.loc[mask, "CLV"] = cote_p.loc[mask] / cote_c.loc[mask] - 1
+        df["CLV"] = pd.to_numeric(df["CLV"], errors="coerce")
     if "Gardiens_Confirmes" in df.columns:
         df["Gardiens_Confirmes"] = (
             df["Gardiens_Confirmes"].astype(str).str.strip().str.upper()
@@ -580,11 +583,15 @@ COLONNES_ATTENTE = [
 def _preparer_tableau_affichage(df_src: pd.DataFrame, colonnes: list) -> pd.DataFrame:
     df_out = df_src.copy()
     if "CLV" in df_out.columns:
-        df_out["CLV (%)"] = (df_out["CLV"] * 100).round(2)
+        clv = pd.to_numeric(df_out["CLV"], errors="coerce")
+        df_out["CLV (%)"] = (clv * 100).round(2)
     if "Confiance_Kelly" in df_out.columns:
-        df_out["Confiance_Kelly"] = df_out["Confiance_Kelly"].round(3)
+        df_out["Confiance_Kelly"] = pd.to_numeric(
+            df_out["Confiance_Kelly"], errors="coerce"
+        ).round(3)
     if "Hia" in df_out.columns:
-        df_out["Hia"] = (df_out["Hia"] * 100).round(2)
+        hia = pd.to_numeric(df_out["Hia"], errors="coerce")
+        df_out["Hia"] = (hia * 100).round(2)
     cols = [c for c in colonnes if c in df_out.columns]
     if "CLV (%)" in df_out.columns and "CLV (%)" not in cols:
         cols.append("CLV (%)")
