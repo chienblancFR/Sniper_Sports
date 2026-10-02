@@ -69,8 +69,40 @@ def _score_journal(df: pd.DataFrame, mtime: float) -> tuple:
     return (n_attente, mtime)
 
 
+def _normaliser_colonnes_journal(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aligne les en-têtes CSV (notamment Mise_€ souvent lu en mojibake latin-1).
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    rename = {}
+    for c in df.columns:
+        if c == "Mise_€":
+            continue
+        # UTF-8 euro mal décodé en latin-1 / cp1252 → Mise_â\x82¬, Mise_â¬, etc.
+        try:
+            fixed = c.encode("latin-1").decode("utf-8")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            fixed = c
+        fixed = fixed.replace("\u20ac", "€")
+        if fixed == "Mise_€" or c in ("Mise_EUR", "Mise_Eur", "Mise"):
+            rename[c] = "Mise_€"
+        elif (
+            c.startswith("Mise_")
+            and "Mise_€" not in df.columns
+            and "Mise_€" not in rename.values()
+        ):
+            rename[c] = "Mise_€"
+    if rename:
+        df = df.rename(columns=rename)
+    return df
+
+
 def _charger_csv(url: str, fichier_local: str):
     """Local le plus récent (priorité EN ATTENTE) → URL PA."""
+    from io import BytesIO
+
     erreurs = []
     best_df, best_src, best_score = None, None, (-1, -1.0)
 
@@ -78,7 +110,8 @@ def _charger_csv(url: str, fichier_local: str):
         if not os.path.isfile(path):
             continue
         try:
-            df = pd.read_csv(path)
+            df = pd.read_csv(path, encoding="utf-8")
+            df = _normaliser_colonnes_journal(df)
             if df.empty:
                 erreurs.append(f"{path}: vide")
                 continue
@@ -99,7 +132,8 @@ def _charger_csv(url: str, fichier_local: str):
     try:
         r = requests.get(url, timeout=20)
         if r.status_code == 200:
-            df = pd.read_csv(StringIO(r.text))
+            df = pd.read_csv(BytesIO(r.content), encoding="utf-8")
+            df = _normaliser_colonnes_journal(df)
             if not df.empty:
                 n_a = _score_journal(df, 0)[0]
                 return df, "ok", f"URL PA · {fichier_local} ({n_a} en attente / {len(df)} lignes)"
@@ -360,7 +394,8 @@ df_attente = df_live[df_live["Statut"] == "EN ATTENTE"].copy()
 
 total_pl = df_termines["P&L"].sum() if not df_termines.empty else 0.0
 capital_actuel = CAPITAL_INITIAL + total_pl
-total_mise = df_termines["Mise_€"].sum() if not df_termines.empty else 0.0
+col_mise = "Mise_€" if "Mise_€" in df_termines.columns else None
+total_mise = float(df_termines[col_mise].sum()) if col_mise and not df_termines.empty else 0.0
 roi = (total_pl / total_mise * 100) if total_mise > 0 else 0
 winrate = (
     len(df_termines[df_termines["Statut"] == "GAGNÉ"]) / len(df_termines) * 100
