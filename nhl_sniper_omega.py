@@ -5747,12 +5747,35 @@ def run_sniper():
 # 8. LA BALAYEUSE & INTELLIGENCE
 # ==========================================
 def get_match_result(game_id):
+    """
+    Scores finaux NHL (away, home) ou None si le match n'est pas terminé.
+    L'API moderne utilise gameState OFF (parfois FINAL*) et score dans awayTeam/homeTeam.
+    """
     try:
-        response = requests.get(f"https://api-web.nhle.com/v1/gamecenter/{game_id}/boxscore", timeout=10)
+        response = requests.get(
+            f"https://api-web.nhle.com/v1/gamecenter/{game_id}/boxscore",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return None
         data = response.json()
-        if response.status_code == 200 and data["gameState"] == "FINAL": return data["awayScore"], data["homeScore"]
+        state = str(data.get("gameState") or "").upper()
+        # OFF = terminé (API NHL actuelle) ; FINAL / FINAL/OT / FINAL/SO = legacy
+        if state not in ("OFF", "FINAL", "FINAL/OT", "FINAL/SO"):
+            return None
+        away = data.get("awayScore")
+        home = data.get("homeScore")
+        if away is None:
+            away = (data.get("awayTeam") or {}).get("score")
+        if home is None:
+            home = (data.get("homeTeam") or {}).get("score")
+        if away is None or home is None:
+            return None
+        return int(away), int(home)
+    except Exception:
         return None
-    except: return None
+
 
 def lancer_la_balayeuse():
     if not os.path.exists(FICHIER_JOURNAL):
@@ -5760,6 +5783,7 @@ def lancer_la_balayeuse():
     migrer_journal_si_besoin()
     rows = []
     modifie = False
+    nb_regles = 0
     with open(FICHIER_JOURNAL, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if row.get("Statut") == "EN ATTENTE":
@@ -5769,6 +5793,7 @@ def lancer_la_balayeuse():
                 res = get_match_result(game_id)
                 if res:
                     modifie = True
+                    nb_regles += 1
                     score_v, score_d = res
                     row["Score_Ext"] = str(score_v)
                     row["Score_Dom"] = str(score_d)
@@ -5776,6 +5801,7 @@ def lancer_la_balayeuse():
                     mise, cote_book = float(row["Mise_€"]), float(row["Cote_Prise"])
 
                     gagne = False
+                    rembourse = False
                     if "Victoire" in pari:
                         if (score_d > score_v and dom in pari) or (score_v > score_d and ext in pari):
                             gagne = True
@@ -5786,17 +5812,28 @@ def lancer_la_balayeuse():
                         parts = pari.split(" ")
                         cut = float(parts[1])
                         total_buts = score_d + score_v
-                        if "OVER" in pari and total_buts > cut:
+                        if abs(total_buts - cut) < 1e-9:
+                            rembourse = True
+                        elif "OVER" in pari and total_buts > cut:
                             gagne = True
                         elif "UNDER" in pari and total_buts < cut:
                             gagne = True
 
-                    row["Statut"] = "GAGNÉ" if gagne else "PERDU"
-                    row["P&L"] = f"{round(mise * (cote_book - 1), 2) if gagne else -mise}"
+                    if rembourse:
+                        row["Statut"] = "REMBOURSÉ"
+                        row["P&L"] = "0.00"
+                    else:
+                        row["Statut"] = "GAGNÉ" if gagne else "PERDU"
+                        row["P&L"] = f"{round(mise * (cote_book - 1), 2) if gagne else -mise}"
+                    log_nhl(
+                        f"🧹 Balayeuse — {ext}@{dom} {pari} → {score_v}-{score_d} "
+                        f"{row['Statut']} (P&L {row['P&L']})"
+                    )
             rows.append(row)
     if modifie:
         _ecrire_journal(rows)
         publier_journal_dashboard()
+        log_nhl(f"🧹 Balayeuse terminée — {nb_regles} pari(s) dénoué(s)")
 
 _rho_meta_cache = None
 
