@@ -2309,13 +2309,20 @@ def lookup_espn_goalies(away_team, home_team, start_utc=None):
 
 def get_rosters_avec_fallback(game_id, away_team=None, home_team=None, start_utc=None):
     """
-    Boxscore NHL en priorité ; repli landing probableGoalies ;
-    puis SportsData ; puis ESPN ; puis override NHL_GOALIES_MANUEL.
+    Boxscore NHL en priorité ; puis override NHL_GOALIES_MANUEL (les 2 équipes) ;
+    sinon landing / SportsData / ESPN.
     Retourne (g_ext, g_dom, skaters_ext, skaters_dom, source).
     """
     g_ext, g_dom, sk_ext, sk_dom = get_active_rosters(game_id)
     if g_ext and g_dom:
         return g_ext, g_dom, sk_ext, sk_dom, "boxscore"
+
+    # Manuel avant les APIs « probable » — sinon ESPN/landing bloquent l'override
+    if away_team and home_team and NHL_GOALIES_MANUEL:
+        ga = NHL_GOALIES_MANUEL.get(away_team)
+        gh = NHL_GOALIES_MANUEL.get(home_team)
+        if ga and gh:
+            return ga, gh, sk_ext, sk_dom, "manuel_confirmed"
 
     url = f"https://api-web.nhle.com/v1/gamecenter/{game_id}/landing"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -2345,12 +2352,6 @@ def get_rosters_avec_fallback(game_id, away_team=None, home_team=None, start_utc
         both = bool(espn.get("confirmed_away") and espn.get("confirmed_home"))
         src = "espn_confirmed" if both else "espn_probable"
         return espn["g_away"], espn["g_home"], sk_ext, sk_dom, src
-
-    if away_team and home_team and NHL_GOALIES_MANUEL:
-        ga = NHL_GOALIES_MANUEL.get(away_team)
-        gh = NHL_GOALIES_MANUEL.get(home_team)
-        if ga and gh:
-            return ga, gh, sk_ext, sk_dom, "manuel_confirmed"
 
     return g_ext, g_dom, sk_ext, sk_dom, "indisponible"
 
