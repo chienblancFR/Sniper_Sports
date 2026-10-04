@@ -1030,7 +1030,8 @@ def creer_graphique_pl_marche(
     df: pd.DataFrame,
     col_x: str,
     titre_x: str = "Catégorie",
-    titre_y: str = "P&L"
+    titre_y: str = "P&L",
+    unite: str = "u",
 ) -> go.Figure:
     """
     Graphique à barres : P&L par catégorie (marché, ligue…).
@@ -1043,7 +1044,7 @@ def creer_graphique_pl_marche(
         x=df[col_x],
         y=df['P_and_L'],
         marker_color=couleurs,
-        text=[f"{v:+.2f} u<br>{n} paris" for v, n in zip(df['P_and_L'], df['Volume'])],
+        text=[f"{v:+.2f} {unite}<br>{n} paris" for v, n in zip(df['P_and_L'], df['Volume'])],
         textposition='outside',
         name='P&L'
     ))

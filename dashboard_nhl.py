@@ -473,6 +473,7 @@ with col_gauche:
             col_x="Type_Marche",
             titre_x="Marché",
             titre_y="Profit / Perte (€)",
+            unite="€",
         )
         st.plotly_chart(fig_segment, use_container_width=True)
     else:
