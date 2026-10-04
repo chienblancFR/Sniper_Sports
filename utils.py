@@ -1031,12 +1031,22 @@ def creer_graphique_pl_marche(
     col_x: str,
     titre_x: str = "Catégorie",
     titre_y: str = "P&L",
-    unite: str = "u",
+    unite: str | None = None,
 ) -> go.Figure:
     """
     Graphique à barres : P&L par catégorie (marché, ligue…).
     Attend les colonnes P_and_L et Volume dans df.
+    Si unite est omis, déduit € / U depuis titre_y.
     """
+    if unite is None:
+        ty = titre_y or ""
+        if "€" in ty or "EUR" in ty.upper():
+            unite = "€"
+        elif "Unit" in ty or "(U)" in ty:
+            unite = "U"
+        else:
+            unite = "u"
+
     couleurs = ['#00FF00' if v >= 0 else '#FF4500' for v in df['P_and_L']]
 
     fig = go.Figure()
