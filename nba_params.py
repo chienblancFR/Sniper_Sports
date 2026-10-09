@@ -79,6 +79,18 @@ def reload_tuned_params() -> None:
     _load_tuned()
 
 
+def set_tuned_global_in_memory(global_params: dict) -> None:
+    """Surcharge `_global` en mémoire uniquement (pas d'écriture disque).
+
+    Utilisé par `backtest_nba.py --tune` pour évaluer des centaines de
+    candidats sans réécrire `nba_params_tuned.json` à chaque itération.
+    """
+    global _tuned_cache
+    base = dict(_load_tuned())
+    base["_global"] = dict(global_params)
+    _tuned_cache = base
+
+
 def _global_entry() -> dict:
     return _load_tuned().get("_global", {})
 
@@ -87,9 +99,9 @@ def _team_entry(team: str) -> dict:
     return _load_tuned().get("teams", {}).get(team, {})
 
 
-def get_n_prior() -> int:
+def get_n_prior() -> float:
     g = _global_entry()
-    return int(g["n_prior"]) if "n_prior" in g else N_PRIOR_DEFAULT
+    return float(g["n_prior"]) if "n_prior" in g else float(N_PRIOR_DEFAULT)
 
 
 def get_rating_half_life_jours() -> float:

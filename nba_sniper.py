@@ -98,9 +98,13 @@ NBA_SCAN_HEURES_AVANCE = float(os.environ.get("NBA_SCAN_HEURES_AVANCE", "12"))
 # saison (échantillon faible = incertitude modèle plus grande), pattern
 # NHL_EDGE_DYNAMIQUE_*.
 NBA_EDGE_MIN = float(os.environ.get("NBA_EDGE_MIN", "0.03"))
+# Edge min dédié SPREAD (BT : CLV SPREAD pire que ML/TOTAL) — 0 = même seuil que NBA_EDGE_MIN.
+NBA_EDGE_MIN_SPREAD = float(os.environ.get("NBA_EDGE_MIN_SPREAD", "0.05"))
 NBA_EDGE_DYNAMIQUE_ACTIF = _env_bool("NBA_EDGE_DYNAMIQUE_ACTIF", True)
 NBA_EDGE_DYNAMIQUE_EXTRA = float(os.environ.get("NBA_EDGE_DYNAMIQUE_EXTRA", "0.02"))
 NBA_EDGE_DYNAMIQUE_GP_PLEIN = float(os.environ.get("NBA_EDGE_DYNAMIQUE_GP_PLEIN", "20"))
+# Tolérance (pts) pour matcher une cote de clôture quand la ligne a bougé (CLV approx).
+NBA_CLV_LIGNE_TOLERANCE = float(os.environ.get("NBA_CLV_LIGNE_TOLERANCE", "1.5"))
 
 # Marchés actifs (ML=moneyline, SPREAD=handicap, TOTAL=total points).
 NBA_MARCHES_ACTIFS = {
@@ -171,6 +175,10 @@ GAME_ID_PREFIX_REGULAR = "002"
 NBA_SAISONS_COVID = {2020, 2021}
 
 _pit_index_memo = {}
+# Cache dédié fin-de-saison (prior N-1) — indépendant de `_pit_index_memo`
+# (sinon `stats_fin_saison_nba(N-1)` reconstruit l'index à chaque match du
+# walk-forward / --tune, ~10× plus lent).
+_fin_saison_memo: dict = {}
 
 
 def is_saison_covid(season_year):
@@ -329,12 +337,28 @@ def _extraire_adversaire(matchup):
 
 def _fusionner_logs_saison(season_year, force=False):
     """Fusionne Base + Advanced + Four Factors → 1 enregistrement complet par
-    (match, équipe), avec le score adverse (2e ligne du même GAME_ID)."""
+    (match, équipe), avec le score adverse (2e ligne du même GAME_ID).
+
+    ⚠️ Normalisation de date critique : `GAME_DATE` (teamgamelogs, convention
+    NBA « jour Eastern ») NE correspond PAS à `date_utc` (`ScheduleLeagueV2`,
+    UTC) pour ~78% des matchs — tout tip-off ≥ ~19h ET bascule déjà sur le
+    jour UTC suivant (vérifié empiriquement : 77.7% de mismatch saison
+    2023-24). Sans réalignement, le filtre walk-forward `date < date_ref`
+    (utilisé partout dans le moteur avec `date_ref` = `date_utc`) incluait le
+    match lui-même comme « passé » pour la majorité des matchs — fuite de
+    look-ahead critique (le modèle voyait son propre score final). On
+    réaligne donc chaque date de boxscore sur `date_utc` via un join game_id
+    -> schedule (même base que `date_ref` partout ailleurs dans le moteur)."""
     base = _fetch_team_game_logs(season_year, "Base", force=force)
     if not base:
         return []
     advanced = _fetch_team_game_logs(season_year, "Advanced", force=force)
     four_factors = _fetch_team_game_logs(season_year, "Four Factors", force=force)
+
+    schedule = fetch_saison_schedule(season_year=season_year, force=force)
+    date_utc_par_game = {
+        m["game_id"]: str(m.get("date_utc") or "")[:10] for m in schedule if m.get("game_id")
+    }
 
     adv_par_cle = {(l.get("GAME_ID"), l.get("TEAM_ID")): l for l in advanced}
     ff_par_cle = {(l.get("GAME_ID"), l.get("TEAM_ID")): l for l in four_factors}
@@ -354,12 +378,14 @@ def _fusionner_logs_saison(season_year, force=False):
         adv = adv_par_cle.get((game_id, team_id), {})
         ff = ff_par_cle.get((game_id, team_id), {})
         matchup = ligne.get("MATCHUP") or ""
+        date_boxscore = (ligne.get("GAME_DATE") or "")[:10]
+        date_norm = date_utc_par_game.get(game_id) or date_boxscore
         records.append({
             "season": season_year,
             "game_id": game_id,
             "team_id": team_id,
             "team": ligne.get("TEAM_ABBREVIATION"),
-            "date": (ligne.get("GAME_DATE") or "")[:10],
+            "date": date_norm,
             "domicile": _extraire_domicile(matchup),
             "opponent": _extraire_adversaire(matchup) or opp.get("TEAM_ABBREVIATION"),
             "pts": ligne.get("PTS"),
@@ -524,20 +550,25 @@ def stats_fin_saison_nba(season_year, force=False):
     l'intégralité de la saison régulière `season_year`) par équipe — sert de
     prior « saison N-1 » pour le blend début de saison suivante (pattern
     `teams_n1` du NHL), à utiliser par la phase moteur mathématique."""
-    global _pit_index_memo
-    if _pit_index_memo.get("season") == season_year and "finaux" in _pit_index_memo:
+    global _pit_index_memo, _fin_saison_memo
+    if not force and season_year in _fin_saison_memo:
+        return _fin_saison_memo[season_year]
+    if not force and _pit_index_memo.get("season") == season_year and "finaux" in _pit_index_memo:
+        _fin_saison_memo[season_year] = _pit_index_memo["finaux"]
         return _pit_index_memo["finaux"]
 
     records = _fusionner_logs_saison(season_year, force=force)
     if not records:
         return {}
     _snapshots, finaux = _construire_index_saison(records)
+    _fin_saison_memo[season_year] = finaux
     return finaux
 
 
 def _invalider_pit_index_memo():
-    global _pit_index_memo
+    global _pit_index_memo, _fin_saison_memo
     _pit_index_memo = {}
+    _fin_saison_memo = {}
 
 
 # ==========================================
@@ -1290,24 +1321,31 @@ def shrink_probabilites_vers_marche_nba(probas, cotes_match, gp_moyen_match):
 # ==========================================
 # 8. EDGE / KELLY / SELECTION DES CANDIDATS
 # ==========================================
-def _edge_minimum_dynamique_nba(gp_moyen):
+def _edge_minimum_dynamique_nba(gp_moyen, marche=None):
     """Edge minimum majoré en début de saison (échantillon faible = incertitude
     modèle plus grande), rampe linéaire jusqu'à `NBA_EDGE_DYNAMIQUE_GP_PLEIN`
-    GP moyen/match — pattern `_edge_minimum_dynamique` NHL."""
+    GP moyen/match — pattern `_edge_minimum_dynamique` NHL.
+
+    `marche` : si ``SPREAD``, applique aussi `NBA_EDGE_MIN_SPREAD` (plancher
+    plus haut — CLV backtest plus faible sur ce marché).
+    """
+    base = NBA_EDGE_MIN
+    if (marche or "").upper() == "SPREAD" and NBA_EDGE_MIN_SPREAD > 0:
+        base = max(base, NBA_EDGE_MIN_SPREAD)
     if not NBA_EDGE_DYNAMIQUE_ACTIF or NBA_EDGE_DYNAMIQUE_GP_PLEIN <= 0:
-        return NBA_EDGE_MIN
+        return base
     gp = max(gp_moyen or 0.0, 0.0)
     ramp = max(0.0, 1.0 - min(gp, NBA_EDGE_DYNAMIQUE_GP_PLEIN) / NBA_EDGE_DYNAMIQUE_GP_PLEIN)
-    return NBA_EDGE_MIN + NBA_EDGE_DYNAMIQUE_EXTRA * ramp
+    return base + NBA_EDGE_DYNAMIQUE_EXTRA * ramp
 
 
-def calculate_kelly_nba(true_prob, book_odds, bankroll, kelly_mult=1.0, gp_moyen=None, edge_min_override=None):
+def calculate_kelly_nba(true_prob, book_odds, bankroll, kelly_mult=1.0, gp_moyen=None, edge_min_override=None, marche=None):
     """Kelly fractionnel + cap % bankroll — pattern `calculate_kelly` NHL
     (sans les composantes gardiens, non applicables en NBA v1)."""
     if book_odds is None or book_odds <= 1.0 or true_prob is None or true_prob <= 0.01 or true_prob >= 0.99:
         return None
     edge = true_prob - (1.0 / book_odds)
-    edge_min = _edge_minimum_dynamique_nba(gp_moyen)
+    edge_min = _edge_minimum_dynamique_nba(gp_moyen, marche=marche)
     if edge_min_override is not None:
         edge_min = max(edge_min, float(edge_min_override))
     if edge <= edge_min:
@@ -1343,9 +1381,9 @@ def _construire_candidats_pari_nba(m, probas, cotes_match, bankroll, gp_moyen=No
     if "ML" in NBA_MARCHES_ACTIFS and "cote_1" in cotes_match and "cote_2" in cotes_match:
         p_dom = probas["moneyline"]["domicile"]
         p_ext = probas["moneyline"]["exterieur"]
-        inv = calculate_kelly_nba(p_dom, cotes_match["cote_1"], **kelly_kw)
+        inv = calculate_kelly_nba(p_dom, cotes_match["cote_1"], marche="ML", **kelly_kw)
         _ajouter("ML", f"Victoire {m['home']}", inv, cotes_match["cote_1"], round(1 / max(p_dom, 0.001), 2))
-        inv = calculate_kelly_nba(p_ext, cotes_match["cote_2"], **kelly_kw)
+        inv = calculate_kelly_nba(p_ext, cotes_match["cote_2"], marche="ML", **kelly_kw)
         _ajouter("ML", f"Victoire {m['away']}", inv, cotes_match["cote_2"], round(1 / max(p_ext, 0.001), 2))
 
     if "SPREAD" in NBA_MARCHES_ACTIFS:
@@ -1354,13 +1392,13 @@ def _construire_candidats_pari_nba(m, probas, cotes_match, bankroll, gp_moyen=No
             if not probs_ligne:
                 continue
             if "home" in prix:
-                inv = calculate_kelly_nba(probs_ligne["domicile"], prix["home"], **kelly_kw)
+                inv = calculate_kelly_nba(probs_ligne["domicile"], prix["home"], marche="SPREAD", **kelly_kw)
                 _ajouter(
                     "SPREAD", f"{m['home']} {ligne:+g}", inv, prix["home"],
                     round(1 / max(probs_ligne["domicile"], 0.001), 2),
                 )
             if "away" in prix:
-                inv = calculate_kelly_nba(probs_ligne["exterieur"], prix["away"], **kelly_kw)
+                inv = calculate_kelly_nba(probs_ligne["exterieur"], prix["away"], marche="SPREAD", **kelly_kw)
                 _ajouter(
                     "SPREAD", f"{m['away']} {-ligne:+g}", inv, prix["away"],
                     round(1 / max(probs_ligne["exterieur"], 0.001), 2),
@@ -1372,12 +1410,12 @@ def _construire_candidats_pari_nba(m, probas, cotes_match, bankroll, gp_moyen=No
             if not probs_ligne:
                 continue
             if "over" in prix:
-                inv = calculate_kelly_nba(probs_ligne["over"], prix["over"], **kelly_kw)
+                inv = calculate_kelly_nba(probs_ligne["over"], prix["over"], marche="TOTAL", **kelly_kw)
                 _ajouter(
                     "TOTAL", f"OVER {ligne:g}", inv, prix["over"], round(1 / max(probs_ligne["over"], 0.001), 2),
                 )
             if "under" in prix:
-                inv = calculate_kelly_nba(probs_ligne["under"], prix["under"], **kelly_kw)
+                inv = calculate_kelly_nba(probs_ligne["under"], prix["under"], marche="TOTAL", **kelly_kw)
                 _ajouter(
                     "TOTAL", f"UNDER {ligne:g}", inv, prix["under"], round(1 / max(probs_ligne["under"], 0.001), 2),
                 )
@@ -1526,42 +1564,195 @@ def compter_paris_en_attente_nba():
         return 0
 
 
-def _extraire_cote_clv_nba(home, away, type_pari, cote_actuelle, odds_cache=None):
-    """Cote Pinnacle actuelle pour un pari en attente — approximation v1 par
-    parsing du libellé `Pari` (pas de ligne stockée séparément dans le journal)."""
-    cotes = get_odds_for_match_nba(home, away, odds_cache)
-    if not cotes:
-        return cote_actuelle
+def _normaliser_ligne_nba(ligne) -> float | None:
+    """Normalise une ligne spread/total en float arrondi à 1 décimale."""
+    try:
+        return round(float(ligne), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _lookup_prix_ligne_nba(marche_dict, ligne_cible, side, tolerance=None):
+    """Retrouve le prix d'un côté (`home`/`away`/`over`/`under`) sur une ligne.
+
+    1. Match exact (ligne arrondie à 0.1)
+    2. Sinon ligne la plus proche dans `tolerance` pts (CLV approx si la ligne
+       a bougé entre prise et clôture — cas dominant du backtest).
+
+    Retourne ``(prix: float|None, ligne_utilisee: float|None, exact: bool)``.
+    """
+    if not marche_dict or side is None:
+        return None, None, False
+    cible = _normaliser_ligne_nba(ligne_cible)
+    if cible is None:
+        return None, None, False
+    tol = NBA_CLV_LIGNE_TOLERANCE if tolerance is None else float(tolerance)
+
+    # Clés parfois str après JSON — normalisées en float.
+    index = {}
+    for k, v in marche_dict.items():
+        lk = _normaliser_ligne_nba(k)
+        if lk is not None and isinstance(v, dict):
+            index[lk] = v
+
+    if cible in index and side in index[cible]:
+        try:
+            return float(index[cible][side]), cible, True
+        except (TypeError, ValueError):
+            return None, None, False
+
+    if tol <= 0 or not index:
+        return None, None, False
+
+    meilleures = sorted(index.keys(), key=lambda L: (abs(L - cible), abs(L)))
+    for L in meilleures:
+        if abs(L - cible) > tol + 1e-9:
+            break
+        if side not in index[L]:
+            continue
+        try:
+            return float(index[L][side]), L, False
+        except (TypeError, ValueError):
+            continue
+    return None, None, False
+
+
+def _ligne_principale_nba(marche_dict, pref=None):
+    """Ligne principale d'un marché spreads/totals (proche de `pref` si fourni)."""
+    if not marche_dict:
+        return None
+    keys = []
+    for k in marche_dict:
+        lk = _normaliser_ligne_nba(k)
+        if lk is not None:
+            keys.append(lk)
+    if not keys:
+        return None
+    if pref is not None:
+        pref_n = _normaliser_ligne_nba(pref)
+        if pref_n is not None:
+            return min(keys, key=lambda L: (abs(L - pref_n), abs(L)))
+    return sorted(keys, key=lambda L: (abs(L), L))[0]
+
+
+def calculer_clv_ligne_nba(type_pari, home, away, cotes_cloture):
+    """CLV « sur le numéro » (pts) : positif = meilleur numéro que la close.
+
+    - Spread domicile (ex. ``BOS -4.5``) : ``ligne_prise - ligne_close`` (home)
+      → prise -4.5 / close -5.5 = +1.0
+    - Spread extérieur (ex. ``LAL +4.5``) : ``ligne_close - ligne_prise`` (home)
+      → close home -5.5 / prise home -4.5 = -1.0
+    - OVER : ``ligne_close - ligne_prise`` (total plus haut à la close = better over)
+    - UNDER : ``ligne_prise - ligne_close``
+    - ML : ``None`` (pas de ligne)
+
+    `cotes_cloture` : dict parse Pinnacle (``spreads`` / ``totals``).
+    """
+    if not cotes_cloture:
+        return None
     tp = str(type_pari).strip()
     tp_upper = tp.upper()
+
+    if tp_upper.startswith("VICTOIRE"):
+        return None
 
     if tp_upper.startswith("OVER") or tp_upper.startswith("UNDER"):
         m = re.search(r"[-+]?\d+\.?\d*", tp)
         if not m:
-            return cote_actuelle
-        ligne = round(float(m.group()), 1)
-        side = "over" if tp_upper.startswith("OVER") else "under"
-        prix = cotes.get("totals", {}).get(ligne)
-        return str(prix[side]) if prix and side in prix else cote_actuelle
-
-    if tp_upper.startswith("VICTOIRE"):
-        if home in tp and "cote_1" in cotes:
-            return str(cotes["cote_1"])
-        if away in tp and "cote_2" in cotes:
-            return str(cotes["cote_2"])
-        return cote_actuelle
+            return None
+        ligne_prise = _normaliser_ligne_nba(m.group())
+        ligne_close = _ligne_principale_nba(cotes_cloture.get("totals"), pref=ligne_prise)
+        if ligne_prise is None or ligne_close is None:
+            return None
+        if tp_upper.startswith("OVER"):
+            return round(ligne_close - ligne_prise, 1)
+        return round(ligne_prise - ligne_close, 1)
 
     m = re.search(r"[-+]\d+\.?\d*$", tp)
     if not m:
-        return cote_actuelle
-    ligne = float(m.group())
+        return None
+    ligne_aff = _normaliser_ligne_nba(m.group())
+    if ligne_aff is None:
+        return None
     if home in tp:
-        prix = cotes.get("spreads", {}).get(round(ligne, 1))
-        return str(prix["home"]) if prix and "home" in prix else cote_actuelle
-    if away in tp:
-        prix = cotes.get("spreads", {}).get(round(-ligne, 1))
-        return str(prix["away"]) if prix and "away" in prix else cote_actuelle
-    return cote_actuelle
+        ligne_prise_home = ligne_aff
+        side = "home"
+    elif away in tp:
+        ligne_prise_home = _normaliser_ligne_nba(-ligne_aff)
+        side = "away"
+    else:
+        return None
+    if ligne_prise_home is None:
+        return None
+    ligne_close_home = _ligne_principale_nba(cotes_cloture.get("spreads"), pref=ligne_prise_home)
+    if ligne_close_home is None:
+        return None
+    if side == "home":
+        return round(ligne_prise_home - ligne_close_home, 1)
+    return round(ligne_close_home - ligne_prise_home, 1)
+
+
+def _extraire_cote_clv_nba(home, away, type_pari, cote_actuelle, odds_cache=None, retourner_meta=False):
+    """Cote Pinnacle (prise ou clôture) pour un pari — parsing du libellé `Pari`.
+
+    Matching spread/total : ligne exacte d'abord, sinon plus proche dans
+    `NBA_CLV_LIGNE_TOLERANCE` (mesure CLV quand la ligne a bougé).
+
+    Si `retourner_meta=True` : ``(cote_str_ou_fallback, meta)`` avec
+    ``meta = {"exact": bool, "ligne_prise": float|None, "ligne_cloture": float|None}``.
+    """
+    meta = {"exact": False, "ligne_prise": None, "ligne_cloture": None}
+    cotes = get_odds_for_match_nba(home, away, odds_cache)
+    if not cotes:
+        return (cote_actuelle, meta) if retourner_meta else cote_actuelle
+
+    tp = str(type_pari).strip()
+    tp_upper = tp.upper()
+
+    def _ok(prix, exact=True, ligne_prise=None, ligne_cloture=None):
+        meta["exact"] = bool(exact)
+        meta["ligne_prise"] = ligne_prise
+        meta["ligne_cloture"] = ligne_cloture
+        out = str(prix) if prix is not None else cote_actuelle
+        return (out, meta) if retourner_meta else out
+
+    if tp_upper.startswith("OVER") or tp_upper.startswith("UNDER"):
+        m = re.search(r"[-+]?\d+\.?\d*", tp)
+        if not m:
+            return _ok(None)
+        ligne = _normaliser_ligne_nba(m.group())
+        side = "over" if tp_upper.startswith("OVER") else "under"
+        prix, L, exact = _lookup_prix_ligne_nba(cotes.get("totals"), ligne, side)
+        return _ok(prix, exact=exact, ligne_prise=ligne, ligne_cloture=L)
+
+    if tp_upper.startswith("VICTOIRE"):
+        if home in tp and "cote_1" in cotes:
+            return _ok(cotes["cote_1"], exact=True)
+        if away in tp and "cote_2" in cotes:
+            return _ok(cotes["cote_2"], exact=True)
+        return _ok(None)
+
+    m = re.search(r"[-+]\d+\.?\d*$", tp)
+    if not m:
+        return _ok(None)
+    ligne_affichee = _normaliser_ligne_nba(m.group())
+    if ligne_affichee is None:
+        return _ok(None)
+
+    # Convention cotes : spreads indexés par ligne domicile.
+    # Pari domicile « BOS -4.5 » → clé -4.5 side home.
+    # Pari extérieur « LAL +4.5 » → clé domicile -4.5 side away.
+    if home in tp:
+        cle_dom = ligne_affichee
+        side = "home"
+    elif away in tp:
+        cle_dom = _normaliser_ligne_nba(-ligne_affichee)
+        side = "away"
+    else:
+        return _ok(None)
+
+    prix, L, exact = _lookup_prix_ligne_nba(cotes.get("spreads"), cle_dom, side)
+    return _ok(prix, exact=exact, ligne_prise=cle_dom, ligne_cloture=L)
 
 
 def traquer_et_actualiser_clv_nba():
