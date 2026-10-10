@@ -51,6 +51,23 @@ def test_lineups_pas_confirmes_trop_tot():
     assert nba.lineups_sont_confirmes_nba(info, tip) is False
 
 
+def test_lineups_confirmes_fenetre_4h():
+    """Gate défaut 240 min : tip −3 h OK si injuries fetchées."""
+    old = nba.NBA_LINEUP_CONFIRM_MINUTES
+    nba.NBA_LINEUP_CONFIRM_MINUTES = 240
+    try:
+        tip = datetime.now(timezone.utc) + timedelta(hours=3)
+        info = {
+            "fetch_ok": True,
+            "injuries_fetched": True,
+            "starters_home": 0,
+            "starters_away": 0,
+        }
+        assert nba.lineups_sont_confirmes_nba(info, tip) is True
+    finally:
+        nba.NBA_LINEUP_CONFIRM_MINUTES = old
+
+
 def test_lineups_fetch_fail():
     tip = datetime.now(timezone.utc) + timedelta(minutes=10)
     assert nba.lineups_sont_confirmes_nba({"fetch_ok": False}, tip) is False
@@ -203,6 +220,7 @@ def main():
         test_lineups_confirmes_starters,
         test_lineups_confirmes_fenetre_minutes,
         test_lineups_pas_confirmes_trop_tot,
+        test_lineups_confirmes_fenetre_4h,
         test_lineups_fetch_fail,
         test_impact_absence_star,
         test_impact_ignore_bench,

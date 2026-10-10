@@ -100,8 +100,9 @@ NBA_SCAN_HEURES_AVANCE = float(os.environ.get("NBA_SCAN_HEURES_AVANCE", "12"))
 # `lineups_sont_confirmes_nba`).
 NBA_ATTENDRE_LINEUPS_CONFIRMES = _env_bool("NBA_ATTENDRE_LINEUPS_CONFIRMES", True)
 # Minutes avant tip : au-delà, on attend encore même si le rapport blessures
-# est dispo (lineups officiels ~30-60 min avant tip ; défaut 75 = marge).
-NBA_LINEUP_CONFIRM_MINUTES = float(os.environ.get("NBA_LINEUP_CONFIRM_MINUTES", "75"))
+# est dispo. Défaut 240 = 4 h (les lineups officiels arrivent plus tard, mais
+# le rapport injuries ESPN est déjà utile ; 75 min était trop court pour paper).
+NBA_LINEUP_CONFIRM_MINUTES = float(os.environ.get("NBA_LINEUP_CONFIRM_MINUTES", "240"))
 # Ajuster mu pour joueurs Out/Doubtful (proxy minutes×surplus pts).
 NBA_ABSENCES_ACTIF = _env_bool("NBA_ABSENCES_ACTIF", True)
 NBA_STAR_MIN_MPG = float(os.environ.get("NBA_STAR_MIN_MPG", "20"))
