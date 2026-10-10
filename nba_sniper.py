@@ -15,10 +15,10 @@ Ce module contient :
   (``NBA_PIT_CACHE_JOURS``, saison en cours).
 - Le **moteur mathématique** (ratings Off/Def + Pace avec décroissance
   temporelle, **ajustement adversaire itératif AdjORtg/AdjDRtg** (SoS /
-  KenPom additif), shrinkage bayésien vers la moyenne ligue + blend saison
-  N/N-1, ajustements home court/repos/B2B/altitude, distribution bivariée
-  Normale sur la marge et le total, probabilités de marché
-  moneyline/spread/total avec gestion du push sur lignes entières) — voir
+  KenPom additif), **Four Factors** (matchup Off×Def adversaire → ORtg via
+  OLS, blend avec le chemin Adj), shrinkage bayésien + blend saison N/N-1,
+  ajustements home court/repos/B2B/altitude, distribution bivariée Normale
+  sur la marge et le total, probabilités moneyline/spread/total) — voir
   `calculer_probabilites_match_nba()`. Paramètres calibrables dans
   `nba_params.py`.
 
@@ -673,9 +673,10 @@ def fetch_live_scoreboard():
 #       -> stats brutes decay-pondérées (demi-vie NBA_RATING_HALF_LIFE_JOURS)
 #       -> moyenne ligue du jour (cross-section des équipes déjà actives)
 #       -> AdjORtg/AdjDRtg itératifs (SoS KenPom additif, PIT-safe, cache)
+#       -> Four Factors decay (eFG/TOV/ORB/FTA + opp_*) + matchup Off×Def
 #       -> shrinkage bayésien vers la moyenne ligue (n_prior)
 #       -> blend saison N / saison N-1 (prior N-1 aussi SoS-ajusté)
-#       -> mu_home / mu_away (cross Off x Def x Pace/lg_avg)
+#       -> mu_home / mu_away (blend Adj-cross × FF-matchup × Pace)
 #       -> ajustements HCA / repos-B2B / altitude
 #       -> distribution bivariée Normale (sigma_home, sigma_away, rho)
 #       -> probabilités moneyline / spread (avec push) / total (avec push)
@@ -719,10 +720,16 @@ def _grouper_records_par_equipe(records):
     return par_equipe
 
 
+_FF_KEYS = (
+    "efg_pct", "tov_pct", "oreb_pct", "fta_rate",
+    "opp_efg_pct", "opp_tov_pct", "opp_oreb_pct", "opp_fta_rate",
+)
+
+
 def _stats_brutes_decay_equipe(games_avant, date_ref, half_life_jours):
-    """Stats brutes (OFF/DEF rating pondérés possessions, Pace) d'une équipe
-    à partir de ses matchs de la saison en cours strictement AVANT
-    `date_ref`, pondérés par décroissance temporelle exponentielle.
+    """Stats brutes (OFF/DEF rating pondérés possessions, Pace, Four Factors)
+    d'une équipe à partir de ses matchs de la saison en cours strictement
+    AVANT `date_ref`, pondérés par décroissance temporelle exponentielle.
 
     Retourne ``None`` si l'équipe n'a encore aucun match cette saison.
     `effective_gp` (somme des poids de décroissance, unité "matchs") sert de
@@ -737,6 +744,7 @@ def _stats_brutes_decay_equipe(games_avant, date_ref, half_life_jours):
     off_num = 0.0
     def_num = 0.0
     pace_num = 0.0
+    ff_num = {k: 0.0 for k in _FF_KEYS}
     for g in games_avant:
         d = _parse_date_nba(g.get("date"))
         age_jours = (ref - d).days if (ref and d) else 0
@@ -747,15 +755,22 @@ def _stats_brutes_decay_equipe(games_avant, date_ref, half_life_jours):
         poids_poss_total += w * poss
         pace_num += w * float(g.get("pace") or 0)
         effective_gp += w
+        for k in _FF_KEYS:
+            val = g.get(k)
+            if val is not None:
+                ff_num[k] += w * poss * float(val)
     if poids_poss_total <= 0 or effective_gp <= 0:
         return None
-    return {
+    out = {
         "off_rating": off_num / poids_poss_total,
         "def_rating": def_num / poids_poss_total,
         "pace": pace_num / effective_gp,
         "effective_gp": effective_gp,
         "gp": len(games_avant),
     }
+    for k in _FF_KEYS:
+        out[k] = ff_num[k] / poids_poss_total
+    return out
 
 
 def _snapshot_ligue_decay(par_equipe, date_ref, half_life_jours):
@@ -770,20 +785,22 @@ def _snapshot_ligue_decay(par_equipe, date_ref, half_life_jours):
 
 
 def _moyennes_ligue_depuis_snapshot(snap):
-    """Moyenne ligue (ORtg/DRtg/Pace) = moyenne cross-section des stats brutes
-    des équipes déjà actives à `date_ref` — reste point-in-time car chaque
-    stat d'équipe n'utilise que son propre passé. Retourne ``None`` si aucune
-    équipe n'a encore joué (tout début de saison)."""
-    offs = [s["off_rating"] for s in snap.values() if s]
-    defs_ = [s["def_rating"] for s in snap.values() if s]
-    paces = [s["pace"] for s in snap.values() if s]
-    if not offs:
+    """Moyenne ligue (ORtg/DRtg/Pace + Four Factors) = moyenne cross-section
+    des stats brutes des équipes déjà actives à `date_ref` — reste
+    point-in-time. Retourne ``None`` si aucune équipe n'a encore joué."""
+    actifs = [s for s in snap.values() if s]
+    if not actifs:
         return None
-    return {
-        "off_rating": sum(offs) / len(offs),
-        "def_rating": sum(defs_) / len(defs_),
-        "pace": sum(paces) / len(paces),
+    out = {
+        "off_rating": sum(s["off_rating"] for s in actifs) / len(actifs),
+        "def_rating": sum(s["def_rating"] for s in actifs) / len(actifs),
+        "pace": sum(s["pace"] for s in actifs) / len(actifs),
     }
+    for k in _FF_KEYS:
+        vals = [s[k] for s in actifs if s.get(k) is not None]
+        if vals:
+            out[k] = sum(vals) / len(vals)
+    return out
 
 
 # Cache mémoire SoS : beaucoup de matchs partagent la même date_ref (soirée NBA)
@@ -905,13 +922,20 @@ def _snapshot_ligue_sos(par_equipe, date_ref, half_life_jours, league_avg, n_ite
         if not brut:
             snap_adj[team] = None
             continue
-        snap_adj[team] = {
+        row = {
             "off_rating": adj_o.get(team, brut["off_rating"]),
             "def_rating": adj_d.get(team, brut["def_rating"]),
             "pace": brut["pace"],
             "effective_gp": brut["effective_gp"],
             "gp": brut["gp"],
         }
+        # Four Factors : pas de SoS itératif dédié ici (le matchup Off×Def
+        # adversaire joue ce rôle à la prédiction) — on propage les moyennes
+        # decay du snapshot brut.
+        for k in _FF_KEYS:
+            if k in brut:
+                row[k] = brut[k]
+        snap_adj[team] = row
 
     _sos_snap_cache[cache_key] = snap_adj
     return snap_adj
@@ -958,14 +982,30 @@ def stats_fin_saison_sos_nba(season_year, force=False):
     for team, s in snap_adj.items():
         if not s:
             continue
-        finaux[team] = {
+        row = {
             "games_played": int(s["gp"]),
             "off_rating": float(s["off_rating"]),
             "def_rating": float(s["def_rating"]),
             "pace": float(s["pace"]),
         }
+        for k in _FF_KEYS:
+            if k in s:
+                row[k] = float(s[k])
+        finaux[team] = row
     _sos_fin_saison_cache[season_year] = finaux
     return finaux
+
+
+def _ff_defaults_from_league(league_avg):
+    """Four Factors ligue (ou fallback params) pour shrinkage / matchup."""
+    fb = nba_params.get_ff_league_fallback()
+    out = {}
+    for k in _FF_KEYS:
+        if league_avg and league_avg.get(k) is not None:
+            out[k] = float(league_avg[k])
+        else:
+            out[k] = float(fb[k])
+    return out
 
 
 def _rating_ajuste_equipe(team, snap, league_avg, prior_n1, n_prior, blend_gp_plein):
@@ -976,43 +1016,57 @@ def _rating_ajuste_equipe(team, snap, league_avg, prior_n1, n_prior, blend_gp_pl
 
     `snap` est attendu **déjà SoS-ajusté** (AdjORtg/AdjDRtg) quand
     `NBA_SOS_ACTIF` ; `prior_n1` idem via `stats_fin_saison_sos_nba`.
+    Propage aussi les Four Factors (shrink + blend N-1).
 
     Sans aucun match cette saison : pur prior N-1 si disponible, sinon
     moyenne ligue (équipe d'expansion / prior manquant)."""
     brut = snap.get(team)
     prior = (prior_n1 or {}).get(team)
     prior_valide = bool(prior) and prior.get("games_played", 0) > 0 and prior.get("off_rating") is not None
+    lg_ff = _ff_defaults_from_league(league_avg)
+
+    def _pack(off, deff, pace, gp, ff_src, ff_prior=None, w_cur=1.0):
+        out = {"off_rating": off, "def_rating": deff, "pace": pace, "gp": gp}
+        for k in _FF_KEYS:
+            cur = ff_src.get(k, lg_ff[k]) if ff_src else lg_ff[k]
+            if ff_prior is not None and k in ff_prior and w_cur < 1.0:
+                out[k] = w_cur * cur + (1.0 - w_cur) * float(ff_prior[k])
+            else:
+                out[k] = cur
+        return out
 
     if not brut:
         if prior_valide:
-            return {
-                "off_rating": prior["off_rating"],
-                "def_rating": prior["def_rating"],
-                "pace": prior["pace"],
-                "gp": 0,
-            }
-        return {
-            "off_rating": league_avg["off_rating"],
-            "def_rating": league_avg["def_rating"],
-            "pace": league_avg["pace"],
-            "gp": 0,
-        }
+            return _pack(
+                prior["off_rating"], prior["def_rating"], prior["pace"], 0,
+                {k: prior[k] for k in _FF_KEYS if k in prior} or lg_ff,
+            )
+        return _pack(
+            league_avg["off_rating"], league_avg["def_rating"], league_avg["pace"], 0, lg_ff,
+        )
 
     eff_gp = brut["effective_gp"]
     shrink_off = (eff_gp * brut["off_rating"] + n_prior * league_avg["off_rating"]) / (eff_gp + n_prior)
     shrink_def = (eff_gp * brut["def_rating"] + n_prior * league_avg["def_rating"]) / (eff_gp + n_prior)
     shrink_pace = (eff_gp * brut["pace"] + n_prior * league_avg["pace"]) / (eff_gp + n_prior)
+    shrink_ff = {}
+    for k in _FF_KEYS:
+        raw = brut.get(k, lg_ff[k])
+        shrink_ff[k] = (eff_gp * float(raw) + n_prior * lg_ff[k]) / (eff_gp + n_prior)
 
     gp = brut["gp"]
     if prior_valide and blend_gp_plein > 0:
         w = min(1.0, gp / blend_gp_plein)
-        return {
-            "off_rating": w * shrink_off + (1.0 - w) * prior["off_rating"],
-            "def_rating": w * shrink_def + (1.0 - w) * prior["def_rating"],
-            "pace": w * shrink_pace + (1.0 - w) * prior["pace"],
-            "gp": gp,
-        }
-    return {"off_rating": shrink_off, "def_rating": shrink_def, "pace": shrink_pace, "gp": gp}
+        return _pack(
+            w * shrink_off + (1.0 - w) * prior["off_rating"],
+            w * shrink_def + (1.0 - w) * prior["def_rating"],
+            w * shrink_pace + (1.0 - w) * prior["pace"],
+            gp,
+            shrink_ff,
+            ff_prior=prior,
+            w_cur=w,
+        )
+    return _pack(shrink_off, shrink_def, shrink_pace, gp, shrink_ff)
 
 
 def _contexte_repos_equipe(games_avant, date_ref):
@@ -1031,6 +1085,48 @@ def _contexte_repos_equipe(games_avant, date_ref):
     return diff <= 1, diff
 
 
+def _ff_to_ortg(efg, tov, orb, fta, coefs=None):
+    """Convertit un quadruplet Four Factors (fractions 0-1) → ORtg (pts/100).
+
+    OLS calibré sur ~12k box scores 2021-26 (R²≈0.95) ; mêmes coefs pour
+    reconstruire un DRtg à partir des opp_* adverses.
+    """
+    c = coefs or nba_params.get_ff_coefs()
+    return (
+        float(c["intercept"])
+        + float(c["efg"]) * float(efg)
+        + float(c["tov"]) * float(tov)
+        + float(c["orb"]) * float(orb)
+        + float(c["fta"]) * float(fta)
+    )
+
+
+def _cross_ff(team_val, opp_val, lg_val):
+    """Cross multiplicatif style Off×Def, borné pour éviter explosions."""
+    lg = max(float(lg_val), 1e-6)
+    return (float(team_val) / lg) * (float(opp_val) / lg) * lg
+
+
+def _matchup_ortg_four_factors(rating_off, rating_def, league_avg):
+    """ORtg attendu de l'attaque `rating_off` face à la défense `rating_def`.
+
+    Croise chaque facteur offensif avec le facteur défensif adverse
+    (``opp_*`` = ce que la défense laisse / force), puis convertit via OLS.
+    """
+    lg = _ff_defaults_from_league(league_avg)
+    efg = _cross_ff(rating_off.get("efg_pct", lg["efg_pct"]), rating_def.get("opp_efg_pct", lg["opp_efg_pct"]), lg["efg_pct"])
+    # TOV : défense qui force beaucoup de pertes (opp_tov élevé) → tov matchup ↑
+    tov = _cross_ff(rating_off.get("tov_pct", lg["tov_pct"]), rating_def.get("opp_tov_pct", lg["opp_tov_pct"]), lg["tov_pct"])
+    orb = _cross_ff(rating_off.get("oreb_pct", lg["oreb_pct"]), rating_def.get("opp_oreb_pct", lg["opp_oreb_pct"]), lg["oreb_pct"])
+    fta = _cross_ff(rating_off.get("fta_rate", lg["fta_rate"]), rating_def.get("opp_fta_rate", lg["opp_fta_rate"]), lg["fta_rate"])
+    # Bornes physiques raisonnables (fractions)
+    efg = min(max(efg, 0.30), 0.75)
+    tov = min(max(tov, 0.05), 0.25)
+    orb = min(max(orb, 0.05), 0.50)
+    fta = min(max(fta, 0.05), 0.55)
+    return _ff_to_ortg(efg, tov, orb, fta)
+
+
 def calculer_mu_points(
     rating_home,
     rating_away,
@@ -1042,13 +1138,13 @@ def calculer_mu_points(
     away_rest_jours=None,
     altitude_domicile=False,
 ):
-    """Points attendus (mu_home, mu_away) — cross-multiplicatif Off x Def x
-    Pace/lg_avg (pattern identique foot/NHL), avec ajustements home
-    court/repos-B2B/altitude appliqués aux ratings avant le cross.
+    """Points attendus (mu_home, mu_away) — blend de :
 
-    `rating_*` : dict avec ``off_rating``/``def_rating``/``pace`` (déjà
-    shrink + blend, voir `_rating_ajuste_equipe`). `league_avg` : moyenne
-    ligue ORtg/DRtg/Pace du jour (voir `_moyennes_ligue_depuis_snapshot`).
+    1. Cross-multiplicatif AdjORtg × AdjDRtg × Pace/lg (chemin historique)
+    2. Four Factors matchup → ORtg OLS × Pace (si ``NBA_FF_ACTIF``)
+
+    Ajustements home court / repos-B2B / altitude appliqués aux ratings
+    avant les deux chemins. Poids FF = ``NBA_FF_BLEND``.
     """
     hca = nba_params.get_hca() if hca is None else hca
     b2b_atk_pct = nba_params.get_b2b_atk_pct()
@@ -1080,8 +1176,27 @@ def calculer_mu_points(
     lg_rtg = max(league_avg["off_rating"], 1.0)
     pace_match = (rating_home["pace"] + rating_away["pace"]) / 2.0 / 100.0
 
-    mu_home = (home_off / lg_rtg) * (away_def / lg_rtg) * lg_rtg * pace_match
-    mu_away = (away_off / lg_rtg) * (home_def / lg_rtg) * lg_rtg * pace_match
+    mu_home_adj = (home_off / lg_rtg) * (away_def / lg_rtg) * lg_rtg * pace_match
+    mu_away_adj = (away_off / lg_rtg) * (home_def / lg_rtg) * lg_rtg * pace_match
+
+    if not nba_params.get_ff_actif():
+        return max(mu_home_adj, 1.0), max(mu_away_adj, 1.0)
+
+    # Ratings "ajustés contexte" pour le matchup FF : on réutilise les
+    # Four Factors du rating de base (HCA/B2B agissent via le blend final
+    # en déplaçant mu_adj ; les FF bruts restent des skill estimates).
+    ortg_home_ff = _matchup_ortg_four_factors(rating_home, rating_away, league_avg)
+    ortg_away_ff = _matchup_ortg_four_factors(rating_away, rating_home, league_avg)
+    # Appliquer HCA/B2B/altitude en échelle relative sur l'ORtg FF
+    # (mêmes multiplicateurs que sur home_off / away_off).
+    scale_h = home_off / max(rating_home["off_rating"], 1e-6)
+    scale_a = away_off / max(rating_away["off_rating"], 1e-6)
+    mu_home_ff = ortg_home_ff * scale_h * pace_match
+    mu_away_ff = ortg_away_ff * scale_a * pace_match
+
+    w = nba_params.get_ff_blend()
+    mu_home = (1.0 - w) * mu_home_adj + w * mu_home_ff
+    mu_away = (1.0 - w) * mu_away_adj + w * mu_away_ff
     return max(mu_home, 1.0), max(mu_away, 1.0)
 
 
@@ -1203,7 +1318,9 @@ def calculer_probabilites_match_nba(
     # League avg depuis snapshot BRUT (échelle ORtg/DRtg non SoS) — le SoS
     # centre les contributions autour de cette moyenne.
     snap_brut = _snapshot_ligue_decay(par_equipe, date_ref, half_life)
-    league_avg = _moyennes_ligue_depuis_snapshot(snap_brut) or nba_params.get_league_avg_fallback()
+    league_avg = _moyennes_ligue_depuis_snapshot(snap_brut)
+    if not league_avg:
+        league_avg = {**nba_params.get_league_avg_fallback(), **nba_params.get_ff_league_fallback()}
     snap = _snapshot_ligue_sos(par_equipe, date_ref, half_life, league_avg)
     # Prior N-1 opponent-adjusted (cohérent avec Adj courant) ; repli brut si SoS off
     if nba_params.get_sos_actif():

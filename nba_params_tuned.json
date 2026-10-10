@@ -1,27 +1,27 @@
 {
   "_meta": {
-    "generated_at": "2026-10-09T19:28:04.950619+00:00",
+    "generated_at": "2026-10-10T07:53:03.876115+00:00",
     "source": "backtest_tune",
     "saisons": [
       2022,
       2023,
       2024
     ],
-    "n_matchs_tune": 3690,
+    "n_matchs_tune": 1998,
     "n_matchs_full": 3690,
-    "brier_ml_defaults": 0.22471,
-    "brier_ml_tuned": 0.219184,
-    "tune_maxiter": 150,
+    "brier_ml_defaults": 0.223576,
+    "brier_ml_tuned": 0.219786,
+    "tune_maxiter": 80,
     "nelder_mead_success": false
   },
   "_global": {
     "n_prior": 3.0,
-    "rating_half_life_jours": 61.42,
-    "blend_gp_plein": 28.58,
-    "hca": 0.00816,
-    "b2b_atk_pct": 0.01253,
-    "b2b_def_pct": 0.00621,
-    "sigma_team": 13.75,
-    "rho_scores": 0.5414
+    "rating_half_life_jours": 66.52,
+    "blend_gp_plein": 26.72,
+    "hca": 0.01586,
+    "b2b_atk_pct": 0.01318,
+    "b2b_def_pct": 0.01214,
+    "sigma_team": 12.965,
+    "rho_scores": 0.4099
   }
 }

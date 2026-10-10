@@ -39,6 +39,25 @@ SOS_ACTIF_DEFAULT = _env_bool_params("NBA_SOS_ACTIF", True)
 # Nombre d'itérations Jacobi (10-20 suffit en pratique pour 30 équipes).
 SOS_ITERS_DEFAULT = int(os.environ.get("NBA_SOS_ITERS", "15"))
 
+# Four Factors (Dean Oliver) → ORtg/DRtg via régression linéaire (R²≈0.95
+# sur box scores 2021-26). Le matchup croise Off FF équipe × Def FF adversaire
+# (opp_*), puis blend avec le chemin AdjORtg/AdjDRtg existant.
+FF_ACTIF_DEFAULT = _env_bool_params("NBA_FF_ACTIF", True)
+# Poids du chemin Four Factors dans mu (0 = pure Adj×cross, 1 = pur FF matchup).
+FF_BLEND_DEFAULT = float(os.environ.get("NBA_FF_BLEND", "0.50"))
+# Coefs OLS ORtg ~ intercept + b_efg*eFG + b_tov*TOV + b_orb*OREB + b_fta*FTA
+# (fit 5 saisons, n≈12k ; même mapping pour DRtg via opp_*).
+FF_COEF_INTERCEPT = float(os.environ.get("NBA_FF_COEF_INTERCEPT", "27.0459"))
+FF_COEF_EFG = float(os.environ.get("NBA_FF_COEF_EFG", "152.1871"))
+FF_COEF_TOV = float(os.environ.get("NBA_FF_COEF_TOV", "-129.1025"))
+FF_COEF_ORB = float(os.environ.get("NBA_FF_COEF_ORB", "62.1513"))
+FF_COEF_FTA = float(os.environ.get("NBA_FF_COEF_FTA", "16.9229"))
+# Moyennes ligue fallback Four Factors (fractions 0-1, stats.nba.com).
+FF_LG_EFG_DEFAULT = float(os.environ.get("NBA_FF_LG_EFG", "0.5437"))
+FF_LG_TOV_DEFAULT = float(os.environ.get("NBA_FF_LG_TOV", "0.1403"))
+FF_LG_ORB_DEFAULT = float(os.environ.get("NBA_FF_LG_ORB", "0.2852"))
+FF_LG_FTA_DEFAULT = float(os.environ.get("NBA_FF_LG_FTA", "0.2562"))
+
 # Home court advantage : fraction appliquée symétriquement sur ORtg (+) et
 # DRtg (-) de l'équipe à domicile ; ~0.015 ≈ 2.5-3 pts d'avantage net typique.
 HCA_DEFAULT = float(os.environ.get("NBA_HCA_DEFAULT", "0.015"))
@@ -136,6 +155,45 @@ def get_sos_iters() -> int:
     if "sos_iters" in g:
         return max(1, int(g["sos_iters"]))
     return max(1, SOS_ITERS_DEFAULT)
+
+
+def get_ff_actif() -> bool:
+    g = _global_entry()
+    if "ff_actif" in g:
+        return bool(g["ff_actif"])
+    return FF_ACTIF_DEFAULT
+
+
+def get_ff_blend() -> float:
+    g = _global_entry()
+    raw = float(g["ff_blend"]) if "ff_blend" in g else FF_BLEND_DEFAULT
+    return min(max(raw, 0.0), 1.0)
+
+
+def get_ff_coefs() -> dict:
+    """Coefs OLS ORtg = intercept + efg*b_efg + tov*b_tov + orb*b_orb + fta*b_fta."""
+    g = _global_entry()
+    return {
+        "intercept": float(g.get("ff_coef_intercept", FF_COEF_INTERCEPT)),
+        "efg": float(g.get("ff_coef_efg", FF_COEF_EFG)),
+        "tov": float(g.get("ff_coef_tov", FF_COEF_TOV)),
+        "orb": float(g.get("ff_coef_orb", FF_COEF_ORB)),
+        "fta": float(g.get("ff_coef_fta", FF_COEF_FTA)),
+    }
+
+
+def get_ff_league_fallback() -> dict:
+    g = _global_entry()
+    return {
+        "efg_pct": float(g.get("ff_lg_efg", FF_LG_EFG_DEFAULT)),
+        "tov_pct": float(g.get("ff_lg_tov", FF_LG_TOV_DEFAULT)),
+        "oreb_pct": float(g.get("ff_lg_orb", FF_LG_ORB_DEFAULT)),
+        "fta_rate": float(g.get("ff_lg_fta", FF_LG_FTA_DEFAULT)),
+        "opp_efg_pct": float(g.get("ff_lg_efg", FF_LG_EFG_DEFAULT)),
+        "opp_tov_pct": float(g.get("ff_lg_tov", FF_LG_TOV_DEFAULT)),
+        "opp_oreb_pct": float(g.get("ff_lg_orb", FF_LG_ORB_DEFAULT)),
+        "opp_fta_rate": float(g.get("ff_lg_fta", FF_LG_FTA_DEFAULT)),
+    }
 
 
 def get_hca(team: str | None = None) -> float:
