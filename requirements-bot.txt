@@ -2,4 +2,5 @@
 -r requirements.txt
 scipy==1.11.4
 python-dotenv==1.0.1
-nba_api==1.5.2
+nba_api==1.11.4  # >=1.9 requis (ScheduleLeagueV2) ; 1.5.2 trop vieux pour nba_sniper.py
+brotli>=1.1.0  # décode Content-Encoding: br (API-Football) pour aiohttp
