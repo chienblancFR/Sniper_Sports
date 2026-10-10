@@ -2855,6 +2855,20 @@ def get_nba_games_today(odds_cache=None):
             f"dans la fenêtre {NBA_SCAN_HEURES_AVANCE:g}h"
         )
         return odds_m
+    if odds_cache:
+        tips = []
+        for parsed in odds_cache.values():
+            t = _parse_utc_nba(parsed.get("commence_time") or parsed.get("date_utc"))
+            if t:
+                tips.append(t)
+        if tips:
+            nxt = min(tips)
+            heures = (nxt - maintenant).total_seconds() / 3600.0
+            log_nba(
+                f"ℹ️ Odds API : {len(odds_cache)} match(s) indexés, 0 dans la fenêtre "
+                f"{NBA_SCAN_HEURES_AVANCE:g}h — prochain tip dans {heures:.0f} h "
+                f"({nxt.strftime('%Y-%m-%d %H:%MZ')})"
+            )
     repli = _matchs_depuis_schedule_fenetre(maintenant=maintenant)
     if repli:
         log_nba(
