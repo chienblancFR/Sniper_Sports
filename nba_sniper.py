@@ -2781,22 +2781,51 @@ def _parse_utc_nba(date_str):
         return None
 
 
-def get_nba_games_today():
-    """Programme du jour (module live cdn.nba.com), filtré aux matchs pas
-    encore terminés et dans la fenêtre `NBA_SCAN_HEURES_AVANCE`."""
-    matchs = fetch_live_scoreboard()
-    if not matchs:
-        return []
-    maintenant = datetime.now(timezone.utc)
+def _filtrer_matchs_fenetre_scan(matchs, maintenant=None):
+    """Garde les matchs non-final dans la fenêtre ``NBA_SCAN_HEURES_AVANCE``."""
+    maintenant = maintenant or datetime.now(timezone.utc)
     eligibles = []
-    for m in matchs:
+    for m in matchs or []:
         if "final" in str(m.get("statut", "")).strip().lower():
             continue
         date_utc = _parse_utc_nba(m.get("date_utc"))
         if date_utc and (date_utc - maintenant).total_seconds() / 3600.0 > NBA_SCAN_HEURES_AVANCE:
             continue
+        # Tip trop loin dans le passé (> 6 h) sans statut utile → ignorer
+        if date_utc and (maintenant - date_utc).total_seconds() / 3600.0 > 6.0:
+            continue
+        if not m.get("domicile") or not m.get("exterieur"):
+            continue
         eligibles.append(m)
     return eligibles
+
+
+def _matchs_depuis_schedule_fenetre(maintenant=None):
+    """Repli ScheduleLeagueV2 quand le live scoreboard cdn.nba.com est vide."""
+    maintenant = maintenant or datetime.now(timezone.utc)
+    try:
+        schedule = fetch_saison_schedule(season_year=NBA_SEASON)
+    except Exception as e:
+        log_nba(f"⚠️ schedule fallback scan : {type(e).__name__}: {e}", level="warning")
+        return []
+    return _filtrer_matchs_fenetre_scan(schedule, maintenant=maintenant)
+
+
+def get_nba_games_today():
+    """Programme à scanner : live scoreboard cdn.nba.com, sinon calendrier
+    saison (ScheduleLeagueV2) — le live renvoie souvent JSON vide même quand
+    l'Odds API liste déjà des matchs (début de saison / incident CDN)."""
+    maintenant = datetime.now(timezone.utc)
+    matchs = _filtrer_matchs_fenetre_scan(fetch_live_scoreboard(), maintenant=maintenant)
+    if matchs:
+        return matchs
+    repli = _matchs_depuis_schedule_fenetre(maintenant=maintenant)
+    if repli:
+        log_nba(
+            f"ℹ️ live scoreboard vide — repli schedule : {len(repli)} match(s) "
+            f"dans la fenêtre {NBA_SCAN_HEURES_AVANCE:g}h"
+        )
+    return repli
 
 
 def _executer_opportunite_nba(opp):
