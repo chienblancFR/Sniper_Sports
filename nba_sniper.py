@@ -244,6 +244,8 @@ NBA_DRY_RUN = _env_bool("NBA_DRY_RUN", True)
 NBA_TOUS_CANDIDATS_ACTIF = _env_bool("NBA_TOUS_CANDIDATS_ACTIF", True)
 NBA_BANKROLL = float(os.environ.get("NBA_BANKROLL", "1000.0"))
 NBA_ODDS_QUOTA_ALERT = int(os.environ.get("NBA_ODDS_QUOTA_ALERT", "100"))
+# Inclure Odds API `basketball_nba_preseason` (smoke paper avant tip-off régulière).
+NBA_ODDS_INCLUDE_PRESEASON = _env_bool("NBA_ODDS_INCLUDE_PRESEASON", True)
 
 PA_DATA_DIR = "/home/chienblanc/data"
 JOURNAL_NOM_NBA = "journal_trading_nba.csv"
@@ -282,9 +284,10 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 NBA_DATA_DIR = os.path.join(_PROJECT_ROOT, "data", "nba")
 
 # GAME_ID nba.com : 001 preseason, 002 saison régulière, 003 all-star,
-# 004 playoffs, 005 play-in. On ne veut que la saison régulière (backtest et
-# ratings walk-forward).
+# 004 playoffs, 005 play-in. Ratings/PIT = régulière uniquement ; le live
+# paper peut aussi scorer la présaison (Odds `basketball_nba_preseason`).
 GAME_ID_PREFIX_REGULAR = "002"
+GAME_ID_PREFIX_PRESEASON = "001"
 
 # Saisons COVID atypiques à marquer/filtrer (option) — bulle 2019-20 (finie le
 # 14/08/2020) et saison 2020-21 raccourcie à 72 matchs (début 22/12/2020).
@@ -2152,11 +2155,16 @@ def _traiter_quota_odds_api_nba(response):
 
 
 def fetch_all_pinnacle_odds_nba():
-    """Une seule requête Odds API pour tous les matchs NBA du jour (quota
-    économisé, pattern `fetch_all_pinnacle_odds` NHL)."""
+    """Cotes Pinnacle NBA (régulière ± présaison) — 1 requête Odds API / sport.
+
+    Sports : ``basketball_nba`` + optionnellement ``basketball_nba_preseason``
+    (``NBA_ODDS_INCLUDE_PRESEASON``, utile pour smoke paper avant tip-off).
+    """
     if not ODDS_API_KEY:
         return {}
-    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds/"
+    sports = ["basketball_nba"]
+    if NBA_ODDS_INCLUDE_PRESEASON:
+        sports.append("basketball_nba_preseason")
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
@@ -2165,28 +2173,42 @@ def fetch_all_pinnacle_odds_nba():
         "oddsFormat": "decimal",
     }
     cache = {}
+    non_resolus = set()
+    counts = {}
     try:
-        response = requests.get(url, params=params, timeout=15)
-        _traiter_quota_odds_api_nba(response)
-        if response.status_code != 200:
-            log_nba(f"⚠️ Odds API NBA : HTTP {response.status_code}", level="warning")
-            return {}
-        non_resolus = set()
-        for game in response.json():
-            parsed = _parse_pinnacle_game_nba(game)
-            if parsed:
-                cache[(parsed["home"], parsed["away"])] = parsed
-            else:
-                for nom in (game.get("home_team"), game.get("away_team")):
-                    if nom and _resoudre_tricode_depuis_nom_odds(nom) is None:
-                        non_resolus.add(nom)
+        for sport in sports:
+            url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+            response = requests.get(url, params=params, timeout=15)
+            _traiter_quota_odds_api_nba(response)
+            if response.status_code != 200:
+                log_nba(f"⚠️ Odds API {sport} : HTTP {response.status_code}", level="warning")
+                counts[sport] = 0
+                continue
+            n_avant = len(cache)
+            for game in response.json() or []:
+                parsed = _parse_pinnacle_game_nba(game)
+                if parsed:
+                    parsed["odds_sport"] = sport
+                    parsed["preseason"] = sport.endswith("_preseason")
+                    # Présaison ne doit pas écraser un éventuel slot régulière homonyme
+                    cle = (parsed["home"], parsed["away"])
+                    if cle in cache and cache[cle].get("preseason") and not parsed["preseason"]:
+                        cache[cle] = parsed
+                    elif cle not in cache:
+                        cache[cle] = parsed
+                else:
+                    for nom in (game.get("home_team"), game.get("away_team")):
+                        if nom and _resoudre_tricode_depuis_nom_odds(nom) is None:
+                            non_resolus.add(nom)
+            counts[sport] = len(cache) - n_avant
         if non_resolus:
             log_nba(f"⚠️ Noms Odds API NBA non mappés : {', '.join(sorted(non_resolus))}", level="warning")
-        log_nba(f"📡 Odds API NBA : {len(cache)} match(s) Pinnacle indexés")
+        detail = ", ".join(f"{k.split('_')[-1]}={v}" for k, v in counts.items())
+        log_nba(f"📡 Odds API NBA : {len(cache)} match(s) Pinnacle indexés ({detail})")
         return cache
     except Exception as e:
         log_nba(f"⚠️ Erreur Odds API NBA : {e}", level="warning")
-        return {}
+        return cache
 
 
 def get_odds_for_match_nba(home_tricode, away_tricode, odds_cache=None, log_si_absent=False):
@@ -2770,9 +2792,13 @@ def calculer_bankroll_dynamique_nba(capital_de_base=None):
 
 
 def _est_nba_game_id(game_id):
-    """True si ``game_id`` ressemble à un id stats.nba.com (ex. ``0022600123``)."""
+    """True si ``game_id`` ressemble à un id stats.nba.com (régulière ``002…`` ou présaison ``001…``)."""
     s = str(game_id or "").strip()
-    return len(s) >= 8 and s.isdigit() and s.startswith(GAME_ID_PREFIX_REGULAR)
+    return (
+        len(s) >= 8
+        and s.isdigit()
+        and (s.startswith(GAME_ID_PREFIX_REGULAR) or s.startswith(GAME_ID_PREFIX_PRESEASON))
+    )
 
 
 def _slug_match_stable_nba(home, away, date_utc):
@@ -3094,6 +3120,8 @@ def run_sniper_nba():
     log_nba(f"🤖 Lancement Sniper NBA — mode {mode}")
     if NBA_DRY_RUN:
         log_nba("🧪 NBA_DRY_RUN actif : Telegram paper + écriture journal (pas de mise réelle).")
+    if NBA_ODDS_INCLUDE_PRESEASON:
+        log_nba("🏀 Odds présaison inclus (basketball_nba_preseason) — smoke paper avant tip-off régulière.")
     if NBA_TOUS_CANDIDATS_ACTIF:
         log_nba("📚 Tous candidats actifs — chaque edge valide est pris (pas seulement le max du match).")
     cap_label = f"{NBA_MISE_MAX_PCT}% bankroll" if NBA_MISE_MAX_PCT > 0 else "Kelly pur (pas de cap %)"
