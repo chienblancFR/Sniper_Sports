@@ -27,8 +27,8 @@ Intégration Odds API (basketball_nba, Pinnacle) + dévigorage Shin 2-way
 bankroll, journal CSV + alertes Telegram (paper trading `NBA_DRY_RUN`), et
 boucle live `run_sniper_nba()` — voir sections 7 à 9 ci-dessous (mirroring
 `nhl_sniper_omega.py`, simplifié : pas de line-movement/steam, pas de Kelly
-dynamique BSS/CLV, pas d'absences stars en v1, documenté comme limite
-connue — voir le plan `sniper_nba_value_bets`).
+dynamique BSS/CLV). Gate lineups / proxy absences stars via ESPN (live only ;
+pas de parité backtest historique — limite documentée).
 """
 import copy
 import csv
@@ -42,7 +42,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 import requests
-from nba_api.stats.endpoints import scheduleleaguev2, teamgamelogs
+from nba_api.stats.endpoints import leaguedashplayerstats, scheduleleaguev2, teamgamelogs
 from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
 
 import nba_params
@@ -95,6 +95,25 @@ NBA_TELEGRAM_CHAT_ID = os.environ.get("NBA_TELEGRAM_CHAT_ID") or os.environ.get(
 # Fenêtre de scan live (heures avant tip-off) — matchs du programme du jour.
 NBA_SCAN_HEURES_AVANCE = float(os.environ.get("NBA_SCAN_HEURES_AVANCE", "12"))
 
+# Gate lineups / absences (pattern NHL_ATTENDRE_GARDIENS_CONFIRMES) — live only.
+# true = aucun pari tant que lineups/injuries ESPN pas « prêts » (voir
+# `lineups_sont_confirmes_nba`).
+NBA_ATTENDRE_LINEUPS_CONFIRMES = _env_bool("NBA_ATTENDRE_LINEUPS_CONFIRMES", True)
+# Minutes avant tip : au-delà, on attend encore même si le rapport blessures
+# est dispo (lineups officiels ~30-60 min avant tip ; défaut 75 = marge).
+NBA_LINEUP_CONFIRM_MINUTES = float(os.environ.get("NBA_LINEUP_CONFIRM_MINUTES", "75"))
+# Ajuster mu pour joueurs Out/Doubtful (proxy minutes×surplus pts).
+NBA_ABSENCES_ACTIF = _env_bool("NBA_ABSENCES_ACTIF", True)
+NBA_STAR_MIN_MPG = float(os.environ.get("NBA_STAR_MIN_MPG", "20"))
+# Niveau « remplaçant » PPG : surplus = max(0, PPG − replacement).
+NBA_STAR_REPLACEMENT_PPG = float(os.environ.get("NBA_STAR_REPLACEMENT_PPG", "8.0"))
+# Multiplicateur global du proxy (1.0 = impact brut minutes/48 × surplus).
+NBA_STAR_IMPACT_SCALE = float(os.environ.get("NBA_STAR_IMPACT_SCALE", "1.0"))
+# Poids Questionable / Day-To-Day (0 = ignorés, 1 = traités comme Out).
+NBA_ABSENCE_QUESTIONABLE_WEIGHT = float(os.environ.get("NBA_ABSENCE_QUESTIONABLE_WEIGHT", "0.35"))
+# TTL cache disque stats joueurs (jours).
+NBA_PLAYER_STATS_CACHE_JOURS = float(os.environ.get("NBA_PLAYER_STATS_CACHE_JOURS", "1"))
+
 # Edge minimum (fraction, ex. 0.03 = 3%) ; dynamique = majoré en début de
 # saison (échantillon faible = incertitude modèle plus grande), pattern
 # NHL_EDGE_DYNAMIQUE_*.
@@ -142,6 +161,7 @@ JOURNAL_COLONNES_NBA = [
     "Vraie_Cote_Bot", "Cote_Prise", "Cote_CLV",
     "Mu_Ext", "Mu_Dom", "Edge(%)", "Risque(%)", "Mise_€",
     "Statut", "P&L", "B2B_Ext", "B2B_Dom", "Confiance_Kelly",
+    "Lineups_Confirmes", "Impact_Abs_Ext", "Impact_Abs_Dom", "Absences",
 ]
 
 # Mapping tricode nba.com -> nom complet Odds API (basketball_nba, régions eu/us).
@@ -245,13 +265,14 @@ def _resultset_vers_dicts(payload, index=0):
 # ==========================================
 # 2. CACHE DISQUE (data/nba/) — permanent si saison terminée, TTL sinon
 # ==========================================
-def _cache_est_frais(chemin, season_year):
+def _cache_est_frais(chemin, season_year, ttl_jours=None):
     if not os.path.exists(chemin):
         return False
-    if season_year < NBA_SEASON:
+    if season_year < NBA_SEASON and ttl_jours is None:
         return True
     age_jours = (time.time() - os.path.getmtime(chemin)) / 86400
-    return age_jours < NBA_PIT_CACHE_JOURS
+    limite = NBA_PIT_CACHE_JOURS if ttl_jours is None else float(ttl_jours)
+    return age_jours < limite
 
 
 def _lire_cache_disque(chemin):
@@ -661,6 +682,305 @@ def fetch_live_scoreboard():
             "score_exterieur": away.get("score"),
         })
     return matchs
+
+
+# ==========================================
+# 5b. LINEUPS / ABSENCES (ESPN) — gate + proxy impact stars (LIVE ONLY)
+# ==========================================
+#
+# Pattern NHL_ATTENDRE_GARDIENS_CONFIRMES : aucun pari tant que la source
+# lineups/injuries n'est pas « prête ». Ajustement mu pour joueurs absents
+# via minutes × surplus PPG (LeagueDashPlayerStats). Pas de parité backtest
+# historique (pas d'archives ESPN PIT dans v1) — documenté comme limite.
+
+_ESPN_ABBREV_TO_NBA = {
+    "GS": "GSW", "NO": "NOP", "NY": "NYK", "SA": "SAS",
+    "UTAH": "UTA", "UT": "UTA", "WSH": "WAS", "PHO": "PHX",
+}
+_ABSENT_STATUSES = {"OUT", "DOUBTFUL", "SUSPENDED"}
+_QUESTIONABLE_STATUSES = {"QUESTIONABLE", "DAY-TO-DAY", "DAY TO DAY", "GTD"}
+
+_espn_scoreboard_cache: dict = {}  # date_key -> list events summary
+_player_stats_memo: dict | None = None
+
+
+def _espn_abbrev_to_nba(abbrev):
+    ab = (abbrev or "").strip().upper()
+    return _ESPN_ABBREV_TO_NBA.get(ab, ab)
+
+
+def _norm_player_name(nom):
+    return re.sub(r"[^a-z0-9]", "", (nom or "").lower())
+
+
+def _fetch_espn_nba_scoreboard(date_str=None):
+    """Scoreboard ESPN NBA du jour (ou `YYYYMMDD`). Cache mémoire courte."""
+    key = date_str or "now"
+    if key in _espn_scoreboard_cache:
+        return _espn_scoreboard_cache[key]
+    params = {}
+    if date_str:
+        params["dates"] = date_str.replace("-", "")
+    try:
+        r = requests.get(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+            params=params or None,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code != 200:
+            log_nba(f"⚠️ ESPN scoreboard NBA HTTP {r.status_code}", level="warning")
+            _espn_scoreboard_cache[key] = []
+            return []
+        events = r.json().get("events") or []
+        _espn_scoreboard_cache[key] = events
+        return events
+    except Exception as e:
+        log_nba(f"⚠️ ESPN scoreboard NBA : {type(e).__name__}: {e}", level="warning")
+        _espn_scoreboard_cache[key] = []
+        return []
+
+
+def _trouver_event_espn(home, away, date_utc=None):
+    """Retrouve l'event ESPN pour `away @ home` (tricodes nba.com)."""
+    dates_try = []
+    if date_utc:
+        tip = _parse_utc_nba(date_utc)
+        if tip:
+            # Scoreboard ESPN indexe souvent en calendrier US ET
+            et = tip - timedelta(hours=4)
+            dates_try.append(et.strftime("%Y%m%d"))
+            dates_try.append(tip.strftime("%Y%m%d"))
+    dates_try.append(None)  # « now »
+    home_u, away_u = (home or "").upper(), (away or "").upper()
+    for d in dates_try:
+        for ev in _fetch_espn_nba_scoreboard(d):
+            comps = (ev.get("competitions") or [None])[0] or {}
+            tricodes = {}
+            for c in comps.get("competitors") or []:
+                tri = _espn_abbrev_to_nba((c.get("team") or {}).get("abbreviation"))
+                tricodes[c.get("homeAway")] = tri
+            if tricodes.get("home") == home_u and tricodes.get("away") == away_u:
+                return ev
+    return None
+
+
+def fetch_espn_lineups_injuries_nba(home, away, date_utc=None):
+    """Injury report + starters ESPN pour un match.
+
+    Retourne dict ::
+        fetch_ok, event_id, injuries_fetched,
+        starters_home, starters_away,
+        absences: {tri: [(name, weight, status), ...]},
+        source
+    """
+    out = {
+        "fetch_ok": False,
+        "event_id": None,
+        "injuries_fetched": False,
+        "starters_home": 0,
+        "starters_away": 0,
+        "absences": {home: [], away: []},
+        "source": "indisponible",
+    }
+    ev = _trouver_event_espn(home, away, date_utc=date_utc)
+    if not ev:
+        return out
+    eid = ev.get("id")
+    out["event_id"] = eid
+    try:
+        r = requests.get(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary",
+            params={"event": eid},
+            timeout=20,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code != 200:
+            return out
+        data = r.json()
+    except Exception as e:
+        log_nba(f"⚠️ ESPN summary {home}/{away} : {e}", level="warning")
+        return out
+
+    out["fetch_ok"] = True
+    out["source"] = "espn"
+
+    # Blessures par équipe
+    q_w = min(max(NBA_ABSENCE_QUESTIONABLE_WEIGHT, 0.0), 1.0)
+    absences = {home: [], away: []}
+    for block in data.get("injuries") or []:
+        tri = _espn_abbrev_to_nba((block.get("team") or {}).get("abbreviation"))
+        if tri not in absences:
+            continue
+        for it in block.get("injuries") or []:
+            status = str(it.get("status") or "").strip().upper()
+            nom = (it.get("athlete") or {}).get("displayName") or ""
+            if not nom:
+                continue
+            if status in _ABSENT_STATUSES:
+                absences[tri].append((nom, 1.0, status))
+            elif status in _QUESTIONABLE_STATUSES and q_w > 0:
+                absences[tri].append((nom, q_w, status))
+    out["absences"] = absences
+    out["injuries_fetched"] = True
+
+    # Starters boxscore (souvent dispo proche tip / in-game)
+    for pblock in (data.get("boxscore") or {}).get("players") or []:
+        tri = _espn_abbrev_to_nba((pblock.get("team") or {}).get("abbreviation"))
+        n_start = 0
+        for stat in pblock.get("statistics") or []:
+            for ath in stat.get("athletes") or []:
+                if ath.get("starter"):
+                    n_start += 1
+        if tri == home:
+            out["starters_home"] = n_start
+        elif tri == away:
+            out["starters_away"] = n_start
+
+    return out
+
+
+def lineups_sont_confirmes_nba(info, tip_utc, maintenant=None):
+    """True si on peut parier (gate lineups).
+
+    Confirmé si :
+    - 5 starters de chaque côté dans le boxscore ESPN, OU
+    - rapport blessures fetch OK ET tip dans ≤ ``NBA_LINEUP_CONFIRM_MINUTES``.
+    """
+    if not info or not info.get("fetch_ok"):
+        return False
+    if info.get("starters_home", 0) >= 5 and info.get("starters_away", 0) >= 5:
+        return True
+    if not info.get("injuries_fetched"):
+        return False
+    maintenant = maintenant or datetime.now(timezone.utc)
+    if tip_utc is None:
+        return False
+    minutes = (tip_utc - maintenant).total_seconds() / 60.0
+    # Déjà commencé / tip imminent : OK si injuries fetchées
+    if minutes <= NBA_LINEUP_CONFIRM_MINUTES:
+        return True
+    return False
+
+
+def fetch_player_stats_nba(season_year=None, force=False):
+    """Stats joueurs saison (PerGame) via LeagueDashPlayerStats — cache disque.
+
+    Retourne ``{norm_name: {name, team, min, pts, gp}}``.
+    """
+    global _player_stats_memo
+    season_year = season_year or NBA_SEASON
+    season_str = _nba_season_str(season_year)
+    chemin = os.path.join(NBA_DATA_DIR, f"player_stats_{season_str}_pergame.json")
+
+    if not force and _player_stats_memo and _player_stats_memo.get("season") == season_year:
+        return _player_stats_memo["by_name"]
+
+    if not force and _cache_est_frais(chemin, season_year, ttl_jours=NBA_PLAYER_STATS_CACHE_JOURS):
+        cache = _lire_cache_disque(chemin)
+        if isinstance(cache, dict) and cache.get("by_name"):
+            _player_stats_memo = {"season": season_year, "by_name": cache["by_name"]}
+            return cache["by_name"]
+
+    resultat = _nba_api_call(
+        leaguedashplayerstats.LeagueDashPlayerStats,
+        label=f"leaguedashplayerstats {season_str}",
+        season=season_str,
+        season_type_all_star="Regular Season",
+        per_mode_detailed="PerGame",
+    )
+    by_name = {}
+    if resultat is not None:
+        try:
+            rows = _resultset_vers_dicts(resultat.get_dict())
+        except Exception:
+            rows = []
+        for row in rows:
+            nom = row.get("PLAYER_NAME") or ""
+            if not nom:
+                continue
+            by_name[_norm_player_name(nom)] = {
+                "name": nom,
+                "team": row.get("TEAM_ABBREVIATION"),
+                "min": float(row.get("MIN") or 0),
+                "pts": float(row.get("PTS") or 0),
+                "gp": int(row.get("GP") or 0),
+            }
+        _ecrire_cache_disque(chemin, {"by_name": by_name, "season": season_year})
+    elif os.path.isfile(chemin):
+        cache = _lire_cache_disque(chemin) or {}
+        by_name = cache.get("by_name") or {}
+
+    _player_stats_memo = {"season": season_year, "by_name": by_name}
+    return by_name
+
+
+def _impact_absence_joueur(nom, weight, player_stats):
+    """Impact points estimé d'un absent : (MPG/48) × surplus PPG × scale × weight."""
+    stats = (player_stats or {}).get(_norm_player_name(nom))
+    if not stats:
+        return 0.0, None
+    mpg = float(stats.get("min") or 0)
+    if mpg < NBA_STAR_MIN_MPG:
+        return 0.0, stats
+    surplus = max(0.0, float(stats.get("pts") or 0) - NBA_STAR_REPLACEMENT_PPG)
+    impact = (mpg / 48.0) * surplus * NBA_STAR_IMPACT_SCALE * float(weight)
+    return impact, stats
+
+
+def calculer_impact_absences_nba(home, away, absences_by_team, player_stats=None):
+    """Retourne (delta_mu_home, delta_mu_away, detail_str).
+
+    Un joueur Out côté domicile diminue ``mu_home`` (perte offensive) et
+    augmente légèrement ``mu_away`` (défense affaiblie / espace adverse).
+    """
+    if not NBA_ABSENCES_ACTIF:
+        return 0.0, 0.0, ""
+    player_stats = player_stats if player_stats is not None else fetch_player_stats_nba()
+    d_home = d_away = 0.0
+    details = []
+    for tri, side in ((home, "home"), (away, "away")):
+        for nom, weight, status in (absences_by_team or {}).get(tri) or []:
+            impact, _st = _impact_absence_joueur(nom, weight, player_stats)
+            if impact <= 0.05:
+                continue
+            if side == "home":
+                d_home -= impact
+                d_away += impact * 0.25
+            else:
+                d_away -= impact
+                d_home += impact * 0.25
+            details.append(f"{tri}:{nom}({status[:3]},{impact:.1f})")
+    return round(d_home, 2), round(d_away, 2), ";".join(details[:8])
+
+
+def ajuster_probas_apres_absences_nba(probas, delta_mu_home, delta_mu_away, lignes_spread=None, lignes_total=None):
+    """Recalcule moneyline/spread/total après déplacement des mu (absences)."""
+    if abs(delta_mu_home) < 1e-9 and abs(delta_mu_away) < 1e-9:
+        return probas
+    mu_h = max(float(probas["mu_home"]) + float(delta_mu_home), 1.0)
+    mu_a = max(float(probas["mu_away"]) + float(delta_mu_away), 1.0)
+    sigma_h = probas.get("sigma_home")
+    sigma_a = probas.get("sigma_away")
+    rho = probas.get("rho")
+    p_dom, p_ext = prob_moneyline_nba(mu_h, mu_a, sigma_h, sigma_a, rho)
+    out = dict(probas)
+    out["mu_home"] = round(mu_h, 2)
+    out["mu_away"] = round(mu_a, 2)
+    out["moneyline"] = {"domicile": round(p_dom, 4), "exterieur": round(p_ext, 4)}
+    out["delta_mu_home_absences"] = delta_mu_home
+    out["delta_mu_away_absences"] = delta_mu_away
+    spreads = {}
+    for ligne in (lignes_spread if lignes_spread is not None else (probas.get("spread") or {}).keys()):
+        p_d, p_p, p_e = prob_spread_nba(mu_h, mu_a, ligne, sigma_h, sigma_a, rho)
+        spreads[ligne] = {"domicile": round(p_d, 4), "push": round(p_p, 4), "exterieur": round(p_e, 4)}
+    totals = {}
+    for ligne in (lignes_total if lignes_total is not None else (probas.get("total") or {}).keys()):
+        p_o, p_p, p_u = prob_total_nba(mu_h, mu_a, ligne, sigma_h, sigma_a, rho)
+        totals[ligne] = {"over": round(p_o, 4), "push": round(p_p, 4), "under": round(p_u, 4)}
+    out["spread"] = spreads
+    out["total"] = totals
+    return out
 
 
 # ==========================================
@@ -1800,6 +2120,7 @@ def publier_journal_dashboard_nba():
 def enregistrer_transaction_nba(
     id_match, ext, dom, type_pari, vraie_cote_pari, investissement, cote_bookmaker,
     mu_ext=None, mu_dom=None, b2b_ext=False, b2b_dom=False,
+    lineups_confirmes=True, impact_abs_ext=0.0, impact_abs_dom=0.0, absences="",
 ):
     fichier_existe = os.path.isfile(FICHIER_JOURNAL_NBA)
     row = {
@@ -1821,6 +2142,10 @@ def enregistrer_transaction_nba(
         "B2B_Ext": "OUI" if b2b_ext else "NON",
         "B2B_Dom": "OUI" if b2b_dom else "NON",
         "Confiance_Kelly": 1.0,
+        "Lineups_Confirmes": "OUI" if lineups_confirmes else "NON",
+        "Impact_Abs_Ext": impact_abs_ext,
+        "Impact_Abs_Dom": impact_abs_dom,
+        "Absences": absences or "",
     }
     with open(FICHIER_JOURNAL_NBA, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA, extrasaction="ignore")
@@ -2236,6 +2561,10 @@ def _executer_opportunite_nba(opp):
         opp["id_match"], away, home, best["type"], best["cote_vraie"], best["inv"], best["cote_book"],
         mu_ext=opp.get("mu_away"), mu_dom=opp.get("mu_home"),
         b2b_ext=opp.get("away_b2b", False), b2b_dom=opp.get("home_b2b", False),
+        lineups_confirmes=opp.get("lineups_confirmes", True),
+        impact_abs_ext=opp.get("impact_abs_away", 0.0),
+        impact_abs_dom=opp.get("impact_abs_home", 0.0),
+        absences=opp.get("absences_detail", ""),
     )
     enregistrer_notification_nba(opp["id_match"])
 
@@ -2265,11 +2594,22 @@ def run_sniper_nba():
             f"⚖️ Shrinkage marché actif — confiance modèle {NBA_MODEL_TRUST_MIN:.0%} à 0 GP → "
             f"{NBA_MODEL_TRUST_MAX:.0%} à {NBA_MODEL_TRUST_GP_PLEIN:.0f}+ GP (reste : no-vig Pinnacle Shin)"
         )
+    if NBA_ATTENDRE_LINEUPS_CONFIRMES:
+        log_nba(
+            f"⏳ Gate lineups ESPN actif — aucun pari hors fenêtre "
+            f"≤{NBA_LINEUP_CONFIRM_MINUTES:g} min avant tip (sauf 5 starters boxscore)."
+        )
+    if NBA_ABSENCES_ACTIF:
+        log_nba(
+            f"🩹 Proxy absences actif — Out/Doubtful (MPG≥{NBA_STAR_MIN_MPG:g}) "
+            f"ajustent mu ; Questionable poids {NBA_ABSENCE_QUESTIONABLE_WEIGHT:.0%}."
+        )
 
     while True:
         try:
             lancer_la_balayeuse_nba()
             _invalider_pit_index_memo()
+            _espn_scoreboard_cache.clear()
 
             nb_attente = compter_paris_en_attente_nba()
             log_nba(f"🕵️ Tracking CLV ({nb_attente} pari(s) en attente)...")
@@ -2281,6 +2621,9 @@ def run_sniper_nba():
             odds_cache = fetch_all_pinnacle_odds_nba()
             matchs = get_nba_games_today()
             opportunites = []
+            player_stats = None
+            if NBA_ABSENCES_ACTIF:
+                player_stats = fetch_player_stats_nba()
 
             if not matchs:
                 log_nba("🏀 Aucun match NBA éligible dans la fenêtre de scan — veille active.")
@@ -2291,6 +2634,23 @@ def run_sniper_nba():
                 home, away = m.get("domicile"), m.get("exterieur")
                 if not home or not away:
                     continue
+
+                tip_utc = _parse_utc_nba(m.get("date_utc"))
+                lineup_info = fetch_espn_lineups_injuries_nba(home, away, date_utc=m.get("date_utc"))
+                lineups_ok = lineups_sont_confirmes_nba(lineup_info, tip_utc)
+                if NBA_ATTENDRE_LINEUPS_CONFIRMES and not lineups_ok:
+                    mins = (
+                        (tip_utc - datetime.now(timezone.utc)).total_seconds() / 60.0
+                        if tip_utc else float("nan")
+                    )
+                    log_nba(
+                        f"⏳ Attente lineups/injuries — {away} @ {home} "
+                        f"(source={lineup_info.get('source')}, "
+                        f"starters {lineup_info.get('starters_away')}/{lineup_info.get('starters_home')}, "
+                        f"tip−{mins:.0f} min) — aucun pari"
+                    )
+                    continue
+
                 cotes_match = get_odds_for_match_nba(home, away, odds_cache, log_si_absent=True)
                 if not cotes_match:
                     continue
@@ -2301,6 +2661,15 @@ def run_sniper_nba():
                 probas = calculer_probabilites_match_nba(
                     home, away, date_ref, lignes_spread=lignes_spread, lignes_total=lignes_total,
                 )
+                d_mu_h, d_mu_a, abs_detail = calculer_impact_absences_nba(
+                    home, away, lineup_info.get("absences") or {}, player_stats=player_stats,
+                )
+                if abs_detail:
+                    log_nba(f"🩹 Absences {away} @ {home} : {abs_detail} (Δμ H{d_mu_h:+.1f}/A{d_mu_a:+.1f})")
+                    probas = ajuster_probas_apres_absences_nba(
+                        probas, d_mu_h, d_mu_a, lignes_spread=lignes_spread, lignes_total=lignes_total,
+                    )
+
                 gp_moyen = (probas["rating_home"].get("gp", 0) + probas["rating_away"].get("gp", 0)) / 2.0
                 probas_shrink = shrink_probabilites_vers_marche_nba(probas, cotes_match, gp_moyen)
 
@@ -2323,6 +2692,9 @@ def run_sniper_nba():
                         "home": home, "away": away, "id_match": id_signal, "best_pari": pari,
                         "mu_home": probas.get("mu_home"), "mu_away": probas.get("mu_away"),
                         "home_b2b": probas.get("home_b2b", False), "away_b2b": probas.get("away_b2b", False),
+                        "lineups_confirmes": lineups_ok,
+                        "impact_abs_home": d_mu_h, "impact_abs_away": d_mu_a,
+                        "absences_detail": abs_detail,
                     })
 
             for opp in opportunites:

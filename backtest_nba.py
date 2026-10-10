@@ -28,7 +28,8 @@ Usage :
 
 Limites documentées (v1, voir le plan `sniper_nba_value_bets`) :
   - Pas de line movement / steam (pas d'historique snapshots intra-cycle)
-  - Pas d'absences stars / injury report (proxy minutes/impact = phase 2 roadmap)
+  - Pas de gate lineups / proxy absences ESPN (live only dans `nba_sniper.py` —
+    pas d'archives PIT ESPN historiques pour le walk-forward)
   - Cotes Pinnacle historiques : snapshot H-X avant tip-off par match (repli H-1 / H-0.5)
   - Résultats des matchs dérivés des box scores `nba_api` (teamgamelogs, déjà PIT-safe côté
     moteur) ; tip-off exact (`start_utc`) via `ScheduleLeagueV2` (bucketing des snapshots cotes)
