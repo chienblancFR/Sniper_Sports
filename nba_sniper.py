@@ -2769,21 +2769,124 @@ def calculer_bankroll_dynamique_nba(capital_de_base=None):
         return capital_de_base
 
 
-def get_match_result_nba(game_id):
-    """Score final `(score_away, score_home)` si le match est terminé
-    (`gameStatus == 3`, module live cdn.nba.com), sinon ``None``."""
-    try:
-        from nba_api.live.nba.endpoints import boxscore as live_boxscore
-        r = live_boxscore.BoxScore(game_id=str(game_id), timeout=15)
-        d = r.get_dict()
-        game = d.get("game", {})
-        if game.get("gameStatus") != 3:
-            return None
-        home = game.get("homeTeam", {})
-        away = game.get("awayTeam", {})
-        return int(away.get("score", 0)), int(home.get("score", 0))
-    except Exception:
+def _est_nba_game_id(game_id):
+    """True si ``game_id`` ressemble à un id stats.nba.com (ex. ``0022600123``)."""
+    s = str(game_id or "").strip()
+    return len(s) >= 8 and s.isdigit() and s.startswith(GAME_ID_PREFIX_REGULAR)
+
+
+def _slug_match_stable_nba(home, away, date_utc):
+    """Id journal stable indépendant de la source (live / Odds / schedule)."""
+    tip = _parse_utc_nba(date_utc)
+    jour = tip.strftime("%Y%m%d") if tip else "nodate"
+    return f"{jour}_{away}_{home}"
+
+
+def _lire_schedule_disque_nba(season_year=None):
+    """Lit le calendrier depuis le cache disque uniquement (pas d'appel nba_api).
+
+    Sur PA, stats.nba.com timeout : on ne doit pas bloquer le scan Odds pour
+    résoudre un game_id — le slug stable suffit en secours.
+    """
+    season_year = season_year or NBA_SEASON
+    season_str = _nba_season_str(season_year)
+    chemin = os.path.join(NBA_DATA_DIR, f"schedule_{season_str}.json")
+    cache = _lire_cache_disque(chemin)
+    return cache if isinstance(cache, list) else []
+
+
+def _lookup_nba_game_id_schedule(home, away, date_utc=None):
+    """Retrouve le ``game_id`` NBA via le calendrier en cache disque (pas de réseau)."""
+    if not home or not away:
         return None
+    tip = _parse_utc_nba(date_utc) if date_utc else None
+    schedule = _lire_schedule_disque_nba(NBA_SEASON)
+    best, best_dt = None, None
+    for m in schedule or []:
+        if m.get("domicile") != home or m.get("exterieur") != away:
+            continue
+        gid = m.get("game_id")
+        if not _est_nba_game_id(gid):
+            continue
+        if tip is None:
+            return str(gid)
+        mt = _parse_utc_nba(m.get("date_utc"))
+        if mt is None:
+            continue
+        delta = abs((mt - tip).total_seconds())
+        if delta <= 36 * 3600 and (best_dt is None or delta < best_dt):
+            best, best_dt = str(gid), delta
+    return best
+
+
+def _normaliser_game_id_match_nba(home, away, date_utc=None, candidate_id=None):
+    """Id stable pour journal / dédup : NBA id si possible, sinon slug date+équipes.
+
+    Évite les Odds ``event_id`` (cassent le règlement boxscore) et les
+    bascules live↔Odds qui dupliqueraient les paris paper.
+    """
+    if _est_nba_game_id(candidate_id):
+        return str(candidate_id).strip()
+    gid = _lookup_nba_game_id_schedule(home, away, date_utc=date_utc)
+    if gid:
+        return gid
+    return _slug_match_stable_nba(home, away, date_utc)
+
+
+def _score_final_depuis_espn(home, away, date_utc=None):
+    """Repli règlement PA : score final ESPN si cdn.nba.com / game_id absents."""
+    ev = _trouver_event_espn(home, away, date_utc=date_utc)
+    if not ev:
+        return None
+    status = ((ev.get("status") or {}).get("type") or {})
+    completed = bool(status.get("completed")) or str(status.get("name", "")).upper() in (
+        "STATUS_FINAL", "STATUS_FULL_TIME",
+    )
+    if not completed and "final" not in str(status.get("description", "")).lower():
+        return None
+    comps = ((ev.get("competitions") or [{}])[0].get("competitors")) or []
+    score_home = score_away = None
+    for c in comps:
+        tri = _espn_abbrev_to_nba((c.get("team") or {}).get("abbreviation"))
+        try:
+            sc = int(float(c.get("score")))
+        except (TypeError, ValueError):
+            continue
+        if tri == home:
+            score_home = sc
+        elif tri == away:
+            score_away = sc
+    if score_home is None or score_away is None:
+        return None
+    return score_away, score_home
+
+
+def get_match_result_nba(game_id, home=None, away=None, date_utc=None):
+    """Score final `(score_away, score_home)` si le match est terminé.
+
+    1. Boxscore live cdn.nba.com si ``game_id`` NBA valide (ou résolu via schedule)
+    2. Scoreboard ESPN (repli PA — cdn souvent down)
+    """
+    gid = str(game_id or "").strip()
+    if not _est_nba_game_id(gid) and home and away:
+        gid = _lookup_nba_game_id_schedule(home, away, date_utc=date_utc) or gid
+
+    if _est_nba_game_id(gid):
+        try:
+            from nba_api.live.nba.endpoints import boxscore as live_boxscore
+            r = live_boxscore.BoxScore(game_id=str(gid), timeout=15)
+            d = r.get_dict()
+            game = d.get("game", {})
+            if game.get("gameStatus") == 3:
+                h = game.get("homeTeam", {})
+                a = game.get("awayTeam", {})
+                return int(a.get("score", 0)), int(h.get("score", 0))
+        except Exception:
+            pass
+
+    if home and away:
+        return _score_final_depuis_espn(home, away, date_utc=date_utc)
+    return None
 
 
 def regler_pari_nba(pari, home, away, score_home, score_away):
@@ -2833,13 +2936,15 @@ def lancer_la_balayeuse_nba():
                 rows.append(row)
                 continue
             game_id = str(row["ID_Match"]).split("|")[0]
-            res = get_match_result_nba(game_id)
+            ext, dom = row.get("Exterieur"), row.get("Domicile")
+            date_hint = row.get("Date")
+            res = get_match_result_nba(game_id, home=dom, away=ext, date_utc=date_hint)
             if not res:
                 rows.append(row)
                 continue
             modifie = True
             score_ext, score_dom = res
-            ext, dom, pari = row["Exterieur"], row["Domicile"], row["Pari"]
+            pari = row["Pari"]
             mise, cote_book = float(row["Mise_€"]), float(row["Cote_Prise"])
             gagne, push = regler_pari_nba(pari, dom, ext, score_dom, score_ext)
 
@@ -2899,14 +3004,17 @@ def _matchs_depuis_schedule_fenetre(maintenant=None):
 
 def _matchs_depuis_odds_cache(odds_cache, maintenant=None):
     """Repli Odds API (Pinnacle) — indispensable sur PythonAnywhere où
-    stats.nba.com / cdn.nba.com timeout souvent alors que The Odds API répond."""
+    stats.nba.com / cdn.nba.com timeout souvent alors que The Odds API répond.
+
+    ``game_id`` = id NBA (schedule) ou slug stable date+équipes — jamais l'event_id
+    Odds brut (casse le règlement boxscore et peut dupliquer vs live).
+    """
     maintenant = maintenant or datetime.now(timezone.utc)
     bruts = []
     for (home, away), parsed in (odds_cache or {}).items():
         commence = parsed.get("commence_time") or parsed.get("date_utc")
-        eid = parsed.get("event_id") or f"ODDS_{away}_{home}_{(commence or '')[:10]}"
         bruts.append({
-            "game_id": str(eid),
+            "game_id": _normaliser_game_id_match_nba(home, away, commence),
             "date_utc": commence,
             "statut": "",
             "domicile": home,

@@ -183,13 +183,28 @@ def test_matchs_depuis_odds_cache_fenetre():
     tip_ok = (now + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     tip_loin = (now + timedelta(hours=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
     cache = {
-        ("BOS", "NYK"): {"commence_time": tip_ok, "event_id": "evt1"},
+        ("BOS", "NYK"): {"commence_time": tip_ok, "event_id": "evt1-unstable"},
         ("LAL", "DEN"): {"commence_time": tip_loin, "event_id": "evt2"},
     }
     out = nba._matchs_depuis_odds_cache(cache, maintenant=now)
     assert len(out) == 1
     assert out[0]["domicile"] == "BOS" and out[0]["exterieur"] == "NYK"
-    assert out[0]["game_id"] == "evt1"
+    # Pas l'event_id Odds : id NBA schedule ou slug stable date+équipes
+    assert out[0]["game_id"] != "evt1-unstable"
+    assert "NYK" in out[0]["game_id"] and "BOS" in out[0]["game_id"]
+
+
+def test_game_id_stable_pas_odds_event():
+    assert nba._est_nba_game_id("0022600123") is True
+    assert nba._est_nba_game_id("abc123") is False
+    slug = nba._slug_match_stable_nba("BOS", "NYK", "2026-10-20T19:00:00Z")
+    assert slug == "20261020_NYK_BOS"
+    # candidate Odds non-NBA → slug (sans dépendre du réseau schedule)
+    gid = nba._normaliser_game_id_match_nba(
+        "BOS", "NYK", "2026-10-20T19:00:00Z", candidate_id="odds-evt-xyz",
+    )
+    # Si schedule local a le match, id NBA ; sinon slug stable
+    assert gid == "20261020_NYK_BOS" or nba._est_nba_game_id(gid)
 
 
 def test_parse_bref_sps_html_minimal():
@@ -231,6 +246,7 @@ def main():
         test_projection_transfert_downweight_prior,
         test_projection_sps_overlay_scoring,
         test_matchs_depuis_odds_cache_fenetre,
+        test_game_id_stable_pas_odds_event,
         test_parse_bref_sps_html_minimal,
     ]
     failed = 0
