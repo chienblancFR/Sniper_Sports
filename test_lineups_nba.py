@@ -160,6 +160,21 @@ def test_projection_sps_overlay_scoring():
     assert proj["sps_pts36"] == 28.0
 
 
+def test_matchs_depuis_odds_cache_fenetre():
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 10, 21, 18, 0, tzinfo=timezone.utc)
+    tip_ok = (now + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tip_loin = (now + timedelta(hours=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cache = {
+        ("BOS", "NYK"): {"commence_time": tip_ok, "event_id": "evt1"},
+        ("LAL", "DEN"): {"commence_time": tip_loin, "event_id": "evt2"},
+    }
+    out = nba._matchs_depuis_odds_cache(cache, maintenant=now)
+    assert len(out) == 1
+    assert out[0]["domicile"] == "BOS" and out[0]["exterieur"] == "NYK"
+    assert out[0]["game_id"] == "evt1"
+
+
 def test_parse_bref_sps_html_minimal():
     html = """
     <table id="stats"><tbody>
@@ -197,6 +212,7 @@ def main():
         test_projection_blend_monte_avec_gp,
         test_projection_transfert_downweight_prior,
         test_projection_sps_overlay_scoring,
+        test_matchs_depuis_odds_cache_fenetre,
         test_parse_bref_sps_html_minimal,
     ]
     failed = 0

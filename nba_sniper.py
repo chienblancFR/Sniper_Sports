@@ -1999,7 +1999,15 @@ def _parse_pinnacle_game_nba(game):
     if not home_tri or not away_tri:
         return None
 
-    parsed = {"home": home_tri, "away": away_tri, "spreads": {}, "totals": {}}
+    parsed = {
+        "home": home_tri,
+        "away": away_tri,
+        "spreads": {},
+        "totals": {},
+        "event_id": game.get("id"),
+        "commence_time": game.get("commence_time"),
+        "date_utc": game.get("commence_time"),
+    }
     for bookmaker in game.get("bookmakers", []):
         if bookmaker.get("key") != "pinnacle":
             continue
@@ -2811,18 +2819,46 @@ def _matchs_depuis_schedule_fenetre(maintenant=None):
     return _filtrer_matchs_fenetre_scan(schedule, maintenant=maintenant)
 
 
-def get_nba_games_today():
-    """Programme à scanner : live scoreboard cdn.nba.com, sinon calendrier
-    saison (ScheduleLeagueV2) — le live renvoie souvent JSON vide même quand
-    l'Odds API liste déjà des matchs (début de saison / incident CDN)."""
+def _matchs_depuis_odds_cache(odds_cache, maintenant=None):
+    """Repli Odds API (Pinnacle) — indispensable sur PythonAnywhere où
+    stats.nba.com / cdn.nba.com timeout souvent alors que The Odds API répond."""
+    maintenant = maintenant or datetime.now(timezone.utc)
+    bruts = []
+    for (home, away), parsed in (odds_cache or {}).items():
+        commence = parsed.get("commence_time") or parsed.get("date_utc")
+        eid = parsed.get("event_id") or f"ODDS_{away}_{home}_{(commence or '')[:10]}"
+        bruts.append({
+            "game_id": str(eid),
+            "date_utc": commence,
+            "statut": "",
+            "domicile": home,
+            "exterieur": away,
+        })
+    return _filtrer_matchs_fenetre_scan(bruts, maintenant=maintenant)
+
+
+def get_nba_games_today(odds_cache=None):
+    """Programme à scanner, par ordre de préférence :
+    1. live scoreboard cdn.nba.com
+    2. événements Odds API déjà fetchés (rapide — prioritaire sur PA où
+       stats.nba.com timeout)
+    3. calendrier ScheduleLeagueV2 (cache disque / nba_api — peut être lent)
+    """
     maintenant = datetime.now(timezone.utc)
     matchs = _filtrer_matchs_fenetre_scan(fetch_live_scoreboard(), maintenant=maintenant)
     if matchs:
         return matchs
+    odds_m = _matchs_depuis_odds_cache(odds_cache, maintenant=maintenant)
+    if odds_m:
+        log_nba(
+            f"ℹ️ live scoreboard vide — repli Odds API : {len(odds_m)} match(s) "
+            f"dans la fenêtre {NBA_SCAN_HEURES_AVANCE:g}h"
+        )
+        return odds_m
     repli = _matchs_depuis_schedule_fenetre(maintenant=maintenant)
     if repli:
         log_nba(
-            f"ℹ️ live scoreboard vide — repli schedule : {len(repli)} match(s) "
+            f"ℹ️ live+odds vides — repli schedule : {len(repli)} match(s) "
             f"dans la fenêtre {NBA_SCAN_HEURES_AVANCE:g}h"
         )
     return repli
@@ -2903,10 +2939,11 @@ def run_sniper_nba():
             log_nba(f"💰 Capital Dynamique Disponible : {bankroll_actuelle} €")
 
             odds_cache = fetch_all_pinnacle_odds_nba()
-            matchs = get_nba_games_today()
+            matchs = get_nba_games_today(odds_cache=odds_cache)
             opportunites = []
+            # Ne pas spammer stats.nba.com (timeouts PA) s'il n'y a rien à scorer
             player_stats = None
-            if NBA_ABSENCES_ACTIF:
+            if NBA_ABSENCES_ACTIF and matchs:
                 player_stats = fetch_player_stats_nba()
 
             if not matchs:
