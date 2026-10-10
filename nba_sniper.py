@@ -44,39 +44,39 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-def _reexec_venv_nba_si_besoin():
+def _injecter_site_packages_venv_nba():
     """PythonAnywhere « Run » utilise le Python système (sans nba_api).
 
-    Si ``nba_api`` est absent et qu'un venv ``~/venv-nba`` existe, on
-    relance le même script avec ce Python (os.execv) — même comportement
-    qu'en Bash avec le chemin complet du venv.
+    ``os.execv`` ferme la console Run PA → on injecte plutôt le
+    ``site-packages`` de ``~/venv-nba`` dans ``sys.path`` (même process).
+    Nécessite la même version mineure Python que le venv (ex. 3.10).
     """
     try:
         import nba_api  # noqa: F401
         return
     except ImportError:
         pass
-    candidats = [
-        Path(os.environ.get("NBA_VENV_PYTHON", "")),
-        Path.home() / "venv-nba" / "bin" / "python",
-        Path("/home/chienblanc/venv-nba/bin/python"),
-    ]
-    actuel = Path(sys.executable).resolve()
-    for venv_py in candidats:
-        if not venv_py or not str(venv_py).strip():
-            continue
+
+    py_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    racines = []
+    env_root = os.environ.get("NBA_VENV_ROOT", "").strip()
+    if env_root:
+        racines.append(Path(env_root))
+    racines.extend([
+        Path.home() / "venv-nba",
+        Path("/home/chienblanc/venv-nba"),
+    ])
+    for root in racines:
+        site = root / "lib" / py_tag / "site-packages"
         try:
-            if not venv_py.is_file():
-                continue
-            if venv_py.resolve() == actuel:
-                continue
+            if site.is_dir() and str(site) not in sys.path:
+                sys.path.insert(0, str(site))
+                break
         except OSError:
             continue
-        os.execv(str(venv_py), [str(venv_py), *sys.argv])
-    # Pas de venv → laisser l'ImportError nba_api remonter plus bas
 
 
-_reexec_venv_nba_si_besoin()
+_injecter_site_packages_venv_nba()
 
 import requests
 from nba_api.stats.endpoints import leaguedashplayerstats, scheduleleaguev2, teamgamelogs
