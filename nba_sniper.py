@@ -123,6 +123,13 @@ NBA_PLAYER_TEAM_CHANGE_PRIOR = float(os.environ.get("NBA_PLAYER_TEAM_CHANGE_PRIO
 NBA_PLAYER_PRESEASON_ACTIF = _env_bool("NBA_PLAYER_PRESEASON_ACTIF", True)
 # Poids de la présaison dans le prior « rôle attendu » (vs N-1) à GP réguliers = 0.
 NBA_PLAYER_PRESEASON_WEIGHT = float(os.environ.get("NBA_PLAYER_PRESEASON_WEIGHT", "0.55"))
+# Prior Basketball-Reference Simple Projection System (SPS, type Marcel) :
+# taux de points /36 min, sans MPG — on convertit en PPG via les minutes
+# du blend N-1/présaison. Améliore la qualité scoring en début de saison.
+NBA_PLAYER_SPS_ACTIF = _env_bool("NBA_PLAYER_SPS_ACTIF", True)
+NBA_PLAYER_SPS_WEIGHT = float(os.environ.get("NBA_PLAYER_SPS_WEIGHT", "0.45"))
+NBA_PLAYER_SPS_CACHE_JOURS = float(os.environ.get("NBA_PLAYER_SPS_CACHE_JOURS", "7"))
+NBA_BREF_SPS_URL = "https://www.basketball-reference.com/friv/projections.cgi"
 
 # Edge minimum (fraction, ex. 0.03 = 3%) ; dynamique = majoré en début de
 # saison (échantillon faible = incertitude modèle plus grande), pattern
@@ -927,17 +934,106 @@ def _blend_stat(cur, prior, w_cur):
     return w * float(cur) + (1.0 - w) * float(prior)
 
 
-def _projeter_stats_joueur(cur, prior, pre, gp_plein, team_change_prior_w, preseason_w):
+def _parse_bref_sps_html(html):
+    """Extrait ``{norm_name: {name, pts36}}`` depuis la page BRef SPS.
+
+    Les projections SPS sont en **per 36 minutes** (pas de MPG) — on ne
+    garde que ``pts_per_mp`` pour convertir en PPG via les minutes du blend.
+    """
+    if not html:
+        return {}
+    # BRef enveloppe souvent le tableau dans des commentaires HTML
+    html2 = html.replace("<!--", "").replace("-->", "")
+    m = re.search(r'<table[^>]*id="stats"[^>]*>(.*?)</table>', html2, re.I | re.S)
+    if not m:
+        return {}
+    tbody = re.search(r"<tbody>(.*?)</tbody>", m.group(1), re.I | re.S)
+    body = tbody.group(1) if tbody else m.group(1)
+    by_name = {}
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.I | re.S):
+        if 'data-stat="player"' not in row:
+            continue
+        typ = re.search(r'data-stat="type"[^>]*>([^<]*)', row, re.I)
+        if not typ or "projected" not in typ.group(1).strip().lower():
+            continue
+        pl = re.search(r'data-stat="player"[^>]*>\s*(?:<a[^>]*>)?([^<]+)', row, re.I)
+        pts = re.search(r'data-stat="pts_per_mp"[^>]*>([^<]*)', row, re.I)
+        if not pl or not pts:
+            continue
+        nom = pl.group(1).strip()
+        try:
+            pts36 = float(pts.group(1).strip())
+        except ValueError:
+            continue
+        if not nom or pts36 < 0:
+            continue
+        by_name[_norm_player_name(nom)] = {"name": nom, "pts36": pts36}
+    return by_name
+
+
+def _charger_bref_sps(season_year, force=False):
+    """Charge les projections SPS BRef pour ``season_year`` (année de fin).
+
+    URL : ``projections.cgi?year=YYYY`` (ex. 2027 = saison 2026-27).
+    Cache disque ``data/nba/bref_sps_{YYYY}.json`` (TTL ``NBA_PLAYER_SPS_CACHE_JOURS``).
+    Échec réseau → ``{}`` (le blend continue sans SPS).
+    """
+    if not NBA_PLAYER_SPS_ACTIF:
+        return {}
+    season_year = int(season_year)
+    chemin = os.path.join(NBA_DATA_DIR, f"bref_sps_{season_year}.json")
+    if not force and _cache_est_frais(chemin, season_year, ttl_jours=NBA_PLAYER_SPS_CACHE_JOURS):
+        cache = _lire_cache_disque(chemin)
+        if isinstance(cache, dict) and cache.get("by_name") is not None:
+            return cache["by_name"]
+
+    url = f"{NBA_BREF_SPS_URL}?year={season_year}"
+    by_name = {}
+    try:
+        r = requests.get(
+            url,
+            timeout=45,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; nba-sniper-sps/1.0)"},
+        )
+        if r.status_code != 200:
+            log_nba(f"⚠️ BRef SPS HTTP {r.status_code} ({url})", level="warning")
+        else:
+            by_name = _parse_bref_sps_html(r.text)
+            if by_name:
+                _ecrire_cache_disque(
+                    chemin,
+                    {"by_name": by_name, "season": season_year, "source": "bref_sps", "n": len(by_name)},
+                )
+                log_nba(f"📊 BRef SPS {season_year} — {len(by_name)} joueurs projetés (cache {chemin})")
+            else:
+                log_nba(f"⚠️ BRef SPS {season_year} — parsing vide", level="warning")
+    except requests.RequestException as e:
+        log_nba(f"⚠️ BRef SPS fetch échoué : {e}", level="warning")
+
+    if not by_name and os.path.isfile(chemin):
+        cache = _lire_cache_disque(chemin) or {}
+        by_name = cache.get("by_name") or {}
+        if by_name:
+            log_nba(f"ℹ️ BRef SPS {season_year} — repli cache disque ({len(by_name)} joueurs)", level="warning")
+    return by_name
+
+
+def _projeter_stats_joueur(
+    cur, prior, pre, gp_plein, team_change_prior_w, preseason_w,
+    sps=None, sps_weight=0.0,
+):
     """Construit la projection de rôle (MPG/PPG) pour un joueur.
 
     - ``cur`` : saison régulière N (peut être vide / 0 GP en début de saison)
     - ``prior`` : saison régulière N-1
     - ``pre`` : présaison N (signal de nouveau rôle post-intersaison)
+    - ``sps`` : projection BRef SPS ``{pts36}`` (taux per 36 min) — overlay
+      scoring une fois les minutes estimées
 
-    À GP=0 : prior_rôle = blend(présaison, N-1) avec downweight N-1 si transfert.
-    Puis rampe vers ``cur`` sur ``gp_plein`` matchs (comme ratings équipes).
+    À GP=0 : prior_rôle = blend(présaison, N-1) + overlay SPS sur PPG,
+    downweight N-1 si transfert. Puis rampe vers ``cur`` sur ``gp_plein``.
     """
-    nom = (cur or prior or pre or {}).get("name") or "?"
+    nom = (cur or prior or pre or sps or {}).get("name") or "?"
     team_cur = (cur or {}).get("team")
     team_prior = (prior or {}).get("team")
     team_pre = (pre or {}).get("team")
@@ -973,6 +1069,23 @@ def _projeter_stats_joueur(cur, prior, pre, gp_plein, team_change_prior_w, prese
     else:
         role_min = role_pts = None
 
+    # Overlay SPS : PTS/36 → PPG via minutes projetées (SPS n'a pas de MPG)
+    sps_used = False
+    sps_pts36 = None
+    sw = min(max(float(sps_weight), 0.0), 1.0) if sps else 0.0
+    if sps and sw > 0 and role_min is not None and role_min > 0:
+        try:
+            sps_pts36 = float(sps.get("pts36"))
+        except (TypeError, ValueError):
+            sps_pts36 = None
+        if sps_pts36 is not None and sps_pts36 >= 0:
+            sps_ppg = (role_min / 36.0) * sps_pts36
+            if role_pts is not None:
+                role_pts = (1.0 - sw) * float(role_pts) + sw * sps_ppg
+            else:
+                role_pts = sps_ppg
+            sps_used = True
+
     if gp_plein > 0 and gp_cur > 0 and cur:
         w = min(1.0, gp_cur / float(gp_plein))
         mpg = _blend_stat(cur.get("min"), role_min, w)
@@ -997,16 +1110,18 @@ def _projeter_stats_joueur(cur, prior, pre, gp_plein, team_change_prior_w, prese
         "blend_w": round(w if gp_cur > 0 else 0.0, 3),
         "team_changed": team_changed,
         "source": source,
+        "sps_used": sps_used,
+        "sps_pts36": sps_pts36,
     }
 
 
 def fetch_player_stats_nba(season_year=None, force=False):
     """Projection de rôle joueur (PerGame) pour le proxy absences.
 
-    Blend saison régulière N + N-1 + présaison N (si activée), rampe sur
-    ``NBA_PLAYER_BLEND_GP_PLEIN`` GP — un joueur peu utilisé N-1 qui démarre
-    N (ou brille en présaison) voit son impact monter rapidement ; un
-    transfert downweight le prior N-1.
+    Blend saison régulière N + N-1 + présaison N + prior BRef SPS (PTS/36),
+    rampe sur ``NBA_PLAYER_BLEND_GP_PLEIN`` GP — un joueur peu utilisé N-1
+    qui démarre N (ou brille en présaison) voit son impact monter rapidement ;
+    un transfert downweight le prior N-1 ; SPS régresse le scoring (Marcel).
 
     Retourne ``{norm_name: {name, team, min, pts, gp, blend_w, source, ...}}``.
     """
@@ -1026,8 +1141,10 @@ def fetch_player_stats_nba(season_year=None, force=False):
     pre = {}
     if NBA_PLAYER_PRESEASON_ACTIF:
         pre = _charger_player_stats_saison(season_year, "Pre Season", force=force)
+    sps = _charger_bref_sps(season_year, force=force) if NBA_PLAYER_SPS_ACTIF else {}
 
     keys = set(cur) | set(prior) | set(pre)
+    # SPS seul ne suffit pas (pas de MPG) — on ne crée pas de joueur SPS-only
     by_name = {}
     for k in keys:
         proj = _projeter_stats_joueur(
@@ -1035,6 +1152,8 @@ def fetch_player_stats_nba(season_year=None, force=False):
             NBA_PLAYER_BLEND_GP_PLEIN,
             NBA_PLAYER_TEAM_CHANGE_PRIOR,
             NBA_PLAYER_PRESEASON_WEIGHT,
+            sps=sps.get(k),
+            sps_weight=NBA_PLAYER_SPS_WEIGHT if NBA_PLAYER_SPS_ACTIF else 0.0,
         )
         if proj:
             by_name[k] = proj
@@ -1046,7 +1165,7 @@ def fetch_player_stats_nba(season_year=None, force=False):
 def _impact_absence_joueur(nom, weight, player_stats):
     """Impact points estimé d'un absent : (MPG/48) × surplus PPG × scale × weight.
 
-    MPG/PPG viennent de la **projection blendée** (saison N / N-1 / présaison),
+    MPG/PPG viennent de la **projection blendée** (N / N-1 / présaison / SPS),
     pas uniquement de la saison passée.
     """
     stats = (player_stats or {}).get(_norm_player_name(nom))
@@ -2736,7 +2855,9 @@ def run_sniper_nba():
         log_nba(
             f"🩹 Proxy absences actif — Out/Doubtful (MPG≥{NBA_STAR_MIN_MPG:g}) "
             f"ajustent mu ; Questionable poids {NBA_ABSENCE_QUESTIONABLE_WEIGHT:.0%}. "
-            f"Rôle joueur = blend N/N-1/présaison (plein à {NBA_PLAYER_BLEND_GP_PLEIN:g} GP)."
+            f"Rôle joueur = blend N/N-1/présaison"
+            f"{'+SPS' if NBA_PLAYER_SPS_ACTIF else ''} "
+            f"(plein à {NBA_PLAYER_BLEND_GP_PLEIN:g} GP)."
         )
 
     while True:

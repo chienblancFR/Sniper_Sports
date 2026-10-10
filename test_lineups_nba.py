@@ -143,6 +143,44 @@ def test_projection_transfert_downweight_prior():
     assert abs(proj["min"] - 16.355) < 0.05, proj
 
 
+def test_projection_sps_overlay_scoring():
+    """SPS (PTS/36) ajuste le PPG via les minutes projetées, sans changer MPG."""
+    prior = {"name": "Star", "team": "OKC", "min": 36.0, "pts": 30.0, "gp": 70}
+    sps = {"name": "Star", "pts36": 28.0}  # 28 pts / 36 min
+    # Sans SPS : PPG = 30
+    base = nba._projeter_stats_joueur(None, prior, None, 15, 0.35, 0.55)
+    # Avec SPS weight 0.45 : sps_ppg = (36/36)*28 = 28 → 0.55*30 + 0.45*28 = 29.1
+    proj = nba._projeter_stats_joueur(
+        None, prior, None, 15, 0.35, 0.55, sps=sps, sps_weight=0.45,
+    )
+    assert abs(base["min"] - 36.0) < 1e-6
+    assert abs(proj["min"] - 36.0) < 1e-6  # minutes inchangées
+    assert abs(proj["pts"] - 29.1) < 0.05, proj
+    assert proj["sps_used"] is True
+    assert proj["sps_pts36"] == 28.0
+
+
+def test_parse_bref_sps_html_minimal():
+    html = """
+    <table id="stats"><tbody>
+    <tr>
+      <td data-stat="player"><a>Test Player</a></td>
+      <td data-stat="type">Projected</td>
+      <td data-stat="pts_per_mp">22.5</td>
+    </tr>
+    <tr>
+      <td data-stat="player">Skip Me</td>
+      <td data-stat="type">Actual</td>
+      <td data-stat="pts_per_mp">99.0</td>
+    </tr>
+    </tbody></table>
+    """
+    by_name = nba._parse_bref_sps_html(html)
+    assert nba._norm_player_name("Test Player") in by_name
+    assert by_name[nba._norm_player_name("Test Player")]["pts36"] == 22.5
+    assert nba._norm_player_name("Skip Me") not in by_name
+
+
 def main():
     tests = [
         test_espn_abbrev_mapping,
@@ -158,6 +196,8 @@ def main():
         test_projection_prior_only_debut_saison,
         test_projection_blend_monte_avec_gp,
         test_projection_transfert_downweight_prior,
+        test_projection_sps_overlay_scoring,
+        test_parse_bref_sps_html_minimal,
     ]
     failed = 0
     for t in tests:
