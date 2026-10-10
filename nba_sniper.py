@@ -113,6 +113,16 @@ NBA_STAR_IMPACT_SCALE = float(os.environ.get("NBA_STAR_IMPACT_SCALE", "1.0"))
 NBA_ABSENCE_QUESTIONABLE_WEIGHT = float(os.environ.get("NBA_ABSENCE_QUESTIONABLE_WEIGHT", "0.35"))
 # TTL cache disque stats joueurs (jours).
 NBA_PLAYER_STATS_CACHE_JOURS = float(os.environ.get("NBA_PLAYER_STATS_CACHE_JOURS", "1"))
+# Projection rôle joueur : blend saison N (courante) + N-1 + présaison
+# (pattern ratings équipes NBA_BLEND_GP_PLEIN) — un bench N-1 promu starter
+# N est capté dès les 1ers matchs / présaison ; un transfert downweight N-1.
+NBA_PLAYER_BLEND_GP_PLEIN = float(os.environ.get("NBA_PLAYER_BLEND_GP_PLEIN", "15"))
+# Poids max du prior N-1 si le joueur a changé d'équipe (0 = ignorer N-1).
+NBA_PLAYER_TEAM_CHANGE_PRIOR = float(os.environ.get("NBA_PLAYER_TEAM_CHANGE_PRIOR", "0.35"))
+# Inclure la présaison N dans la projection tant que GP réguliers < blend plein.
+NBA_PLAYER_PRESEASON_ACTIF = _env_bool("NBA_PLAYER_PRESEASON_ACTIF", True)
+# Poids de la présaison dans le prior « rôle attendu » (vs N-1) à GP réguliers = 0.
+NBA_PLAYER_PRESEASON_WEIGHT = float(os.environ.get("NBA_PLAYER_PRESEASON_WEIGHT", "0.55"))
 
 # Edge minimum (fraction, ex. 0.03 = 3%) ; dynamique = majoré en début de
 # saison (échantillon faible = incertitude modèle plus grande), pattern
@@ -863,30 +873,22 @@ def lineups_sont_confirmes_nba(info, tip_utc, maintenant=None):
     return False
 
 
-def fetch_player_stats_nba(season_year=None, force=False):
-    """Stats joueurs saison (PerGame) via LeagueDashPlayerStats — cache disque.
-
-    Retourne ``{norm_name: {name, team, min, pts, gp}}``.
-    """
-    global _player_stats_memo
-    season_year = season_year or NBA_SEASON
+def _charger_player_stats_saison(season_year, season_type="Regular Season", force=False):
+    """Charge un snapshot PerGame brut (une saison × un season_type) — cache disque."""
     season_str = _nba_season_str(season_year)
-    chemin = os.path.join(NBA_DATA_DIR, f"player_stats_{season_str}_pergame.json")
-
-    if not force and _player_stats_memo and _player_stats_memo.get("season") == season_year:
-        return _player_stats_memo["by_name"]
+    slug = "preseason" if "pre" in season_type.lower() else "regular"
+    chemin = os.path.join(NBA_DATA_DIR, f"player_stats_{season_str}_{slug}_pergame.json")
 
     if not force and _cache_est_frais(chemin, season_year, ttl_jours=NBA_PLAYER_STATS_CACHE_JOURS):
         cache = _lire_cache_disque(chemin)
         if isinstance(cache, dict) and cache.get("by_name"):
-            _player_stats_memo = {"season": season_year, "by_name": cache["by_name"]}
             return cache["by_name"]
 
     resultat = _nba_api_call(
         leaguedashplayerstats.LeagueDashPlayerStats,
-        label=f"leaguedashplayerstats {season_str}",
+        label=f"leaguedashplayerstats {season_str} {slug}",
         season=season_str,
-        season_type_all_star="Regular Season",
+        season_type_all_star=season_type,
         per_mode_detailed="PerGame",
     )
     by_name = {}
@@ -906,17 +908,147 @@ def fetch_player_stats_nba(season_year=None, force=False):
                 "pts": float(row.get("PTS") or 0),
                 "gp": int(row.get("GP") or 0),
             }
-        _ecrire_cache_disque(chemin, {"by_name": by_name, "season": season_year})
+        _ecrire_cache_disque(chemin, {"by_name": by_name, "season": season_year, "type": slug})
     elif os.path.isfile(chemin):
         cache = _lire_cache_disque(chemin) or {}
         by_name = cache.get("by_name") or {}
+    return by_name
 
-    _player_stats_memo = {"season": season_year, "by_name": by_name}
+
+def _blend_stat(cur, prior, w_cur):
+    """Blend linéaire ; si une source manque, prend l'autre."""
+    if cur is None and prior is None:
+        return 0.0
+    if cur is None:
+        return float(prior)
+    if prior is None:
+        return float(cur)
+    w = min(max(float(w_cur), 0.0), 1.0)
+    return w * float(cur) + (1.0 - w) * float(prior)
+
+
+def _projeter_stats_joueur(cur, prior, pre, gp_plein, team_change_prior_w, preseason_w):
+    """Construit la projection de rôle (MPG/PPG) pour un joueur.
+
+    - ``cur`` : saison régulière N (peut être vide / 0 GP en début de saison)
+    - ``prior`` : saison régulière N-1
+    - ``pre`` : présaison N (signal de nouveau rôle post-intersaison)
+
+    À GP=0 : prior_rôle = blend(présaison, N-1) avec downweight N-1 si transfert.
+    Puis rampe vers ``cur`` sur ``gp_plein`` matchs (comme ratings équipes).
+    """
+    nom = (cur or prior or pre or {}).get("name") or "?"
+    team_cur = (cur or {}).get("team")
+    team_prior = (prior or {}).get("team")
+    team_pre = (pre or {}).get("team")
+    team = team_cur or team_pre or team_prior
+    gp_cur = int((cur or {}).get("gp") or 0)
+    team_changed = bool(
+        team_prior and (team_cur or team_pre)
+        and team_prior != (team_cur or team_pre)
+    )
+
+    # Prior « rôle attendu cette saison » avant/au début de la régulière
+    prior_min = prior_pts = None
+    if prior:
+        prior_min = float(prior.get("min") or 0)
+        prior_pts = float(prior.get("pts") or 0)
+        if team_changed:
+            # Transfert : N-1 moins fiable (nouveau système / minutes inconnues)
+            tcw = min(max(float(team_change_prior_w), 0.0), 1.0)
+            prior_min *= tcw
+            prior_pts *= tcw
+
+    pre_min = float(pre.get("min") or 0) if pre else None
+    pre_pts = float(pre.get("pts") or 0) if pre else None
+    pw = min(max(float(preseason_w), 0.0), 1.0) if pre and (pre.get("gp") or 0) > 0 else 0.0
+
+    if prior_min is not None and pre_min is not None and pw > 0:
+        role_min = pw * pre_min + (1.0 - pw) * prior_min
+        role_pts = pw * pre_pts + (1.0 - pw) * prior_pts
+    elif pre_min is not None and pw > 0:
+        role_min, role_pts = pre_min, pre_pts
+    elif prior_min is not None:
+        role_min, role_pts = prior_min, prior_pts
+    else:
+        role_min = role_pts = None
+
+    if gp_plein > 0 and gp_cur > 0 and cur:
+        w = min(1.0, gp_cur / float(gp_plein))
+        mpg = _blend_stat(cur.get("min"), role_min, w)
+        ppg = _blend_stat(cur.get("pts"), role_pts, w)
+        source = "blend" if w < 1.0 and role_min is not None else "current"
+    elif role_min is not None:
+        mpg, ppg, w, source = role_min, role_pts, 0.0, "projection"
+    elif cur:
+        mpg = float(cur.get("min") or 0)
+        ppg = float(cur.get("pts") or 0)
+        w, source = 1.0, "current"
+    else:
+        return None
+
+    return {
+        "name": nom,
+        "team": team,
+        "min": mpg,
+        "pts": ppg,
+        "gp": gp_cur,
+        "gp_prior": int((prior or {}).get("gp") or 0),
+        "blend_w": round(w if gp_cur > 0 else 0.0, 3),
+        "team_changed": team_changed,
+        "source": source,
+    }
+
+
+def fetch_player_stats_nba(season_year=None, force=False):
+    """Projection de rôle joueur (PerGame) pour le proxy absences.
+
+    Blend saison régulière N + N-1 + présaison N (si activée), rampe sur
+    ``NBA_PLAYER_BLEND_GP_PLEIN`` GP — un joueur peu utilisé N-1 qui démarre
+    N (ou brille en présaison) voit son impact monter rapidement ; un
+    transfert downweight le prior N-1.
+
+    Retourne ``{norm_name: {name, team, min, pts, gp, blend_w, source, ...}}``.
+    """
+    global _player_stats_memo
+    season_year = season_year or NBA_SEASON
+
+    if (
+        not force
+        and _player_stats_memo
+        and _player_stats_memo.get("season") == season_year
+        and _player_stats_memo.get("mode") == "projection"
+    ):
+        return _player_stats_memo["by_name"]
+
+    cur = _charger_player_stats_saison(season_year, "Regular Season", force=force)
+    prior = _charger_player_stats_saison(season_year - 1, "Regular Season", force=force)
+    pre = {}
+    if NBA_PLAYER_PRESEASON_ACTIF:
+        pre = _charger_player_stats_saison(season_year, "Pre Season", force=force)
+
+    keys = set(cur) | set(prior) | set(pre)
+    by_name = {}
+    for k in keys:
+        proj = _projeter_stats_joueur(
+            cur.get(k), prior.get(k), pre.get(k),
+            NBA_PLAYER_BLEND_GP_PLEIN,
+            NBA_PLAYER_TEAM_CHANGE_PRIOR,
+            NBA_PLAYER_PRESEASON_WEIGHT,
+        )
+        if proj:
+            by_name[k] = proj
+
+    _player_stats_memo = {"season": season_year, "by_name": by_name, "mode": "projection"}
     return by_name
 
 
 def _impact_absence_joueur(nom, weight, player_stats):
-    """Impact points estimé d'un absent : (MPG/48) × surplus PPG × scale × weight."""
+    """Impact points estimé d'un absent : (MPG/48) × surplus PPG × scale × weight.
+
+    MPG/PPG viennent de la **projection blendée** (saison N / N-1 / présaison),
+    pas uniquement de la saison passée.
+    """
     stats = (player_stats or {}).get(_norm_player_name(nom))
     if not stats:
         return 0.0, None
@@ -933,6 +1065,7 @@ def calculer_impact_absences_nba(home, away, absences_by_team, player_stats=None
 
     Un joueur Out côté domicile diminue ``mu_home`` (perte offensive) et
     augmente légèrement ``mu_away`` (défense affaiblie / espace adverse).
+    Impacts basés sur la projection de rôle blendée (voir ``fetch_player_stats_nba``).
     """
     if not NBA_ABSENCES_ACTIF:
         return 0.0, 0.0, ""
@@ -2602,7 +2735,8 @@ def run_sniper_nba():
     if NBA_ABSENCES_ACTIF:
         log_nba(
             f"🩹 Proxy absences actif — Out/Doubtful (MPG≥{NBA_STAR_MIN_MPG:g}) "
-            f"ajustent mu ; Questionable poids {NBA_ABSENCE_QUESTIONABLE_WEIGHT:.0%}."
+            f"ajustent mu ; Questionable poids {NBA_ABSENCE_QUESTIONABLE_WEIGHT:.0%}. "
+            f"Rôle joueur = blend N/N-1/présaison (plein à {NBA_PLAYER_BLEND_GP_PLEIN:g} GP)."
         )
 
     while True:

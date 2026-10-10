@@ -109,6 +109,40 @@ def test_ajuster_probas_apres_absences():
     assert "moneyline" in out and -3.5 in out["spread"]
 
 
+def test_projection_prior_only_debut_saison():
+    """GP=0 → projection basée N-1 (et présaison si dispo)."""
+    prior = {"name": "Rookie Grow", "team": "BOS", "min": 12.0, "pts": 5.0, "gp": 70}
+    pre = {"name": "Rookie Grow", "team": "BOS", "min": 28.0, "pts": 16.0, "gp": 4}
+    proj = nba._projeter_stats_joueur(None, prior, pre, 15, 0.35, 0.55)
+    assert proj is not None
+    # 0.55*28 + 0.45*12 = 15.4+5.4 = 20.8
+    assert abs(proj["min"] - 20.8) < 0.05, proj
+    assert proj["source"] == "projection"
+    assert proj["gp"] == 0
+
+
+def test_projection_blend_monte_avec_gp():
+    """Un bench N-1 qui joue gros minutes en N → MPG projection monte avec GP."""
+    prior = {"name": "Breakout", "team": "SAS", "min": 11.0, "pts": 4.0, "gp": 60}
+    cur = {"name": "Breakout", "team": "SAS", "min": 30.0, "pts": 15.0, "gp": 8}
+    proj0 = nba._projeter_stats_joueur(None, prior, None, 15, 0.35, 0.55)
+    proj8 = nba._projeter_stats_joueur(cur, prior, None, 15, 0.35, 0.55)
+    assert proj0["min"] < 15
+    assert proj8["min"] > proj0["min"]
+    assert proj8["blend_w"] == round(8 / 15, 3)
+    assert proj8["source"] == "blend"
+
+
+def test_projection_transfert_downweight_prior():
+    prior = {"name": "Tradee", "team": "LAL", "min": 34.0, "pts": 22.0, "gp": 70}
+    cur = {"name": "Tradee", "team": "BOS", "min": 0.0, "pts": 0.0, "gp": 0}
+    # gp=0 + team change : prior downweighted, pas de cur utile → projection réduite
+    proj = nba._projeter_stats_joueur(None, prior, {"name": "Tradee", "team": "BOS", "min": 20.0, "pts": 10.0, "gp": 3}, 15, 0.35, 0.55)
+    assert proj["team_changed"] is True
+    # prior_min effective 34*0.35=11.9 ; blend 0.55*20 + 0.45*11.9 = 11+5.355 = 16.355
+    assert abs(proj["min"] - 16.355) < 0.05, proj
+
+
 def main():
     tests = [
         test_espn_abbrev_mapping,
@@ -121,6 +155,9 @@ def main():
         test_impact_ignore_bench,
         test_calculer_impact_absences_sides,
         test_ajuster_probas_apres_absences,
+        test_projection_prior_only_debut_saison,
+        test_projection_blend_monte_avec_gp,
+        test_projection_transfert_downweight_prior,
     ]
     failed = 0
     for t in tests:
