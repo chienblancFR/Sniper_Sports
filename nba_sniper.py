@@ -13,10 +13,11 @@ Ce module contient :
   (``ScheduleLeagueV2``) et scoreboard du jour (module live cdn.nba.com) ;
   cache disque JSON (``data/nba/``), permanent (saisons terminées) ou TTL
   (``NBA_PIT_CACHE_JOURS``, saison en cours).
-- Le **moteur mathématique** (ratings ajustés Off/Def + Pace avec
-  décroissance temporelle + shrinkage bayésien vers la moyenne ligue + blend
-  saison N/N-1, ajustements home court/repos/B2B/altitude, distribution
-  bivariée Normale sur la marge et le total, probabilités de marché
+- Le **moteur mathématique** (ratings Off/Def + Pace avec décroissance
+  temporelle, **ajustement adversaire itératif AdjORtg/AdjDRtg** (SoS /
+  KenPom additif), shrinkage bayésien vers la moyenne ligue + blend saison
+  N/N-1, ajustements home court/repos/B2B/altitude, distribution bivariée
+  Normale sur la marge et le total, probabilités de marché
   moneyline/spread/total avec gestion du push sur lignes entières) — voir
   `calculer_probabilites_match_nba()`. Paramètres calibrables dans
   `nba_params.py`.
@@ -38,7 +39,7 @@ import os
 import re
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from nba_api.stats.endpoints import scheduleleaguev2, teamgamelogs
@@ -566,9 +567,11 @@ def stats_fin_saison_nba(season_year, force=False):
 
 
 def _invalider_pit_index_memo():
-    global _pit_index_memo, _fin_saison_memo
+    global _pit_index_memo, _fin_saison_memo, _sos_snap_cache, _sos_fin_saison_cache
     _pit_index_memo = {}
     _fin_saison_memo = {}
+    _sos_snap_cache = {}
+    _sos_fin_saison_cache = {}
 
 
 # ==========================================
@@ -669,8 +672,9 @@ def fetch_live_scoreboard():
 #   records par équipe (get_dict per-game)
 #       -> stats brutes decay-pondérées (demi-vie NBA_RATING_HALF_LIFE_JOURS)
 #       -> moyenne ligue du jour (cross-section des équipes déjà actives)
+#       -> AdjORtg/AdjDRtg itératifs (SoS KenPom additif, PIT-safe, cache)
 #       -> shrinkage bayésien vers la moyenne ligue (n_prior)
-#       -> blend saison N / saison N-1 (rampe sur GP comptés, NBA_BLEND_GP_PLEIN)
+#       -> blend saison N / saison N-1 (prior N-1 aussi SoS-ajusté)
 #       -> mu_home / mu_away (cross Off x Def x Pace/lg_avg)
 #       -> ajustements HCA / repos-B2B / altitude
 #       -> distribution bivariée Normale (sigma_home, sigma_away, rho)
@@ -782,11 +786,196 @@ def _moyennes_ligue_depuis_snapshot(snap):
     }
 
 
+# Cache mémoire SoS : beaucoup de matchs partagent la même date_ref (soirée NBA)
+# et --tune réévalue des centaines de fois le même snapshot → gain majeur.
+_sos_snap_cache: dict = {}
+_sos_fin_saison_cache: dict = {}
+
+
+def _neutraliser_hca_game(ortg, drtg, domicile, hca_pts):
+    """Retire l'avantage domicile des ratings de match avant le SoS.
+
+    Sans cela, les équipes à calendrier domicile-lourd gonflent leur AdjO
+    (et sous-estiment leur AdjD). HCA est réappliqué à la prédiction via
+    `calculer_mu_points` — il ne doit pas aussi polluer les ratings de base.
+    """
+    if hca_pts <= 0:
+        return float(ortg), float(drtg)
+    if domicile:
+        return float(ortg) - hca_pts, float(drtg) + hca_pts
+    return float(ortg) + hca_pts, float(drtg) - hca_pts
+
+
+def _snapshot_ligue_sos(par_equipe, date_ref, half_life_jours, league_avg, n_iter=None):
+    """AdjORtg / AdjDRtg itératifs (KenPom additif) à `date_ref`, walk-forward.
+
+    Pour chaque match strictement avant `date_ref` ::
+
+        adj_o_contrib = ortg_neutre - (opp_adj_d - lg_d)
+        adj_d_contrib = drtg_neutre - (opp_adj_o - lg_o)
+
+    (défense mauvaise / ORtg élevé adverse → on dégonfle / crédite).
+    Itération Jacobi jusqu'à ``n_iter`` (défaut ``NBA_SOS_ITERS``). Pace /
+    effective_gp / gp restent ceux du snapshot brut (SoS ne touche que Off/Def).
+
+    Retourne un dict team → stats (même forme que `_snapshot_ligue_decay`),
+    ou le snapshot brut si SoS désactivé / trop peu de matchs.
+    """
+    if not nba_params.get_sos_actif():
+        return _snapshot_ligue_decay(par_equipe, date_ref, half_life_jours)
+
+    n_iter = int(n_iter if n_iter is not None else nba_params.get_sos_iters())
+    lg_o = float(league_avg["off_rating"])
+    lg_d = float(league_avg["def_rating"])
+    hca_pts = lg_o * float(nba_params.get_hca())
+
+    cache_key = (
+        id(par_equipe), date_ref, float(half_life_jours or 0), n_iter,
+        round(lg_o, 4), round(lg_d, 4), round(hca_pts, 4),
+    )
+    if cache_key in _sos_snap_cache:
+        return _sos_snap_cache[cache_key]
+
+    snap_brut = _snapshot_ligue_decay(par_equipe, date_ref, half_life_jours)
+    ref = _parse_date_nba(date_ref)
+
+    # Contributions par équipe : liste de (w_poss, ortg_n, drtg_n, opp, w_match)
+    contribs: dict[str, list] = {}
+    for team, games in par_equipe.items():
+        rows = []
+        for g in games:
+            if g["date"] >= date_ref:
+                continue
+            opp = g.get("opponent")
+            if not opp:
+                continue
+            d = _parse_date_nba(g.get("date"))
+            age_jours = (ref - d).days if (ref and d) else 0
+            w = _decay_poids(age_jours, half_life_jours)
+            poss = float(g.get("poss") or 0)
+            if poss <= 0 or w <= 0:
+                continue
+            ortg_n, drtg_n = _neutraliser_hca_game(
+                g.get("off_rating") or lg_o,
+                g.get("def_rating") or lg_d,
+                bool(g.get("domicile")),
+                hca_pts,
+            )
+            rows.append((w * poss, ortg_n, drtg_n, opp, w))
+        if rows:
+            contribs[team] = rows
+
+    if len(contribs) < 2:
+        _sos_snap_cache[cache_key] = snap_brut
+        return snap_brut
+
+    # Init : ratings bruts decay (ou moyenne ligue)
+    adj_o = {}
+    adj_d = {}
+    for team, brut in snap_brut.items():
+        if brut:
+            adj_o[team] = float(brut["off_rating"])
+            adj_d[team] = float(brut["def_rating"])
+        else:
+            adj_o[team] = lg_o
+            adj_d[team] = lg_d
+    # Équipes présentes dans contribs mais absentes du snap (ne devrait pas arriver)
+    for team in contribs:
+        adj_o.setdefault(team, lg_o)
+        adj_d.setdefault(team, lg_d)
+
+    for _ in range(max(n_iter, 1)):
+        new_o = dict(adj_o)
+        new_d = dict(adj_d)
+        for team, rows in contribs.items():
+            o_num = d_num = w_tot = 0.0
+            for w_poss, ortg_n, drtg_n, opp, _w in rows:
+                opp_d = adj_d.get(opp, lg_d)
+                opp_o = adj_o.get(opp, lg_o)
+                o_num += w_poss * (ortg_n - (opp_d - lg_d))
+                d_num += w_poss * (drtg_n - (opp_o - lg_o))
+                w_tot += w_poss
+            if w_tot > 0:
+                new_o[team] = o_num / w_tot
+                new_d[team] = d_num / w_tot
+        adj_o, adj_d = new_o, new_d
+
+    snap_adj = {}
+    for team, brut in snap_brut.items():
+        if not brut:
+            snap_adj[team] = None
+            continue
+        snap_adj[team] = {
+            "off_rating": adj_o.get(team, brut["off_rating"]),
+            "def_rating": adj_d.get(team, brut["def_rating"]),
+            "pace": brut["pace"],
+            "effective_gp": brut["effective_gp"],
+            "gp": brut["gp"],
+        }
+
+    _sos_snap_cache[cache_key] = snap_adj
+    return snap_adj
+
+
+def stats_fin_saison_sos_nba(season_year, force=False):
+    """Cumul fin de saison **opponent-adjusted** (même SoS que le live).
+
+    Sert de prior N-1 cohérent avec les ratings Adj de la saison en cours
+    (évite de blender Adj courant avec ORtg brut N-1). Cache mémoire par
+    saison ; `force=True` invalide.
+    """
+    global _sos_fin_saison_cache
+    if force:
+        _sos_fin_saison_cache.pop(season_year, None)
+    if season_year in _sos_fin_saison_cache:
+        return _sos_fin_saison_cache[season_year]
+
+    records = _fusionner_logs_saison(season_year, force=force)
+    if not records:
+        _sos_fin_saison_cache[season_year] = {}
+        return {}
+
+    par_equipe = _grouper_records_par_equipe(records)
+    # date_ref après le dernier match → tous les matchs de la saison inclus
+    dates = [g["date"] for games in par_equipe.values() for g in games]
+    if not dates:
+        _sos_fin_saison_cache[season_year] = {}
+        return {}
+    last = max(dates)
+    # J+1 pour inclure last (filtre strict `< date_ref`)
+    try:
+        last_d = datetime.strptime(last, "%Y-%m-%d").date()
+        date_ref = (last_d + timedelta(days=1)).isoformat()
+    except ValueError:
+        date_ref = "9999-12-31"
+
+    # Fin de saison : pas de décroissance (poids uniforme) pour un prior stable
+    snap_brut = _snapshot_ligue_decay(par_equipe, date_ref, half_life_jours=0)
+    league_avg = _moyennes_ligue_depuis_snapshot(snap_brut) or nba_params.get_league_avg_fallback()
+    snap_adj = _snapshot_ligue_sos(par_equipe, date_ref, half_life_jours=0, league_avg=league_avg)
+
+    finaux = {}
+    for team, s in snap_adj.items():
+        if not s:
+            continue
+        finaux[team] = {
+            "games_played": int(s["gp"]),
+            "off_rating": float(s["off_rating"]),
+            "def_rating": float(s["def_rating"]),
+            "pace": float(s["pace"]),
+        }
+    _sos_fin_saison_cache[season_year] = finaux
+    return finaux
+
+
 def _rating_ajuste_equipe(team, snap, league_avg, prior_n1, n_prior, blend_gp_plein):
     """Rating ajusté d'une équipe : shrinkage bayésien vers `league_avg`
     (poids `n_prior`, taille d'échantillon = `effective_gp` decay-pondéré)
     puis blend avec le rating de fin de saison précédente `prior_n1` (rampe
     sur GP comptés jusqu'à `blend_gp_plein`, pattern `NHL_BLEND_GP_PLEIN`).
+
+    `snap` est attendu **déjà SoS-ajusté** (AdjORtg/AdjDRtg) quand
+    `NBA_SOS_ACTIF` ; `prior_n1` idem via `stats_fin_saison_sos_nba`.
 
     Sans aucun match cette saison : pur prior N-1 si disponible, sinon
     moyenne ligue (équipe d'expansion / prior manquant)."""
@@ -1011,9 +1200,16 @@ def calculer_probabilites_match_nba(
     n_prior = nba_params.get_n_prior()
     blend_gp_plein = nba_params.get_blend_gp_plein()
 
-    snap = _snapshot_ligue_decay(par_equipe, date_ref, half_life)
-    league_avg = _moyennes_ligue_depuis_snapshot(snap) or nba_params.get_league_avg_fallback()
-    prior_n1 = stats_fin_saison_nba(season_year - 1, force=force)
+    # League avg depuis snapshot BRUT (échelle ORtg/DRtg non SoS) — le SoS
+    # centre les contributions autour de cette moyenne.
+    snap_brut = _snapshot_ligue_decay(par_equipe, date_ref, half_life)
+    league_avg = _moyennes_ligue_depuis_snapshot(snap_brut) or nba_params.get_league_avg_fallback()
+    snap = _snapshot_ligue_sos(par_equipe, date_ref, half_life, league_avg)
+    # Prior N-1 opponent-adjusted (cohérent avec Adj courant) ; repli brut si SoS off
+    if nba_params.get_sos_actif():
+        prior_n1 = stats_fin_saison_sos_nba(season_year - 1, force=force)
+    else:
+        prior_n1 = stats_fin_saison_nba(season_year - 1, force=force)
 
     rating_home = _rating_ajuste_equipe(home, snap, league_avg, prior_n1, n_prior, blend_gp_plein)
     rating_away = _rating_ajuste_equipe(away, snap, league_avg, prior_n1, n_prior, blend_gp_plein)

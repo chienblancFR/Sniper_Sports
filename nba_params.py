@@ -29,6 +29,16 @@ RATING_HALF_LIFE_JOURS_DEFAULT = float(os.environ.get("NBA_RATING_HALF_LIFE_JOUR
 # saison en cours vs le prior saison N-1 (pattern NHL_BLEND_GP_PLEIN).
 BLEND_GP_PLEIN_DEFAULT = float(os.environ.get("NBA_BLEND_GP_PLEIN", "20"))
 
+# Ajustement adversaire (AdjORtg/AdjDRtg) — itération KenPom additive, PIT-safe.
+# Désactiver (`false`) pour revenir aux ORtg/DRtg bruts (ablation / debug).
+def _env_bool_params(key: str, default: bool) -> bool:
+    return os.environ.get(key, str(default)).lower() in ("1", "true", "yes", "on")
+
+
+SOS_ACTIF_DEFAULT = _env_bool_params("NBA_SOS_ACTIF", True)
+# Nombre d'itérations Jacobi (10-20 suffit en pratique pour 30 équipes).
+SOS_ITERS_DEFAULT = int(os.environ.get("NBA_SOS_ITERS", "15"))
+
 # Home court advantage : fraction appliquée symétriquement sur ORtg (+) et
 # DRtg (-) de l'équipe à domicile ; ~0.015 ≈ 2.5-3 pts d'avantage net typique.
 HCA_DEFAULT = float(os.environ.get("NBA_HCA_DEFAULT", "0.015"))
@@ -112,6 +122,20 @@ def get_rating_half_life_jours() -> float:
 def get_blend_gp_plein() -> float:
     g = _global_entry()
     return float(g["blend_gp_plein"]) if "blend_gp_plein" in g else BLEND_GP_PLEIN_DEFAULT
+
+
+def get_sos_actif() -> bool:
+    g = _global_entry()
+    if "sos_actif" in g:
+        return bool(g["sos_actif"])
+    return SOS_ACTIF_DEFAULT
+
+
+def get_sos_iters() -> int:
+    g = _global_entry()
+    if "sos_iters" in g:
+        return max(1, int(g["sos_iters"]))
+    return max(1, SOS_ITERS_DEFAULT)
 
 
 def get_hca(team: str | None = None) -> float:
