@@ -47,13 +47,13 @@ from pathlib import Path
 def _injecter_site_packages_venv_nba():
     """PythonAnywhere « Run » utilise le Python système (sans nba_api).
 
-    ``os.execv`` ferme la console Run PA → on injecte plutôt le
-    ``site-packages`` de ``~/venv-nba`` dans ``sys.path`` (même process).
-    Nécessite la même version mineure Python que le venv (ex. 3.10).
+    Injecte le ``site-packages`` de ``~/venv-nba`` dans ``sys.path``.
+    Cherche toutes les versions ``lib/python*/site-packages`` (le Run PA
+    n'est pas toujours la même mineure que le venv).
     """
     try:
         import nba_api  # noqa: F401
-        return
+        return True
     except ImportError:
         pass
 
@@ -66,21 +66,61 @@ def _injecter_site_packages_venv_nba():
         Path.home() / "venv-nba",
         Path("/home/chienblanc/venv-nba"),
     ])
+    sites = []
     for root in racines:
-        site = root / "lib" / py_tag / "site-packages"
+        lib = root / "lib"
         try:
-            if site.is_dir() and str(site) not in sys.path:
-                sys.path.insert(0, str(site))
-                break
+            if not lib.is_dir():
+                continue
+        except OSError:
+            continue
+        pref = lib / py_tag / "site-packages"
+        if pref.is_dir():
+            sites.append(pref)
+        try:
+            for site in sorted(lib.glob("python*/site-packages")):
+                if site not in sites:
+                    sites.append(site)
         except OSError:
             continue
 
+    for site in sites:
+        nba_dir = site / "nba_api"
+        if not nba_dir.is_dir():
+            continue
+        path_s = str(site)
+        if path_s not in sys.path:
+            sys.path.insert(0, path_s)
+        try:
+            import nba_api  # noqa: F401
+            print(f"ℹ️ nba_api via venv site-packages : {site}", flush=True)
+            return True
+        except ImportError:
+            try:
+                sys.path.remove(path_s)
+            except ValueError:
+                pass
+    return False
 
-_injecter_site_packages_venv_nba()
 
-import requests
-from nba_api.stats.endpoints import leaguedashplayerstats, scheduleleaguev2, teamgamelogs
-from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
+_NBA_API_VIA_VENV = _injecter_site_packages_venv_nba()
+
+try:
+    import requests
+    from nba_api.stats.endpoints import leaguedashplayerstats, scheduleleaguev2, teamgamelogs
+    from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
+except ImportError as _nba_imp_err:
+    print(
+        "❌ nba_api introuvable pour ce Python.\n"
+        f"   executable = {sys.executable}\n"
+        f"   version    = {sys.version.split()[0]}\n"
+        "   → Sur PA, clique Run sur **run_nba_sniper.py** (lance le venv),\n"
+        "     ou en Bash :\n"
+        "     /home/chienblanc/venv-nba/bin/python /home/chienblanc/nba_sniper.py",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(1) from _nba_imp_err
 
 import nba_params
 from config_env import load_project_env
