@@ -29,34 +29,30 @@ def test_lineups_confirmes_starters():
     assert nba.lineups_sont_confirmes_nba(info, tip) is True
 
 
-def test_lineups_confirmes_fenetre_minutes():
-    tip = datetime.now(timezone.utc) + timedelta(minutes=30)
-    info = {
-        "fetch_ok": True,
-        "injuries_fetched": True,
-        "starters_home": 0,
-        "starters_away": 0,
-    }
-    assert nba.lineups_sont_confirmes_nba(info, tip) is True
+def test_lineups_require_starters_bloque_sans_cinq():
+    """Défaut : injuries + tip proche ≠ confirmé sans 5/5 starters."""
+    old = nba.NBA_LINEUP_REQUIRE_STARTERS
+    nba.NBA_LINEUP_REQUIRE_STARTERS = True
+    try:
+        tip = datetime.now(timezone.utc) + timedelta(minutes=30)
+        info = {
+            "fetch_ok": True,
+            "injuries_fetched": True,
+            "starters_home": 3,
+            "starters_away": 5,
+        }
+        assert nba.lineups_sont_confirmes_nba(info, tip) is False
+    finally:
+        nba.NBA_LINEUP_REQUIRE_STARTERS = old
 
 
-def test_lineups_pas_confirmes_trop_tot():
-    tip = datetime.now(timezone.utc) + timedelta(hours=6)
-    info = {
-        "fetch_ok": True,
-        "injuries_fetched": True,
-        "starters_home": 0,
-        "starters_away": 0,
-    }
-    assert nba.lineups_sont_confirmes_nba(info, tip) is False
-
-
-def test_lineups_confirmes_fenetre_4h():
-    """Gate défaut 240 min : tip −3 h OK si injuries fetchées."""
-    old = nba.NBA_LINEUP_CONFIRM_MINUTES
+def test_lineups_legacy_fenetre_si_require_off():
+    """Si REQUIRE_STARTERS=false : injuries + tip−30 min OK (legacy)."""
+    old_r, old_m = nba.NBA_LINEUP_REQUIRE_STARTERS, nba.NBA_LINEUP_CONFIRM_MINUTES
+    nba.NBA_LINEUP_REQUIRE_STARTERS = False
     nba.NBA_LINEUP_CONFIRM_MINUTES = 240
     try:
-        tip = datetime.now(timezone.utc) + timedelta(hours=3)
+        tip = datetime.now(timezone.utc) + timedelta(minutes=30)
         info = {
             "fetch_ok": True,
             "injuries_fetched": True,
@@ -64,8 +60,11 @@ def test_lineups_confirmes_fenetre_4h():
             "starters_away": 0,
         }
         assert nba.lineups_sont_confirmes_nba(info, tip) is True
+        tip_loin = datetime.now(timezone.utc) + timedelta(hours=6)
+        assert nba.lineups_sont_confirmes_nba(info, tip_loin) is False
     finally:
-        nba.NBA_LINEUP_CONFIRM_MINUTES = old
+        nba.NBA_LINEUP_REQUIRE_STARTERS = old_r
+        nba.NBA_LINEUP_CONFIRM_MINUTES = old_m
 
 
 def test_lineups_fetch_fail():
@@ -244,9 +243,8 @@ def main():
         test_espn_abbrev_mapping,
         test_norm_player_name,
         test_lineups_confirmes_starters,
-        test_lineups_confirmes_fenetre_minutes,
-        test_lineups_pas_confirmes_trop_tot,
-        test_lineups_confirmes_fenetre_4h,
+        test_lineups_require_starters_bloque_sans_cinq,
+        test_lineups_legacy_fenetre_si_require_off,
         test_lineups_fetch_fail,
         test_impact_absence_star,
         test_impact_ignore_bench,

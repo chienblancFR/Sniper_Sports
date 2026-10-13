@@ -176,10 +176,12 @@ NBA_SCAN_HEURES_AVANCE = float(os.environ.get("NBA_SCAN_HEURES_AVANCE", "12"))
 # true = aucun pari tant que lineups/injuries ESPN pas « prêts » (voir
 # `lineups_sont_confirmes_nba`).
 NBA_ATTENDRE_LINEUPS_CONFIRMES = _env_bool("NBA_ATTENDRE_LINEUPS_CONFIRMES", True)
-# Minutes avant tip : au-delà, on attend encore même si le rapport blessures
-# est dispo. Défaut 240 = 4 h (les lineups officiels arrivent plus tard, mais
-# le rapport injuries ESPN est déjà utile ; 75 min était trop court pour paper).
+# Minutes avant tip : utilisé seulement si ``NBA_LINEUP_REQUIRE_STARTERS=false``
+# (repli « injuries OK dans la fenêtre »). Défaut 240 = 4 h.
 NBA_LINEUP_CONFIRM_MINUTES = float(os.environ.get("NBA_LINEUP_CONFIRM_MINUTES", "240"))
+# true (défaut) = ne parier que lorsque ESPN a 5 starters domicile ET extérieur
+# (dès que les deux lineups sont confirmées, sans attendre une fenêtre horaire).
+NBA_LINEUP_REQUIRE_STARTERS = _env_bool("NBA_LINEUP_REQUIRE_STARTERS", True)
 # Ajuster mu pour joueurs Out/Doubtful (proxy minutes×surplus pts).
 NBA_ABSENCES_ACTIF = _env_bool("NBA_ABSENCES_ACTIF", True)
 NBA_STAR_MIN_MPG = float(os.environ.get("NBA_STAR_MIN_MPG", "20"))
@@ -941,24 +943,26 @@ def fetch_espn_lineups_injuries_nba(home, away, date_utc=None):
 def lineups_sont_confirmes_nba(info, tip_utc, maintenant=None):
     """True si on peut parier (gate lineups).
 
-    Confirmé si :
-    - 5 starters de chaque côté dans le boxscore ESPN, OU
-    - rapport blessures fetch OK ET tip dans ≤ ``NBA_LINEUP_CONFIRM_MINUTES``.
+    Par défaut (``NBA_LINEUP_REQUIRE_STARTERS=true``) : uniquement quand ESPN
+    publie **5 starters domicile et 5 extérieur** — dès que c'est le cas,
+    on analyse (pas de délai artificiel tip−Xh).
+
+    Si ``NBA_LINEUP_REQUIRE_STARTERS=false`` : repli legacy = rapport blessures
+    OK et tip dans ≤ ``NBA_LINEUP_CONFIRM_MINUTES``.
     """
     if not info or not info.get("fetch_ok"):
         return False
     if info.get("starters_home", 0) >= 5 and info.get("starters_away", 0) >= 5:
         return True
+    if NBA_LINEUP_REQUIRE_STARTERS:
+        return False
     if not info.get("injuries_fetched"):
         return False
     maintenant = maintenant or datetime.now(timezone.utc)
     if tip_utc is None:
         return False
     minutes = (tip_utc - maintenant).total_seconds() / 60.0
-    # Déjà commencé / tip imminent : OK si injuries fetchées
-    if minutes <= NBA_LINEUP_CONFIRM_MINUTES:
-        return True
-    return False
+    return minutes <= NBA_LINEUP_CONFIRM_MINUTES
 
 
 def _charger_player_stats_saison(season_year, season_type="Regular Season", force=False):
@@ -3197,10 +3201,16 @@ def run_sniper_nba():
             f"{NBA_MODEL_TRUST_MAX:.0%} à {NBA_MODEL_TRUST_GP_PLEIN:.0f}+ GP (reste : no-vig Pinnacle Shin)"
         )
     if NBA_ATTENDRE_LINEUPS_CONFIRMES:
-        log_nba(
-            f"⏳ Gate lineups ESPN actif — aucun pari hors fenêtre "
-            f"≤{NBA_LINEUP_CONFIRM_MINUTES:g} min avant tip (sauf 5 starters boxscore)."
-        )
+        if NBA_LINEUP_REQUIRE_STARTERS:
+            log_nba(
+                "⏳ Gate lineups ESPN actif — pari seulement quand 5 starters "
+                "domicile + 5 extérieur sont publiés (dès confirmation, sans délai tip−Xh)."
+            )
+        else:
+            log_nba(
+                f"⏳ Gate lineups ESPN actif — 5 starters OU injuries dans "
+                f"≤{NBA_LINEUP_CONFIRM_MINUTES:g} min avant tip."
+            )
     if NBA_ABSENCES_ACTIF:
         log_nba(
             f"🩹 Proxy absences actif — Out/Doubtful (MPG≥{NBA_STAR_MIN_MPG:g}) "
@@ -3250,10 +3260,11 @@ def run_sniper_nba():
                         if tip_utc else float("nan")
                     )
                     log_nba(
-                        f"⏳ Attente lineups/injuries — {away} @ {home} "
+                        f"⏳ Attente lineups confirmés — {away} @ {home} "
                         f"(source={lineup_info.get('source')}, "
-                        f"starters {lineup_info.get('starters_away')}/{lineup_info.get('starters_home')}, "
-                        f"tip−{mins:.0f} min) — aucun pari"
+                        f"starters away/home "
+                        f"{lineup_info.get('starters_away')}/{lineup_info.get('starters_home')} "
+                        f"(besoin 5/5), tip−{mins:.0f} min) — aucun pari"
                     )
                     continue
 
