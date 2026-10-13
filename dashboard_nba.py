@@ -104,6 +104,12 @@ def _charger_csv(url: str, fichier_local: str):
                 n_a = _score_journal(df, 0)[0]
                 return df, "ok", f"URL PA · {fichier_local} ({n_a} en attente / {len(df)} lignes)"
             return df, "empty", f"URL PA · {fichier_local} (vide)"
+        if r.status_code == 404:
+            # Fichier pas encore créé (aucun pari / bot pas redémarré avec assurer_journal)
+            return pd.DataFrame(), "empty", (
+                f"URL PA · {fichier_local} absent (HTTP 404) — "
+                "normal tant qu'aucun pari paper ; redémarre le sniper pour créer le CSV vide"
+            )
         erreurs.append(f"URL HTTP {r.status_code}")
     except Exception as e:
         erreurs.append(f"URL: {e}")
@@ -238,7 +244,8 @@ if statut_chargement == "missing":
         "⚠️ Journal NBA introuvable.\n\n"
         f"**Détail :** {source}\n\n"
         "Le dashboard lit `journal_trading_nba.csv` (local, dossier PA, ou URL). "
-        "Sur PythonAnywhere : vérifiez que le bot NBA tourne et publie le CSV dans `/data/`."
+        "Sur PythonAnywhere : le sniper doit écrire `/home/chienblanc/data/journal_trading_nba.csv` "
+        "(créé au démarrage même sans paris)."
     )
     st.stop()
 

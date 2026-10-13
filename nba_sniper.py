@@ -2451,6 +2451,28 @@ def enregistrer_notification_nba(id_match):
         f.write(id_match + "\n")
 
 
+def assurer_journal_nba_existe():
+    """Crée le CSV journal (header seul) s'il n'existe pas — évite 404 dashboard PA.
+
+    Sur PythonAnywhere le static ``/data/`` sert ``/home/chienblanc/data/`` :
+    sans fichier → HTTP 404 côté Streamlit tant qu'aucun pari n'a été pris.
+    """
+    if os.path.isfile(FICHIER_JOURNAL_NBA):
+        return FICHIER_JOURNAL_NBA
+    try:
+        parent = os.path.dirname(FICHIER_JOURNAL_NBA) or "."
+        if parent and parent != ".":
+            os.makedirs(parent, exist_ok=True)
+        with open(FICHIER_JOURNAL_NBA, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA)
+            writer.writeheader()
+        log_nba(f"📄 Journal NBA créé (vide) → {FICHIER_JOURNAL_NBA}")
+        publier_journal_dashboard_nba()
+    except OSError as e:
+        log_nba(f"⚠️ Impossible de créer le journal NBA : {e}", level="warning")
+    return FICHIER_JOURNAL_NBA
+
+
 def publier_journal_dashboard_nba():
     """Upload FTP optionnel du journal vers PythonAnywhere (pattern NHL/foot) —
     no-op si le journal est déjà écrit directement dans `PA_DATA_DIR`."""
@@ -3132,6 +3154,7 @@ def run_sniper_nba():
     (paper trading `NBA_DRY_RUN`, pattern `run_sniper` NHL)."""
     mode = "DRY RUN (paper trading)" if NBA_DRY_RUN else "LIVE"
     log_nba(f"🤖 Lancement Sniper NBA — mode {mode}")
+    assurer_journal_nba_existe()
     if NBA_DRY_RUN:
         log_nba("🧪 NBA_DRY_RUN actif : Telegram paper + écriture journal (pas de mise réelle).")
     if NBA_ODDS_INCLUDE_PRESEASON:
