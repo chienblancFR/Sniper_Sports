@@ -2990,10 +2990,24 @@ def lancer_la_balayeuse_nba():
 
 
 def _parse_utc_nba(date_str):
+    """Parse une date en ``datetime`` **toujours aware UTC**.
+
+    Le journal écrit ``YYYY-MM-DD HH:MM`` (naive) ; le schedule/Odds utilisent
+    ISO avec ``Z``. Sans normalisation → TypeError naive vs aware (balayeuse PA).
+    """
     if not date_str:
         return None
     try:
-        return datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+        s = str(date_str).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        # Journal / formats locaux : espace → T pour fromisoformat
+        if " " in s and "T" not in s:
+            s = s.replace(" ", "T", 1)
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except ValueError:
         return None
 

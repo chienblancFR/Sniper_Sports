@@ -194,6 +194,17 @@ def test_matchs_depuis_odds_cache_fenetre():
     assert "NYK" in out[0]["game_id"] and "BOS" in out[0]["game_id"]
 
 
+def test_parse_utc_nba_always_aware():
+    from datetime import timezone
+    a = nba._parse_utc_nba("2026-10-10 18:30")  # journal naive
+    b = nba._parse_utc_nba("2026-10-10T22:30:00Z")  # odds/schedule
+    assert a is not None and b is not None
+    assert a.tzinfo is not None and b.tzinfo is not None
+    # ne doit plus lever TypeError
+    delta = abs((b - a).total_seconds())
+    assert delta == 4 * 3600
+
+
 def test_game_id_stable_pas_odds_event():
     assert nba._est_nba_game_id("0022600123") is True
     assert nba._est_nba_game_id("abc123") is False
@@ -246,6 +257,7 @@ def main():
         test_projection_transfert_downweight_prior,
         test_projection_sps_overlay_scoring,
         test_matchs_depuis_odds_cache_fenetre,
+        test_parse_utc_nba_always_aware,
         test_game_id_stable_pas_odds_event,
         test_parse_bref_sps_html_minimal,
     ]
