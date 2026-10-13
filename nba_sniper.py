@@ -2843,11 +2843,20 @@ def _lire_schedule_disque_nba(season_year=None):
     return cache if isinstance(cache, list) else []
 
 
+def _as_utc_nba(dt):
+    """Force un ``datetime`` en aware UTC (secours si une source renvoie du naive)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _lookup_nba_game_id_schedule(home, away, date_utc=None):
     """Retrouve le ``game_id`` NBA via le calendrier en cache disque (pas de réseau)."""
     if not home or not away:
         return None
-    tip = _parse_utc_nba(date_utc) if date_utc else None
+    tip = _as_utc_nba(_parse_utc_nba(date_utc)) if date_utc else None
     schedule = _lire_schedule_disque_nba(NBA_SEASON)
     best, best_dt = None, None
     for m in schedule or []:
@@ -2858,10 +2867,13 @@ def _lookup_nba_game_id_schedule(home, away, date_utc=None):
             continue
         if tip is None:
             return str(gid)
-        mt = _parse_utc_nba(m.get("date_utc"))
+        mt = _as_utc_nba(_parse_utc_nba(m.get("date_utc")))
         if mt is None:
             continue
-        delta = abs((mt - tip).total_seconds())
+        try:
+            delta = abs((mt - tip).total_seconds())
+        except TypeError:
+            continue
         if delta <= 36 * 3600 and (best_dt is None or delta < best_dt):
             best, best_dt = str(gid), delta
     return best
@@ -2986,7 +2998,15 @@ def lancer_la_balayeuse_nba():
             game_id = str(row["ID_Match"]).split("|")[0]
             ext, dom = row.get("Exterieur"), row.get("Domicile")
             date_hint = row.get("Date")
-            res = get_match_result_nba(game_id, home=dom, away=ext, date_utc=date_hint)
+            try:
+                res = get_match_result_nba(game_id, home=dom, away=ext, date_utc=date_hint)
+            except Exception as e:
+                log_nba(
+                    f"⚠️ Balayeuse NBA {ext}@{dom} ({game_id}) : {type(e).__name__}: {e}",
+                    level="warning",
+                )
+                rows.append(row)
+                continue
             if not res:
                 rows.append(row)
                 continue
