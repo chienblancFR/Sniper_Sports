@@ -223,6 +223,8 @@ NBA_EDGE_DYNAMIQUE_EXTRA = float(os.environ.get("NBA_EDGE_DYNAMIQUE_EXTRA", "0.0
 NBA_EDGE_DYNAMIQUE_GP_PLEIN = float(os.environ.get("NBA_EDGE_DYNAMIQUE_GP_PLEIN", "20"))
 # Tolérance (pts) pour matcher une cote de clôture quand la ligne a bougé (CLV approx).
 NBA_CLV_LIGNE_TOLERANCE = float(os.environ.get("NBA_CLV_LIGNE_TOLERANCE", "1.5"))
+# Écart relatif max |clv-prise|/prise accepté (sinon live blowout / mauvaise close).
+NBA_CLV_MAX_DEV_REL = float(os.environ.get("NBA_CLV_MAX_DEV_REL", "0.45"))
 
 # Marchés actifs (ML=moneyline, SPREAD=handicap, TOTAL=total points).
 NBA_MARCHES_ACTIFS = {
@@ -2837,9 +2839,11 @@ def _extraire_cote_clv_nba(home, away, type_pari, cote_actuelle, odds_cache=None
         return _ok(prix, exact=exact, ligne_prise=ligne, ligne_cloture=L)
 
     if tp_upper.startswith("VICTOIRE"):
-        if home in tp and "cote_1" in cotes:
+        # Libellé exact « Victoire TRI » (évite faux positifs substring).
+        cible = tp_upper.replace("VICTOIRE", "", 1).strip()
+        if cible == str(home or "").upper() and "cote_1" in cotes:
             return _ok(cotes["cote_1"], exact=True)
-        if away in tp and "cote_2" in cotes:
+        if cible == str(away or "").upper() and "cote_2" in cotes:
             return _ok(cotes["cote_2"], exact=True)
         return _ok(None)
 
@@ -2866,19 +2870,79 @@ def _extraire_cote_clv_nba(home, away, type_pari, cote_actuelle, odds_cache=None
     return _ok(prix, exact=exact, ligne_prise=cle_dom, ligne_cloture=L)
 
 
+def _cote_clv_plausible_nba(cote_prise, cote_clv, max_dev_rel=None):
+    """Rejette les cotes live blowout (ex. ML 3.01 → 1.25) qui ne sont pas une close pré-tip."""
+    max_dev = NBA_CLV_MAX_DEV_REL if max_dev_rel is None else float(max_dev_rel)
+    try:
+        prise = float(cote_prise)
+        clv = float(cote_clv)
+    except (TypeError, ValueError):
+        return False
+    if prise <= 1.0 or clv <= 1.0:
+        return False
+    return abs(clv - prise) / prise <= max_dev
+
+
+def _match_deja_tippe_nba(home, away, odds_cache=None, maintenant=None):
+    """True si tip-off déjà passé (commence_time Odds API) — figer la CLV."""
+    maintenant = maintenant or datetime.now(timezone.utc)
+    cotes = get_odds_for_match_nba(home, away, odds_cache)
+    tip_raw = (cotes or {}).get("commence_time") or (cotes or {}).get("date_utc")
+    tip = _parse_utc_nba(tip_raw) if tip_raw else None
+    if tip is None:
+        return False
+    return maintenant >= tip
+
+
+def _reparer_clv_aberrants_nba():
+    """Remet Cote_CLV = Cote_Prise si l'écart est absurde (CLV live post-tip)."""
+    if not os.path.exists(FICHIER_JOURNAL_NBA):
+        return
+    rows, modifie, n = [], False, 0
+    with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            prise, clv = row.get("Cote_Prise"), row.get("Cote_CLV")
+            if prise and clv and not _cote_clv_plausible_nba(prise, clv):
+                row["Cote_CLV"] = prise
+                modifie = True
+                n += 1
+            rows.append(row)
+    if modifie:
+        with open(FICHIER_JOURNAL_NBA, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        publier_journal_dashboard_nba()
+        log_nba(
+            f"🛠️ CLV réparé — {n} ligne(s) avec Cote_CLV aberrante "
+            f"(écart >{NBA_CLV_MAX_DEV_REL:.0%} vs prise) → reset à Cote_Prise"
+        )
+
+
 def traquer_et_actualiser_clv_nba():
+    """Met à jour Cote_CLV uniquement en pré-tip ; ignore les écarts absurdes (live)."""
     if not os.path.exists(FICHIER_JOURNAL_NBA):
         return
     odds_cache = fetch_all_pinnacle_odds_nba()
     rows, maj = [], False
+    maintenant = datetime.now(timezone.utc)
     with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if row.get("Statut") == "EN ATTENTE":
                 dom, ext, type_pari = row.get("Domicile"), row.get("Exterieur"), row.get("Pari")
+                if _match_deja_tippe_nba(dom, ext, odds_cache, maintenant=maintenant):
+                    rows.append(row)
+                    continue
                 nv_cote = _extraire_cote_clv_nba(dom, ext, type_pari, row.get("Cote_CLV"), odds_cache)
-                if nv_cote != row.get("Cote_CLV"):
+                if nv_cote != row.get("Cote_CLV") and _cote_clv_plausible_nba(row.get("Cote_Prise"), nv_cote):
                     row["Cote_CLV"] = nv_cote
                     maj = True
+                elif nv_cote != row.get("Cote_CLV") and not _cote_clv_plausible_nba(row.get("Cote_Prise"), nv_cote):
+                    log_nba(
+                        f"⚠️ CLV ignoré (écart trop fort) {ext}@{dom} {type_pari} : "
+                        f"prise {row.get('Cote_Prise')} → {nv_cote}",
+                        level="warning",
+                    )
             rows.append(row)
     if maj:
         with open(FICHIER_JOURNAL_NBA, "w", encoding="utf-8", newline="") as f:
@@ -3267,6 +3331,7 @@ def run_sniper_nba():
     mode = "DRY RUN (paper trading)" if NBA_DRY_RUN else "LIVE"
     log_nba(f"🤖 Lancement Sniper NBA — mode {mode}")
     assurer_journal_nba_existe()
+    _reparer_clv_aberrants_nba()
     if NBA_DRY_RUN:
         log_nba("🧪 NBA_DRY_RUN actif : Telegram paper + écriture journal (pas de mise réelle).")
     if NBA_ODDS_INCLUDE_PRESEASON:
