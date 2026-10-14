@@ -242,7 +242,8 @@ NBA_MODEL_TRUST_GP_PLEIN = float(os.environ.get("NBA_MODEL_TRUST_GP_PLEIN", "20"
 
 # Paper trading — cette saison, aucune mise réelle (voir règle nba-paper-trading).
 NBA_DRY_RUN = _env_bool("NBA_DRY_RUN", True)
-# Paper : tous les candidats edge valides du match (pas seulement le max-edge).
+# true = jusqu'à 1 pari / marché / match (meilleur edge ML, SPREAD, TOTAL) ;
+# false = un seul pari global (max-edge du match).
 NBA_TOUS_CANDIDATS_ACTIF = _env_bool("NBA_TOUS_CANDIDATS_ACTIF", True)
 NBA_BANKROLL = float(os.environ.get("NBA_BANKROLL", "1000.0"))
 NBA_ODDS_QUOTA_ALERT = int(os.environ.get("NBA_ODDS_QUOTA_ALERT", "100"))
@@ -2431,18 +2432,43 @@ def _choisir_meilleur_pari_nba(candidats):
 
 
 def _selectionner_paris_nba(candidats):
-    """Max-edge seul, ou tous les candidats (paper trading — `NBA_TOUS_CANDIDATS_ACTIF`)."""
+    """Sélection des paris à prendre.
+
+    - ``NBA_TOUS_CANDIDATS_ACTIF=false`` : 1 seul pari (max-edge du match)
+    - ``true`` (paper) : **au plus 1 pari par marché** (meilleur edge ML,
+      meilleur SPREAD, meilleur TOTAL) — jamais plusieurs lignes OVER/UNDER
+      ou handicaps sur le même match.
+    """
     if not candidats:
         return []
-    if NBA_TOUS_CANDIDATS_ACTIF:
-        return list(candidats)
-    best = _choisir_meilleur_pari_nba(candidats)
-    return [best] if best else []
+    if not NBA_TOUS_CANDIDATS_ACTIF:
+        best = _choisir_meilleur_pari_nba(candidats)
+        return [best] if best else []
+    meilleurs = {}
+    for cand in candidats:
+        marche = (cand.get("marche") or "").upper() or "?"
+        inv = cand.get("inv")
+        if not inv:
+            continue
+        prev = meilleurs.get(marche)
+        if prev is None or float(inv.get("edge") or 0) > float(prev["inv"].get("edge") or 0):
+            meilleurs[marche] = cand
+    ordre = ["ML", "SPREAD", "TOTAL"]
+    out = [meilleurs[m] for m in ordre if m in meilleurs]
+    for m, cand in meilleurs.items():
+        if m not in ordre:
+            out.append(cand)
+    return out
 
 
 # ==========================================
 # 9. JOURNAL DE TRADING, TELEGRAM & BOUCLE LIVE
 # ==========================================
+def _cle_dedup_marche_nba(game_id, marche):
+    """Clé mémoire / anti-doublon : 1 entrée par (match, marché), pas par ligne."""
+    return f"{game_id}|{(marche or '').upper()}"
+
+
 def match_deja_notifie_nba(id_match):
     if not os.path.exists(FICHIER_MEMOIRE_NBA):
         return False
@@ -2453,6 +2479,40 @@ def match_deja_notifie_nba(id_match):
 def enregistrer_notification_nba(id_match):
     with open(FICHIER_MEMOIRE_NBA, "a", encoding="utf-8") as f:
         f.write(id_match + "\n")
+
+
+def _marche_depuis_type_pari_nba(type_pari):
+    tp = str(type_pari or "").strip().upper()
+    if tp.startswith("VICTOIRE"):
+        return "ML"
+    if tp.startswith("OVER") or tp.startswith("UNDER"):
+        return "TOTAL"
+    return "SPREAD"
+
+
+def marche_deja_joue_nba(game_id, marche):
+    """True si ce marché a déjà été pris pour ce match (mémoire ou journal).
+
+    Empêche de rejouer UNDER 239 après UNDER 237 quand la ligne bouge.
+    """
+    cle = _cle_dedup_marche_nba(game_id, marche)
+    if match_deja_notifie_nba(cle):
+        return True
+    # Ancienne clé verbose (rétrocompat) + scan journal
+    if not os.path.isfile(FICHIER_JOURNAL_NBA):
+        return False
+    prefix = f"{game_id}|"
+    try:
+        with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                idm = str(row.get("ID_Match") or "")
+                if not idm.startswith(prefix):
+                    continue
+                if _marche_depuis_type_pari_nba(row.get("Pari") or idm.split("|", 1)[-1]) == (marche or "").upper():
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def assurer_journal_nba_existe():
@@ -3169,7 +3229,8 @@ def _executer_opportunite_nba(opp):
         impact_abs_dom=opp.get("impact_abs_home", 0.0),
         absences=opp.get("absences_detail", ""),
     )
-    enregistrer_notification_nba(opp["id_match"])
+    # Dédup par marché (pas par ligne) pour ne pas rejouer si le total/spread bouge
+    enregistrer_notification_nba(opp.get("id_dedup") or opp["id_match"])
 
 
 def run_sniper_nba():
@@ -3184,7 +3245,9 @@ def run_sniper_nba():
     if NBA_ODDS_INCLUDE_PRESEASON:
         log_nba("🏀 Odds présaison inclus (basketball_nba_preseason) — smoke paper avant tip-off régulière.")
     if NBA_TOUS_CANDIDATS_ACTIF:
-        log_nba("📚 Tous candidats actifs — chaque edge valide est pris (pas seulement le max du match).")
+        log_nba("📚 Paper multi-marchés — au plus 1 pari / marché / match (meilleur edge ML, SPREAD, TOTAL).")
+    else:
+        log_nba("📚 Mode max-edge — 1 seul pari par match.")
     cap_label = f"{NBA_MISE_MAX_PCT}% bankroll" if NBA_MISE_MAX_PCT > 0 else "Kelly pur (pas de cap %)"
     log_nba(f"💶 Cap mise : {cap_label} | journal → {FICHIER_JOURNAL_NBA}")
     log_nba(
@@ -3302,11 +3365,15 @@ def run_sniper_nba():
                     continue
 
                 for pari in paris_retenus:
-                    id_signal = f"{m['game_id']}|{pari['type']}"
-                    if match_deja_notifie_nba(id_signal):
+                    marche = (pari.get("marche") or _marche_depuis_type_pari_nba(pari.get("type"))).upper()
+                    # Journal : détail de la ligne ; dédup : 1 seule fois par marché
+                    id_journal = f"{m['game_id']}|{pari['type']}"
+                    id_dedup = _cle_dedup_marche_nba(m["game_id"], marche)
+                    if marche_deja_joue_nba(m["game_id"], marche):
                         continue
                     opportunites.append({
-                        "home": home, "away": away, "id_match": id_signal, "best_pari": pari,
+                        "home": home, "away": away, "id_match": id_journal, "id_dedup": id_dedup,
+                        "best_pari": pari,
                         "mu_home": probas.get("mu_home"), "mu_away": probas.get("mu_away"),
                         "home_b2b": probas.get("home_b2b", False), "away_b2b": probas.get("away_b2b", False),
                         "lineups_confirmes": lineups_ok,
