@@ -37,6 +37,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -2515,35 +2516,54 @@ def marche_deja_joue_nba(game_id, marche):
     return False
 
 
-def assurer_journal_nba_existe():
-    """Crée le CSV journal (header seul) s'il n'existe pas — évite 404 dashboard PA.
+def _chemin_miroir_static_nba() -> str:
+    """Cible du miroir static PA : ``~/journal_trading_nba.csv``.
 
-    Sur PythonAnywhere le static ``/data/`` sert ``/home/chienblanc/data/`` :
-    sans fichier → HTTP 404 côté Streamlit tant qu'aucun pari n'a été pris.
+    Sur PythonAnywhere, ``https://…/data/<fichier>`` sert souvent ``~/<fichier>``
+    (home), pas ``~/data/<fichier>`` — même pattern que NHL / foot.
     """
-    if os.path.isfile(FICHIER_JOURNAL_NBA):
-        return FICHIER_JOURNAL_NBA
-    try:
-        parent = os.path.dirname(FICHIER_JOURNAL_NBA) or "."
-        if parent and parent != ".":
-            os.makedirs(parent, exist_ok=True)
-        with open(FICHIER_JOURNAL_NBA, mode="w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA)
-            writer.writeheader()
-        log_nba(f"📄 Journal NBA créé (vide) → {FICHIER_JOURNAL_NBA}")
-        publier_journal_dashboard_nba()
-    except OSError as e:
-        log_nba(f"⚠️ Impossible de créer le journal NBA : {e}", level="warning")
+    return os.path.join(os.path.expanduser("~"), JOURNAL_NOM_NBA)
+
+
+def assurer_journal_nba_existe():
+    """Crée le CSV journal (header seul) s'il n'existe pas, et miroir static PA."""
+    if not os.path.isfile(FICHIER_JOURNAL_NBA):
+        try:
+            parent = os.path.dirname(FICHIER_JOURNAL_NBA) or "."
+            if parent and parent != ".":
+                os.makedirs(parent, exist_ok=True)
+            with open(FICHIER_JOURNAL_NBA, mode="w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA)
+                writer.writeheader()
+            log_nba(f"📄 Journal NBA créé (vide) → {FICHIER_JOURNAL_NBA}")
+        except OSError as e:
+            log_nba(f"⚠️ Impossible de créer le journal NBA : {e}", level="warning")
+            return FICHIER_JOURNAL_NBA
+    # Toujours republier / miroir (même si le CSV existait déjà dans ~/data/)
+    publier_journal_dashboard_nba()
     return FICHIER_JOURNAL_NBA
 
 
 def publier_journal_dashboard_nba():
-    """Upload FTP optionnel du journal vers PythonAnywhere (pattern NHL/foot) —
-    no-op si le journal est déjà écrit directement dans `PA_DATA_DIR`."""
-    if os.path.isdir(PA_DATA_DIR) and FICHIER_JOURNAL_NBA.startswith(PA_DATA_DIR):
-        return
+    """Rend le journal visible pour Streamlit via l'URL PA ``/data/...``.
+
+    Canonique : ``~/data/journal_trading_nba.csv``.
+    Miroir : ``~/journal_trading_nba.csv`` (static PA pointe souvent sur ``~/``).
+    Hors PA : upload FTP optionnel vers les deux emplacements.
+    """
     if not os.path.exists(FICHIER_JOURNAL_NBA):
         return
+
+    if os.path.isdir(PA_DATA_DIR) and FICHIER_JOURNAL_NBA.startswith(PA_DATA_DIR):
+        legacy = _chemin_miroir_static_nba()
+        try:
+            if os.path.abspath(FICHIER_JOURNAL_NBA) != os.path.abspath(legacy):
+                shutil.copy2(FICHIER_JOURNAL_NBA, legacy)
+                log_nba(f"📄 Journal NBA miroir static → {legacy}")
+        except OSError as e:
+            log_nba(f"⚠️ Miroir journal static (~/) échoué : {e}", level="warning")
+        return
+
     ftp_user = os.environ.get("PA_FTP_USER", "")
     ftp_pass = os.environ.get("PA_FTP_PASSWORD", "")
     if not ftp_user or not ftp_pass:
@@ -2558,7 +2578,14 @@ def publier_journal_dashboard_nba():
             ftp.cwd(remote_dir)
             with open(FICHIER_JOURNAL_NBA, "rb") as f:
                 ftp.storbinary(f"STOR {remote_name}", f)
-        log_nba(f"📤 Journal NBA uploadé → {ftp_host}{remote_dir}/{remote_name}")
+            # Miroir home (static /data/ → ~/)
+            try:
+                ftp.cwd("/home/chienblanc")
+                with open(FICHIER_JOURNAL_NBA, "rb") as f:
+                    ftp.storbinary(f"STOR {remote_name}", f)
+            except Exception:
+                pass
+        log_nba(f"📤 Journal NBA uploadé → {ftp_host} ({remote_name} + miroir ~/)")
     except Exception as e:
         log_nba(f"⚠️ Upload FTP journal NBA échoué : {e}", level="warning")
 

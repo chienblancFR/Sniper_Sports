@@ -44,15 +44,17 @@ NBA_CALIB_MIN = 5
 
 
 def _candidats_fichiers(nom: str) -> list[str]:
+    """Ordre : env → ~/data/ (canonique) → ~/ (miroir static PA) → script/cwd."""
     paths = []
     if os.environ.get("NBA_JOURNAL_CSV"):
         paths.append(os.environ["NBA_JOURNAL_CSV"])
     if os.path.isdir(PA_DATA_DIR):
         paths.append(os.path.join(PA_DATA_DIR, nom))
+    # Miroir static : https://…/data/<nom> sert souvent ~/<nom> (pas ~/data/<nom>)
+    paths.append(os.path.join(os.path.expanduser("~"), nom))
     paths.extend([
         os.path.join(_SCRIPT_DIR, nom),
         os.path.join(os.getcwd(), nom),
-        os.path.join(os.path.expanduser("~"), nom),
     ])
     seen, out = set(), []
     for p in paths:
@@ -73,6 +75,7 @@ def _charger_csv(url: str, fichier_local: str):
     """Local le plus récent (priorité EN ATTENTE) → URL PA."""
     erreurs = []
     best_df, best_src, best_score = None, None, (-1, -1.0)
+    header_seul = None
 
     for path in _candidats_fichiers(fichier_local):
         if not os.path.isfile(path):
@@ -80,7 +83,8 @@ def _charger_csv(url: str, fichier_local: str):
         try:
             df = pd.read_csv(path)
             if df.empty:
-                erreurs.append(f"{path}: vide")
+                header_seul = header_seul or path
+                erreurs.append(f"{path}: vide (header seul)")
                 continue
             score = _score_journal(df, os.path.getmtime(path))
             if score > best_score:
@@ -96,6 +100,9 @@ def _charger_csv(url: str, fichier_local: str):
     if best_df is not None:
         return best_df, "ok", best_src
 
+    if header_seul:
+        return pd.DataFrame(), "empty", f"fichier · {header_seul} (header seul, 0 pari)"
+
     try:
         r = requests.get(url, timeout=20)
         if r.status_code == 200:
@@ -105,10 +112,9 @@ def _charger_csv(url: str, fichier_local: str):
                 return df, "ok", f"URL PA · {fichier_local} ({n_a} en attente / {len(df)} lignes)"
             return df, "empty", f"URL PA · {fichier_local} (vide)"
         if r.status_code == 404:
-            # Fichier pas encore créé (aucun pari / bot pas redémarré avec assurer_journal)
             return pd.DataFrame(), "empty", (
                 f"URL PA · {fichier_local} absent (HTTP 404) — "
-                "normal tant qu'aucun pari paper ; redémarre le sniper pour créer le CSV vide"
+                "redémarre le sniper NBA (miroir ~/journal_trading_nba.csv)"
             )
         erreurs.append(f"URL HTTP {r.status_code}")
     except Exception as e:
@@ -243,9 +249,9 @@ if statut_chargement == "missing":
     st.warning(
         "⚠️ Journal NBA introuvable.\n\n"
         f"**Détail :** {source}\n\n"
-        "Le dashboard lit `journal_trading_nba.csv` (local, dossier PA, ou URL). "
-        "Sur PythonAnywhere : le sniper doit écrire `/home/chienblanc/data/journal_trading_nba.csv` "
-        "(créé au démarrage même sans paris)."
+        "Le dashboard lit `journal_trading_nba.csv` (`~/data/`, miroir `~/`, ou URL). "
+        "Sur PythonAnywhere le static `/data/` sert souvent `~/` : le sniper doit "
+        "miroiter vers `/home/chienblanc/journal_trading_nba.csv` (reload Always-on)."
     )
     st.stop()
 
