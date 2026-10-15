@@ -7,13 +7,15 @@ import nba_sniper as sniper
 
 def test_plausible_ok():
     assert sniper._cote_clv_plausible_nba(1.90, 1.95)
-    assert sniper._cote_clv_plausible_nba(2.87, 3.72)  # ~30 %
+    assert sniper._cote_clv_plausible_nba(2.87, 3.50)  # ~22 % < 35 %
 
 
 def test_plausible_rejette_blowout():
     assert not sniper._cote_clv_plausible_nba(3.01, 1.25)  # +140 % CLV affiché
     assert not sniper._cote_clv_plausible_nba(4.85, 10.9)
     assert not sniper._cote_clv_plausible_nba(3.07, 5.24)
+    assert not sniper._cote_clv_plausible_nba(2.65, 1.18)  # LAC live
+    assert not sniper._cote_clv_plausible_nba(2.31, 7.05)  # DAL live
 
 
 def test_match_deja_tippe():

@@ -61,11 +61,17 @@ def test_marche_depuis_type():
     assert nba._marche_depuis_type_pari_nba("CLE +10.5") == "SPREAD"
 
 
+def test_cle_dedup_marche():
+    assert nba._cle_dedup_marche_nba("20261015_NOP_DAL", "TOTAL") == "20261015_NOP_DAL|TOTAL"
+    assert nba._cle_dedup_marche_nba("g", "spread") == "g|SPREAD"
+
+
 def main():
     tests = [
         test_selection_un_par_marche,
         test_selection_max_edge_seul,
         test_marche_depuis_type,
+        test_cle_dedup_marche,
     ]
     failed = 0
     for t in tests:

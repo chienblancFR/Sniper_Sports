@@ -224,7 +224,7 @@ NBA_EDGE_DYNAMIQUE_GP_PLEIN = float(os.environ.get("NBA_EDGE_DYNAMIQUE_GP_PLEIN"
 # Tolérance (pts) pour matcher une cote de clôture quand la ligne a bougé (CLV approx).
 NBA_CLV_LIGNE_TOLERANCE = float(os.environ.get("NBA_CLV_LIGNE_TOLERANCE", "1.5"))
 # Écart relatif max |clv-prise|/prise accepté (sinon live blowout / mauvaise close).
-NBA_CLV_MAX_DEV_REL = float(os.environ.get("NBA_CLV_MAX_DEV_REL", "0.45"))
+NBA_CLV_MAX_DEV_REL = float(os.environ.get("NBA_CLV_MAX_DEV_REL", "0.35"))
 
 # Marchés actifs (ML=moneyline, SPREAD=handicap, TOTAL=total points).
 NBA_MARCHES_ACTIFS = {
@@ -255,10 +255,18 @@ NBA_ODDS_INCLUDE_PRESEASON = _env_bool("NBA_ODDS_INCLUDE_PRESEASON", True)
 
 PA_DATA_DIR = "/home/chienblanc/data"
 JOURNAL_NOM_NBA = "journal_trading_nba.csv"
+_MEMOIRE_NOM_NBA = "alertes_nba_envoyees.txt"
+_LOCK_NOM_NBA = "nba_sniper.lock"
 FICHIER_JOURNAL_NBA = (
     os.path.join(PA_DATA_DIR, JOURNAL_NOM_NBA) if os.path.isdir(PA_DATA_DIR) else JOURNAL_NOM_NBA
 )
-FICHIER_MEMOIRE_NBA = "alertes_nba_envoyees.txt"
+# Mémoire + lock dans le même dossier que le journal (partagés entre Always-on).
+_DIR_RUNTIME_NBA = PA_DATA_DIR if os.path.isdir(PA_DATA_DIR) else os.path.abspath(".")
+FICHIER_MEMOIRE_NBA = os.path.join(_DIR_RUNTIME_NBA, _MEMOIRE_NOM_NBA)
+FICHIER_LOCK_NBA = os.path.join(_DIR_RUNTIME_NBA, _LOCK_NOM_NBA)
+# Marchés réservés dans le cycle courant (anti double-prise intra-processus).
+_marches_reserves_cycle_nba: set[str] = set()
+_lock_fd_nba = None
 JOURNAL_COLONNES_NBA = [
     "Date", "ID_Match", "Exterieur", "Domicile", "Pari",
     "Vraie_Cote_Bot", "Cote_Prise", "Cote_CLV",
@@ -2472,16 +2480,54 @@ def _cle_dedup_marche_nba(game_id, marche):
     return f"{game_id}|{(marche or '').upper()}"
 
 
+def _acquerir_verrou_instance_nba():
+    """Empêche 2 Always-on / Run simultanés (cause principale des doublons ~1 min)."""
+    global _lock_fd_nba
+    try:
+        _lock_fd_nba = open(FICHIER_LOCK_NBA, "a+", encoding="utf-8")
+        if os.name == "posix":
+            import fcntl
+            fcntl.flock(_lock_fd_nba.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            # Windows : best-effort via fichier pid (PA = Linux).
+            _lock_fd_nba.seek(0)
+            existing = (_lock_fd_nba.read() or "").strip()
+            if existing and existing.isdigit():
+                # Autre PID local — on n'abort pas en dev Windows.
+                pass
+        _lock_fd_nba.seek(0)
+        _lock_fd_nba.truncate()
+        _lock_fd_nba.write(str(os.getpid()))
+        _lock_fd_nba.flush()
+        log_nba(f"🔒 Verrou instance NBA acquis → {FICHIER_LOCK_NBA} (pid {os.getpid()})")
+        return True
+    except OSError as e:
+        log_nba(
+            f"❌ Autre instance nba_sniper déjà active ({FICHIER_LOCK_NBA}) : {e}. "
+            f"Arrêt pour éviter les paris en double — vérifie les Always-on PA.",
+            level="error",
+        )
+        return False
+
+
 def match_deja_notifie_nba(id_match):
+    if id_match in _marches_reserves_cycle_nba:
+        return True
     if not os.path.exists(FICHIER_MEMOIRE_NBA):
         return False
     with open(FICHIER_MEMOIRE_NBA, "r", encoding="utf-8") as f:
-        return id_match in f.read()
+        return id_match in f.read().splitlines()
 
 
 def enregistrer_notification_nba(id_match):
+    _marches_reserves_cycle_nba.add(id_match)
     with open(FICHIER_MEMOIRE_NBA, "a", encoding="utf-8") as f:
         f.write(id_match + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
 
 
 def _marche_depuis_type_pari_nba(type_pari):
@@ -2501,21 +2547,91 @@ def marche_deja_joue_nba(game_id, marche):
     cle = _cle_dedup_marche_nba(game_id, marche)
     if match_deja_notifie_nba(cle):
         return True
-    # Ancienne clé verbose (rétrocompat) + scan journal
     if not os.path.isfile(FICHIER_JOURNAL_NBA):
         return False
     prefix = f"{game_id}|"
+    marche_u = (marche or "").upper()
     try:
         with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 idm = str(row.get("ID_Match") or "")
                 if not idm.startswith(prefix):
                     continue
-                if _marche_depuis_type_pari_nba(row.get("Pari") or idm.split("|", 1)[-1]) == (marche or "").upper():
+                if _marche_depuis_type_pari_nba(row.get("Pari") or idm.split("|", 1)[-1]) == marche_u:
                     return True
     except OSError:
         return False
     return False
+
+
+def _compter_marche_journal_nba(game_id, marche) -> int:
+    if not os.path.isfile(FICHIER_JOURNAL_NBA):
+        return 0
+    prefix = f"{game_id}|"
+    marche_u = (marche or "").upper()
+    n = 0
+    try:
+        with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                idm = str(row.get("ID_Match") or "")
+                if not idm.startswith(prefix):
+                    continue
+                if _marche_depuis_type_pari_nba(row.get("Pari") or idm.split("|", 1)[-1]) == marche_u:
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def reserver_marche_nba(game_id, marche) -> bool:
+    """Réserve le marché sous verrou fichier — False si déjà pris (anti-race multi-process)."""
+    cle = _cle_dedup_marche_nba(game_id, marche)
+    if cle in _marches_reserves_cycle_nba:
+        return False
+    os.makedirs(os.path.dirname(FICHIER_MEMOIRE_NBA) or ".", exist_ok=True)
+    with open(FICHIER_MEMOIRE_NBA, "a+", encoding="utf-8") as f:
+        if os.name == "posix":
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        f.seek(0)
+        lignes = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+        if cle in lignes or _compter_marche_journal_nba(game_id, marche) > 0:
+            return False
+        f.write(cle + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    _marches_reserves_cycle_nba.add(cle)
+    return True
+
+
+def _dedupliquer_journal_nba():
+    """Supprime les doublons exacts (même ID_Match) et 2ᵉ+ pari du même marché."""
+    if not os.path.isfile(FICHIER_JOURNAL_NBA):
+        return
+    rows, kept_id, kept_marche, n_drop = [], set(), set(), 0
+    with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            idm = str(row.get("ID_Match") or "")
+            gid = idm.split("|", 1)[0]
+            marche = _marche_depuis_type_pari_nba(row.get("Pari") or (idm.split("|", 1)[-1] if "|" in idm else ""))
+            cle_m = _cle_dedup_marche_nba(gid, marche)
+            if idm in kept_id or cle_m in kept_marche:
+                n_drop += 1
+                continue
+            kept_id.add(idm)
+            kept_marche.add(cle_m)
+            rows.append(row)
+    if n_drop <= 0:
+        return
+    with open(FICHIER_JOURNAL_NBA, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    publier_journal_dashboard_nba()
+    log_nba(f"🧹 Journal dédupliqué — {n_drop} ligne(s) en double retirée(s)")
 
 
 def _chemin_miroir_static_nba() -> str:
@@ -2883,13 +2999,18 @@ def _cote_clv_plausible_nba(cote_prise, cote_clv, max_dev_rel=None):
     return abs(clv - prise) / prise <= max_dev
 
 
-def _match_deja_tippe_nba(home, away, odds_cache=None, maintenant=None):
-    """True si tip-off déjà passé (commence_time Odds API) — figer la CLV."""
+def _match_deja_tippe_nba(home, away, odds_cache=None, maintenant=None, tip_hint=None):
+    """True si tip-off déjà passé — figer la CLV (plus de cotes live)."""
     maintenant = maintenant or datetime.now(timezone.utc)
     cotes = get_odds_for_match_nba(home, away, odds_cache)
-    tip_raw = (cotes or {}).get("commence_time") or (cotes or {}).get("date_utc")
+    tip_raw = (
+        (cotes or {}).get("commence_time")
+        or (cotes or {}).get("date_utc")
+        or tip_hint
+    )
     tip = _parse_utc_nba(tip_raw) if tip_raw else None
     if tip is None:
+        # Sans tip connu : figer dès que le journal a >2 h (évite live tardif)
         return False
     return maintenant >= tip
 
@@ -3302,7 +3423,7 @@ def get_nba_games_today(odds_cache=None):
 
 
 def _executer_opportunite_nba(opp):
-    """Envoie Telegram + journal pour une opportunité validée."""
+    """Envoie Telegram + journal pour une opportunité déjà réservée (marché claimé)."""
     home, away = opp["home"], opp["away"]
     best = opp["best_pari"]
     log_nba(
@@ -3320,8 +3441,6 @@ def _executer_opportunite_nba(opp):
         impact_abs_dom=opp.get("impact_abs_home", 0.0),
         absences=opp.get("absences_detail", ""),
     )
-    # Dédup par marché (pas par ligne) pour ne pas rejouer si le total/spread bouge
-    enregistrer_notification_nba(opp.get("id_dedup") or opp["id_match"])
 
 
 def run_sniper_nba():
@@ -3330,7 +3449,10 @@ def run_sniper_nba():
     (paper trading `NBA_DRY_RUN`, pattern `run_sniper` NHL)."""
     mode = "DRY RUN (paper trading)" if NBA_DRY_RUN else "LIVE"
     log_nba(f"🤖 Lancement Sniper NBA — mode {mode}")
+    if not _acquerir_verrou_instance_nba():
+        return
     assurer_journal_nba_existe()
+    _dedupliquer_journal_nba()
     _reparer_clv_aberrants_nba()
     if NBA_DRY_RUN:
         log_nba("🧪 NBA_DRY_RUN actif : Telegram paper + écriture journal (pas de mise réelle).")
@@ -3377,10 +3499,13 @@ def run_sniper_nba():
 
     while True:
         try:
+            _marches_reserves_cycle_nba.clear()
             lancer_la_balayeuse_nba()
             _invalider_pit_index_memo()
             _espn_scoreboard_cache.clear()
 
+            # CLV : réparer blowouts à chaque cycle (pas seulement au boot)
+            _reparer_clv_aberrants_nba()
             nb_attente = compter_paris_en_attente_nba()
             log_nba(f"🕵️ Tracking CLV ({nb_attente} pari(s) en attente)...")
             traquer_et_actualiser_clv_nba()
@@ -3458,13 +3583,16 @@ def run_sniper_nba():
 
                 for pari in paris_retenus:
                     marche = (pari.get("marche") or _marche_depuis_type_pari_nba(pari.get("type"))).upper()
-                    # Journal : détail de la ligne ; dédup : 1 seule fois par marché
+                    # Journal : détail de la ligne ; claim mémoire AVANT écriture (anti double Always-on)
                     id_journal = f"{m['game_id']}|{pari['type']}"
-                    id_dedup = _cle_dedup_marche_nba(m["game_id"], marche)
-                    if marche_deja_joue_nba(m["game_id"], marche):
+                    if not reserver_marche_nba(m["game_id"], marche):
+                        log_nba(
+                            f"⏭️ Marché {marche} déjà pris — skip {pari['type']} ({away} @ {home})"
+                        )
                         continue
                     opportunites.append({
-                        "home": home, "away": away, "id_match": id_journal, "id_dedup": id_dedup,
+                        "home": home, "away": away, "id_match": id_journal,
+                        "id_dedup": _cle_dedup_marche_nba(m["game_id"], marche),
                         "best_pari": pari,
                         "mu_home": probas.get("mu_home"), "mu_away": probas.get("mu_away"),
                         "home_b2b": probas.get("home_b2b", False), "away_b2b": probas.get("away_b2b", False),
