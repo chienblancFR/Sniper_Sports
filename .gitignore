@@ -5,3 +5,11 @@ env/*.env
 __pycache__/
 *.pyc
 *.pyo
+ps_collection/data/
+ps_collection/exports/
+# CSV Sackmann (miroir CC BY-NC-SA) — téléchargés via tennis_data.py
+data/tennis/sackmann/
+data/tennis/state_cache.pkl
+journal_trading_tennis.csv
+
+ps_collection/watch.env
