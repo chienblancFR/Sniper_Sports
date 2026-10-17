@@ -176,6 +176,10 @@ TENNIS_FATIGUE_REST_DAYS = _f("TENNIS_FATIGUE_REST_DAYS", "2")
 TENNIS_CLV_TRACK = _b("TENNIS_CLV_TRACK", True)
 # Écart max relatif prise→close ; au-delà = blowout live ignoré / réparé
 TENNIS_CLV_MAX_DEV_REL = _f("TENNIS_CLV_MAX_DEV_REL", "0.35")
+# Règlement auto ML dans la boucle sniper (scores Odds API completed)
+TENNIS_AUTO_SETTLE = _b("TENNIS_AUTO_SETTLE", True)
+# Fenêtre scores API (jours) pour régler les paris EN ATTENTE
+TENNIS_SETTLE_DAYS_FROM = _i("TENNIS_SETTLE_DAYS_FROM", "3")
 
 
 SURFACES = ("Hard", "Clay", "Grass", "Carpet")

@@ -339,12 +339,16 @@ def _fetch_scores(sport_key: str, days_from: int = 3) -> list[dict]:
         return []
 
 
-def settle_results(path: Path | None = None) -> int:
+def settle_results(path: Path | None = None, *, days_from: int | None = None) -> int:
     """Règle ML depuis les scores Odds API (completed). O/U jeux non dispo."""
+    from tennis_params import TENNIS_SETTLE_DAYS_FROM
+
     dest = path or JOURNAL_PATH
     fields, rows = _read_rows(dest)
     if not rows:
         return 0
+    df = int(days_from if days_from is not None else TENNIS_SETTLE_DAYS_FROM)
+    df = max(1, min(3, df))  # Odds API scores: daysFrom 1..3
     pending = [
         r
         for r in rows
@@ -354,7 +358,7 @@ def settle_results(path: Path | None = None) -> int:
     sports = {r.get("SportKey") or "" for r in pending if r.get("SportKey")}
     scores_by_event: dict[str, dict] = {}
     for sk in sports:
-        for ev in _fetch_scores(sk, days_from=3):
+        for ev in _fetch_scores(sk, days_from=df):
             if ev.get("completed") and ev.get("id"):
                 scores_by_event[ev["id"]] = ev
 

@@ -579,7 +579,7 @@ def scan_once(state: TennisLiveState, *, edge_min: float | None = None) -> list[
                 send_telegram(cand, dry_run=dry)
     if not found:
         log_tennis("Aucun nouvel edge au-dessus du seuil")
-    from tennis_params import TENNIS_CLV_TRACK
+    from tennis_params import TENNIS_AUTO_SETTLE, TENNIS_CLV_TRACK
 
     if TENNIS_CLV_TRACK:
         try:
@@ -591,6 +591,15 @@ def scan_once(state: TennisLiveState, *, edge_min: float | None = None) -> list[
                 log_tennis(f"CLV pre-tip: {n_clv} cote(s) close maj (gele au tip)")
         except Exception as e:
             log_tennis(f"CLV track skip: {e}", level="warning")
+    if TENNIS_AUTO_SETTLE:
+        try:
+            from tennis_clv import settle_results
+
+            n_set = settle_results()
+            if n_set:
+                log_tennis(f"Reglement auto: {n_set} pari(s) ML → REGLE")
+        except Exception as e:
+            log_tennis(f"Settle skip: {e}", level="warning")
     return found
 
 
