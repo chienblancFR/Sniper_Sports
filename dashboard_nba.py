@@ -189,9 +189,13 @@ def enrichir_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if "Cote_Prise" in df.columns and "Cote_CLV" in df.columns:
         cote_p = pd.to_numeric(df["Cote_Prise"], errors="coerce")
         cote_c = pd.to_numeric(df["Cote_CLV"], errors="coerce")
-        mask = (cote_p > 1) & (cote_c > 1)
+        # Cote_CLV == Cote_Prise → close jamais capturée (pas un vrai CLV 0 %)
+        tracke = (
+            (cote_p > 1) & (cote_c > 1)
+            & ((cote_p - cote_c).abs() > 1e-9)
+        )
         df["CLV"] = pd.NA
-        df.loc[mask, "CLV"] = cote_p.loc[mask] / cote_c.loc[mask] - 1
+        df.loc[tracke, "CLV"] = cote_p.loc[tracke] / cote_c.loc[tracke] - 1
         df["CLV"] = pd.to_numeric(df["CLV"], errors="coerce")
     for col in ("B2B_Ext", "B2B_Dom"):
         if col in df.columns:
@@ -376,9 +380,11 @@ max_dd_pct = 0.0
 if not df_termines.empty:
     df_termines, max_dd_pct = calculer_max_drawdown(df_termines, "P&L", CAPITAL_INITIAL)
 
+# CLV tracké seulement (prise≠close) — les « 0 % » fake (close=prise) sont NA
 df_clv_ok = (
-    df_termines[(df_termines["CLV"].notna()) & (df_termines["CLV"] != 0)]
-    if not df_termines.empty else pd.DataFrame()
+    df_termines[df_termines["CLV"].notna()]
+    if (not df_termines.empty and "CLV" in df_termines.columns)
+    else pd.DataFrame()
 )
 clv_moy = df_clv_ok["CLV"].mean() * 100 if not df_clv_ok.empty else None
 edge_col = "Edge(%)" if "Edge(%)" in df_termines.columns else None

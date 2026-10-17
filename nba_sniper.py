@@ -225,6 +225,12 @@ NBA_EDGE_DYNAMIQUE_GP_PLEIN = float(os.environ.get("NBA_EDGE_DYNAMIQUE_GP_PLEIN"
 NBA_CLV_LIGNE_TOLERANCE = float(os.environ.get("NBA_CLV_LIGNE_TOLERANCE", "1.5"))
 # Écart relatif max |clv-prise|/prise accepté (sinon live blowout / mauvaise close).
 NBA_CLV_MAX_DEV_REL = float(os.environ.get("NBA_CLV_MAX_DEV_REL", "0.35"))
+# Snapshot close historique Odds API (tip−N min) si Cote_CLV encore = prise au règlement.
+NBA_CLV_HISTORIQUE_ACTIF = _env_bool("NBA_CLV_HISTORIQUE_ACTIF", True)
+NBA_CLV_HISTORIQUE_MINUTES = float(os.environ.get("NBA_CLV_HISTORIQUE_MINUTES", "5"))
+# Cycle plus court (s) quand des paris EN ATTENTE ont tip dans ≤ cette fenêtre (h).
+NBA_CLV_POLL_PROCHE_TIP_H = float(os.environ.get("NBA_CLV_POLL_PROCHE_TIP_H", "3"))
+NBA_CLV_POLL_PROCHE_TIP_S = float(os.environ.get("NBA_CLV_POLL_PROCHE_TIP_S", "300"))
 
 # Marchés actifs (ML=moneyline, SPREAD=handicap, TOTAL=total points).
 NBA_MARCHES_ACTIFS = {
@@ -2999,20 +3005,91 @@ def _cote_clv_plausible_nba(cote_prise, cote_clv, max_dev_rel=None):
     return abs(clv - prise) / prise <= max_dev
 
 
-def _match_deja_tippe_nba(home, away, odds_cache=None, maintenant=None, tip_hint=None):
-    """True si tip-off déjà passé — figer la CLV (plus de cotes live)."""
-    maintenant = maintenant or datetime.now(timezone.utc)
-    cotes = get_odds_for_match_nba(home, away, odds_cache)
+def _tip_utc_match_nba(home, away, odds_cache=None, tip_hint=None):
+    """Tip-off UTC depuis Odds cache (commence_time) ou hint ISO."""
+    cotes = get_odds_for_match_nba(home, away, odds_cache) if home and away else None
     tip_raw = (
         (cotes or {}).get("commence_time")
         or (cotes or {}).get("date_utc")
         or tip_hint
     )
-    tip = _parse_utc_nba(tip_raw) if tip_raw else None
+    return _parse_utc_nba(tip_raw) if tip_raw else None
+
+
+def _match_deja_tippe_nba(home, away, odds_cache=None, maintenant=None, tip_hint=None):
+    """True si tip-off déjà passé — figer la CLV (plus de cotes live)."""
+    maintenant = maintenant or datetime.now(timezone.utc)
+    tip = _tip_utc_match_nba(home, away, odds_cache, tip_hint=tip_hint)
     if tip is None:
-        # Sans tip connu : figer dès que le journal a >2 h (évite live tardif)
         return False
     return maintenant >= tip
+
+
+def _clv_non_trackee(cote_prise, cote_clv) -> bool:
+    """True si close jamais capturée (égale à la prise)."""
+    try:
+        return abs(float(cote_prise) - float(cote_clv)) < 1e-9
+    except (TypeError, ValueError):
+        return True
+
+
+def _fetch_cotes_historiques_tip_nba(home, away, tip_utc):
+    """Snapshot Pinnacle historique à tip−N min (Odds API /v4/historical/)."""
+    if not NBA_CLV_HISTORIQUE_ACTIF or not ODDS_API_KEY or tip_utc is None:
+        return None
+    instant = tip_utc - timedelta(minutes=max(NBA_CLV_HISTORIQUE_MINUTES, 1.0))
+    date_str = instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sports = ["basketball_nba"]
+    if NBA_ODDS_INCLUDE_PRESEASON:
+        sports.append("basketball_nba_preseason")
+    for sport in sports:
+        try:
+            r = requests.get(
+                f"https://api.the-odds-api.com/v4/historical/sports/{sport}/odds",
+                params={
+                    "apiKey": ODDS_API_KEY,
+                    "regions": "eu",
+                    "markets": "h2h,spreads,totals",
+                    "bookmakers": "pinnacle",
+                    "oddsFormat": "decimal",
+                    "date": date_str,
+                },
+                timeout=25,
+            )
+            _traiter_quota_odds_api_nba(r)
+            if r.status_code != 200:
+                continue
+            payload = r.json() or {}
+            data = payload.get("data", payload) if isinstance(payload, dict) else payload
+            if not isinstance(data, list):
+                continue
+            for game in data:
+                parsed = _parse_pinnacle_game_nba(game)
+                if parsed and parsed.get("home") == home and parsed.get("away") == away:
+                    return parsed
+        except Exception as e:
+            log_nba(f"⚠️ CLV historique {sport} {away}@{home} : {e}", level="warning")
+    return None
+
+
+def _appliquer_cloture_historique_nba(row, odds_hist=None, tip_utc=None):
+    """Si Cote_CLV == prise, tente de remplir depuis un snapshot historique tip−N."""
+    if not _clv_non_trackee(row.get("Cote_Prise"), row.get("Cote_CLV")):
+        return False
+    dom, ext, typ = row.get("Domicile"), row.get("Exterieur"), row.get("Pari")
+    if odds_hist is None:
+        tip = tip_utc or _tip_utc_match_nba(dom, ext)
+        if tip is None:
+            return False
+        odds_hist = _fetch_cotes_historiques_tip_nba(dom, ext, tip)
+    if not odds_hist:
+        return False
+    cache = {(dom, ext): odds_hist}
+    nv = _extraire_cote_clv_nba(dom, ext, typ, row.get("Cote_CLV"), cache)
+    if nv != row.get("Cote_CLV") and _cote_clv_plausible_nba(row.get("Cote_Prise"), nv):
+        row["Cote_CLV"] = nv
+        return True
+    return False
 
 
 def _reparer_clv_aberrants_nba():
@@ -3046,19 +3123,27 @@ def traquer_et_actualiser_clv_nba():
         return
     odds_cache = fetch_all_pinnacle_odds_nba()
     rows, maj = [], False
+    n_upd = n_tip = n_no_odds = n_skip_plaus = 0
     maintenant = datetime.now(timezone.utc)
     with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if row.get("Statut") == "EN ATTENTE":
                 dom, ext, type_pari = row.get("Domicile"), row.get("Exterieur"), row.get("Pari")
                 if _match_deja_tippe_nba(dom, ext, odds_cache, maintenant=maintenant):
+                    n_tip += 1
+                    rows.append(row)
+                    continue
+                if not get_odds_for_match_nba(dom, ext, odds_cache):
+                    n_no_odds += 1
                     rows.append(row)
                     continue
                 nv_cote = _extraire_cote_clv_nba(dom, ext, type_pari, row.get("Cote_CLV"), odds_cache)
                 if nv_cote != row.get("Cote_CLV") and _cote_clv_plausible_nba(row.get("Cote_Prise"), nv_cote):
                     row["Cote_CLV"] = nv_cote
                     maj = True
+                    n_upd += 1
                 elif nv_cote != row.get("Cote_CLV") and not _cote_clv_plausible_nba(row.get("Cote_Prise"), nv_cote):
+                    n_skip_plaus += 1
                     log_nba(
                         f"⚠️ CLV ignoré (écart trop fort) {ext}@{dom} {type_pari} : "
                         f"prise {row.get('Cote_Prise')} → {nv_cote}",
@@ -3071,6 +3156,11 @@ def traquer_et_actualiser_clv_nba():
             writer.writeheader()
             writer.writerows(rows)
         publier_journal_dashboard_nba()
+    if n_upd or n_tip or n_no_odds or n_skip_plaus:
+        log_nba(
+            f"📈 CLV cycle — maj={n_upd} | figé tip={n_tip} | sans cotes={n_no_odds} | "
+            f"écart rejeté={n_skip_plaus}"
+        )
 
 
 def calculer_bankroll_dynamique_nba(capital_de_base=None):
@@ -3266,6 +3356,9 @@ def lancer_la_balayeuse_nba():
     if not os.path.exists(FICHIER_JOURNAL_NBA):
         return
     rows, modifie = [], False
+    # Cache historique 1 fetch / match (plusieurs paris même tip)
+    hist_cache: dict[tuple, dict | None] = {}
+    n_clv_hist = 0
     with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if row.get("Statut") != "EN ATTENTE":
@@ -3286,6 +3379,19 @@ def lancer_la_balayeuse_nba():
             if not res:
                 rows.append(row)
                 continue
+            # Close historique si tracking live n'a rien capturé
+            if _clv_non_trackee(row.get("Cote_Prise"), row.get("Cote_CLV")):
+                cle_h = (dom, ext)
+                if cle_h not in hist_cache:
+                    tip = _tip_utc_match_nba(dom, ext)
+                    # tip disparu des odds live → approx via date journal (UTC)
+                    if tip is None and date_hint:
+                        tip = _parse_utc_nba(date_hint)
+                    hist_cache[cle_h] = (
+                        _fetch_cotes_historiques_tip_nba(dom, ext, tip) if tip else None
+                    )
+                if _appliquer_cloture_historique_nba(row, odds_hist=hist_cache.get(cle_h)):
+                    n_clv_hist += 1
             modifie = True
             score_ext, score_dom = res
             pari = row["Pari"]
@@ -3305,6 +3411,8 @@ def lancer_la_balayeuse_nba():
             writer.writeheader()
             writer.writerows(rows)
         publier_journal_dashboard_nba()
+        if n_clv_hist:
+            log_nba(f"📊 CLV historique appliqué au règlement — {n_clv_hist} ligne(s)")
 
 
 def _parse_utc_nba(date_str):
@@ -3604,7 +3712,24 @@ def run_sniper_nba():
             for opp in opportunites:
                 _executer_opportunite_nba(opp)
 
-            time.sleep(900)
+            # Poll CLV plus souvent si tip proche (sinon cycle 15 min)
+            sleep_s = 900.0
+            if NBA_CLV_POLL_PROCHE_TIP_H > 0 and NBA_CLV_POLL_PROCHE_TIP_S > 0:
+                try:
+                    maintenant = datetime.now(timezone.utc)
+                    with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+                        for row in csv.DictReader(f):
+                            if row.get("Statut") != "EN ATTENTE":
+                                continue
+                            tip = _tip_utc_match_nba(
+                                row.get("Domicile"), row.get("Exterieur"), odds_cache,
+                            )
+                            if tip and 0 <= (tip - maintenant).total_seconds() <= NBA_CLV_POLL_PROCHE_TIP_H * 3600:
+                                sleep_s = min(sleep_s, NBA_CLV_POLL_PROCHE_TIP_S)
+                                break
+                except OSError:
+                    pass
+            time.sleep(sleep_s)
         except Exception as e:
             log_nba(f"⚠️ Erreur système NBA : {e}", level="error")
             traceback.print_exc()
