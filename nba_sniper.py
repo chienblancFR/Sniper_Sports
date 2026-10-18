@@ -256,8 +256,8 @@ NBA_DRY_RUN = _env_bool("NBA_DRY_RUN", True)
 NBA_TOUS_CANDIDATS_ACTIF = _env_bool("NBA_TOUS_CANDIDATS_ACTIF", True)
 NBA_BANKROLL = float(os.environ.get("NBA_BANKROLL", "1000.0"))
 NBA_ODDS_QUOTA_ALERT = int(os.environ.get("NBA_ODDS_QUOTA_ALERT", "100"))
-# Inclure Odds API `basketball_nba_preseason` (smoke paper avant tip-off régulière).
-NBA_ODDS_INCLUDE_PRESEASON = _env_bool("NBA_ODDS_INCLUDE_PRESEASON", True)
+# Inclure Odds API `basketball_nba_preseason` — false en saison régulière.
+NBA_ODDS_INCLUDE_PRESEASON = _env_bool("NBA_ODDS_INCLUDE_PRESEASON", False)
 
 PA_DATA_DIR = "/home/chienblanc/data"
 JOURNAL_NOM_NBA = "journal_trading_nba.csv"
