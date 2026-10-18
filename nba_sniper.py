@@ -3068,57 +3068,104 @@ def _tip_utc_depuis_schedule_nba(home, away, game_id=None, date_hint=None):
     return None
 
 
+def _tip_candidats_depuis_slug_nba(game_id, date_hint=None):
+    """Heuristique tip UTC pour présaison (hors schedule régulière).
+
+    Les tip-offs NBA US tombent souvent entre 16h et 04h UTC le jour du slug.
+    """
+    jour = None
+    m_slug = re.match(r"^(\d{8})_", str(game_id or ""))
+    if m_slug:
+        jour = m_slug.group(1)
+    elif date_hint:
+        tip_h = _parse_utc_nba(date_hint)
+        if tip_h:
+            jour = tip_h.strftime("%Y%m%d")
+    if not jour:
+        return []
+    try:
+        base = datetime.strptime(jour, "%Y%m%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return []
+    out = []
+    for h, day_off in (
+        (16, 0), (17, 0), (19, 0), (20, 0), (23, 0),
+        (0, 1), (1, 1), (2, 1), (3, 1), (4, 1),
+    ):
+        out.append(base + timedelta(days=day_off, hours=h))
+    return out
+
+
 def _tip_utc_pour_row_nba(row, odds_cache=None):
-    """Meilleure estimation tip : odds live → schedule → (jamais date journal seule)."""
+    """Meilleure estimation tip : odds live → schedule → ESPN → heuristique slug."""
     dom, ext = row.get("Domicile"), row.get("Exterieur")
     tip = _tip_utc_match_nba(dom, ext, odds_cache)
     if tip:
         return tip
-    return _tip_utc_depuis_schedule_nba(
+    tip = _tip_utc_depuis_schedule_nba(
         dom, ext, game_id=row.get("ID_Match"), date_hint=row.get("Date"),
     )
+    if tip:
+        return tip
+    # ESPN event date (présaison souvent absente du schedule nba_api)
+    try:
+        ev = _trouver_event_espn(dom, ext, date_utc=row.get("Date"))
+        if ev:
+            tip = _parse_utc_nba(ev.get("date"))
+            if tip:
+                return tip
+    except Exception:
+        pass
+    cands = _tip_candidats_depuis_slug_nba(row.get("ID_Match"), row.get("Date"))
+    return cands[0] if cands else None
 
 
-def _fetch_cotes_historiques_tip_nba(home, away, tip_utc):
-    """Snapshot Pinnacle historique à tip−N min (Odds API /v4/historical/)."""
-    if not NBA_CLV_HISTORIQUE_ACTIF or not ODDS_API_KEY or tip_utc is None:
+def _fetch_cotes_historiques_tip_nba(home, away, tip_utc, tip_alternatifs=None):
+    """Snapshot Pinnacle historique à tip−N min (Odds API /v4/historical/).
+
+    Si ``tip_utc`` rate (présaison), essaie ``tip_alternatifs`` (fenêtres horaires).
+    """
+    if not NBA_CLV_HISTORIQUE_ACTIF or not ODDS_API_KEY:
         return None
-    instant = tip_utc - timedelta(minutes=max(NBA_CLV_HISTORIQUE_MINUTES, 1.0))
-    date_str = instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tips = []
+    for t in [tip_utc, *(tip_alternatifs or [])]:
+        if t is not None and t not in tips:
+            tips.append(t)
+    if not tips:
+        return None
     sports = ["basketball_nba"]
     if NBA_ODDS_INCLUDE_PRESEASON:
         sports.append("basketball_nba_preseason")
-    for sport in sports:
-        try:
-            r = requests.get(
-                f"https://api.the-odds-api.com/v4/historical/sports/{sport}/odds",
-                params={
-                    "apiKey": ODDS_API_KEY,
-                    "regions": "eu",
-                    "markets": "h2h,spreads,totals",
-                    "bookmakers": "pinnacle",
-                    "oddsFormat": "decimal",
-                    "date": date_str,
-                },
-                timeout=25,
-            )
-            _traiter_quota_odds_api_nba(r)
-            if r.status_code != 200:
-                log_nba(
-                    f"⚠️ CLV historique {sport} HTTP {r.status_code} @ {date_str}",
-                    level="warning",
+    for tip in tips:
+        instant = tip - timedelta(minutes=max(NBA_CLV_HISTORIQUE_MINUTES, 1.0))
+        date_str = instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for sport in sports:
+            try:
+                r = requests.get(
+                    f"https://api.the-odds-api.com/v4/historical/sports/{sport}/odds",
+                    params={
+                        "apiKey": ODDS_API_KEY,
+                        "regions": "eu",
+                        "markets": "h2h,spreads,totals",
+                        "bookmakers": "pinnacle",
+                        "oddsFormat": "decimal",
+                        "date": date_str,
+                    },
+                    timeout=25,
                 )
-                continue
-            payload = r.json() or {}
-            data = payload.get("data", payload) if isinstance(payload, dict) else payload
-            if not isinstance(data, list):
-                continue
-            for game in data:
-                parsed = _parse_pinnacle_game_nba(game)
-                if parsed and parsed.get("home") == home and parsed.get("away") == away:
-                    return parsed
-        except Exception as e:
-            log_nba(f"⚠️ CLV historique {sport} {away}@{home} : {e}", level="warning")
+                _traiter_quota_odds_api_nba(r)
+                if r.status_code != 200:
+                    continue
+                payload = r.json() or {}
+                data = payload.get("data", payload) if isinstance(payload, dict) else payload
+                if not isinstance(data, list):
+                    continue
+                for game in data:
+                    parsed = _parse_pinnacle_game_nba(game)
+                    if parsed and parsed.get("home") == home and parsed.get("away") == away:
+                        return parsed
+            except Exception as e:
+                log_nba(f"⚠️ CLV historique {sport} {away}@{home} : {e}", level="warning")
     return None
 
 
@@ -3173,11 +3220,12 @@ def _backfill_clv_historique_nba(max_matchs=40):
                 hist_cache[cle] = None
             else:
                 tip = _tip_utc_pour_row_nba(row)
-                hist_cache[cle] = (
-                    _fetch_cotes_historiques_tip_nba(dom, ext, tip) if tip else None
+                alts = _tip_candidats_depuis_slug_nba(row.get("ID_Match"), row.get("Date"))
+                hist_cache[cle] = _fetch_cotes_historiques_tip_nba(
+                    dom, ext, tip, tip_alternatifs=alts,
                 )
                 if hist_cache[cle]:
-                    log_nba(f"📥 Close historique {ext}@{dom} tip={tip}")
+                    log_nba(f"📥 Close historique {ext}@{dom} tip≈{tip}")
         if _appliquer_cloture_historique_nba(row, odds_hist=hist_cache.get(cle)):
             n_ok += 1
     if n_ok:
@@ -3497,8 +3545,9 @@ def lancer_la_balayeuse_nba():
                 cle_h = (dom, ext, str(game_id)[:8])
                 if cle_h not in hist_cache:
                     tip = _tip_utc_pour_row_nba(row)
-                    hist_cache[cle_h] = (
-                        _fetch_cotes_historiques_tip_nba(dom, ext, tip) if tip else None
+                    alts = _tip_candidats_depuis_slug_nba(game_id, date_hint)
+                    hist_cache[cle_h] = _fetch_cotes_historiques_tip_nba(
+                        dom, ext, tip, tip_alternatifs=alts,
                     )
                 if _appliquer_cloture_historique_nba(row, odds_hist=hist_cache.get(cle_h)):
                     n_clv_hist += 1
