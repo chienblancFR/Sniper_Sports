@@ -189,10 +189,14 @@ def enrichir_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if "Cote_Prise" in df.columns and "Cote_CLV" in df.columns:
         cote_p = pd.to_numeric(df["Cote_Prise"], errors="coerce")
         cote_c = pd.to_numeric(df["Cote_CLV"], errors="coerce")
-        # Cote_CLV == Cote_Prise → close jamais capturée (pas un vrai CLV 0 %)
-        tracke = (
-            (cote_p > 1) & (cote_c > 1)
-            & ((cote_p - cote_c).abs() > 1e-9)
+        # Close capturée si CLV_OK=OUI, ou écart prise/close (journaux anciens)
+        ok_flag = (
+            df["CLV_OK"].astype(str).str.strip().str.upper().eq("OUI")
+            if "CLV_OK" in df.columns
+            else pd.Series(False, index=df.index)
+        )
+        tracke = (cote_p > 1) & (cote_c > 1) & (
+            ok_flag | ((cote_p - cote_c).abs() > 1e-9)
         )
         df["CLV"] = pd.NA
         df.loc[tracke, "CLV"] = cote_p.loc[tracke] / cote_c.loc[tracke] - 1
@@ -405,8 +409,16 @@ c5.metric("Ordres en Cours", f"{len(df_attente)}")
 c6.metric(
     "CLV moyen",
     f"{clv_moy:+.2f} %" if clv_moy is not None else "N/A",
-    help=f"Sur {len(df_clv_ok)} paris clôturés avec CLV",
+    help=f"Sur {len(df_clv_ok)} paris avec close Pinnacle capturée (CLV_OK)",
 )
+n_clv_total = len(df_termines) if not df_termines.empty else 0
+if clv_moy is None and n_clv_total > 0:
+    st.caption(
+        f"ℹ️ CLV : 0/{n_clv_total} close capturée — reload le sniper PA "
+        f"(backfill historique tip−5 min). Cellule vide ≠ CLV 0 %."
+    )
+elif n_clv_total > 0:
+    st.caption(f"CLV tracké : **{len(df_clv_ok)}/{n_clv_total}** paris clôturés")
 c7.metric(
     "Edge moyen",
     f"{edge_moy:+.2f} %" if edge_moy is not None else "N/A",

@@ -279,6 +279,8 @@ JOURNAL_COLONNES_NBA = [
     "Mu_Ext", "Mu_Dom", "Edge(%)", "Risque(%)", "Mise_€",
     "Statut", "P&L", "B2B_Ext", "B2B_Dom", "Confiance_Kelly",
     "Lineups_Confirmes", "Impact_Abs_Ext", "Impact_Abs_Dom", "Absences",
+    # OUI = close Pinnacle capturée (live ou historique) — même si = prise (marché plat)
+    "CLV_OK",
 ]
 
 # Mapping tricode nba.com -> nom complet Odds API (basketball_nba, régions eu/us).
@@ -2743,6 +2745,7 @@ def enregistrer_transaction_nba(
         "Impact_Abs_Ext": impact_abs_ext,
         "Impact_Abs_Dom": impact_abs_dom,
         "Absences": absences or "",
+        "CLV_OK": "NON",
     }
     with open(FICHIER_JOURNAL_NBA, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA, extrasaction="ignore")
@@ -3025,12 +3028,55 @@ def _match_deja_tippe_nba(home, away, odds_cache=None, maintenant=None, tip_hint
     return maintenant >= tip
 
 
-def _clv_non_trackee(cote_prise, cote_clv) -> bool:
-    """True si close jamais capturée (égale à la prise)."""
+def _clv_non_trackee(row_or_prise, cote_clv=None) -> bool:
+    """True si close jamais capturée (CLV_OK≠OUI et prise≈clv)."""
+    if isinstance(row_or_prise, dict):
+        row = row_or_prise
+        if str(row.get("CLV_OK") or "").strip().upper() == "OUI":
+            return False
+        cote_prise, cote_clv = row.get("Cote_Prise"), row.get("Cote_CLV")
+    else:
+        cote_prise = row_or_prise
     try:
         return abs(float(cote_prise) - float(cote_clv)) < 1e-9
     except (TypeError, ValueError):
         return True
+
+
+def _tip_utc_depuis_schedule_nba(home, away, game_id=None, date_hint=None):
+    """Tip exact via cache schedule (slug YYYYMMDD_AWAY_HOME ou date hint)."""
+    jour = None
+    gid = str(game_id or "").split("|")[0]
+    m_slug = re.match(r"^(\d{8})_", gid)
+    if m_slug:
+        jour = m_slug.group(1)
+    elif date_hint:
+        tip_h = _parse_utc_nba(date_hint)
+        if tip_h:
+            jour = tip_h.strftime("%Y%m%d")
+    # Essayer saison courante + précédente (présaison à cheval)
+    for season_year in (NBA_SEASON, NBA_SEASON - 1, NBA_SEASON + 1):
+        for m in _lire_schedule_disque_nba(season_year) or []:
+            if m.get("domicile") != home or m.get("exterieur") != away:
+                continue
+            tip = _parse_utc_nba(m.get("date_utc"))
+            if tip is None:
+                continue
+            if jour and tip.strftime("%Y%m%d") != jour:
+                continue
+            return tip
+    return None
+
+
+def _tip_utc_pour_row_nba(row, odds_cache=None):
+    """Meilleure estimation tip : odds live → schedule → (jamais date journal seule)."""
+    dom, ext = row.get("Domicile"), row.get("Exterieur")
+    tip = _tip_utc_match_nba(dom, ext, odds_cache)
+    if tip:
+        return tip
+    return _tip_utc_depuis_schedule_nba(
+        dom, ext, game_id=row.get("ID_Match"), date_hint=row.get("Date"),
+    )
 
 
 def _fetch_cotes_historiques_tip_nba(home, away, tip_utc):
@@ -3058,6 +3104,10 @@ def _fetch_cotes_historiques_tip_nba(home, away, tip_utc):
             )
             _traiter_quota_odds_api_nba(r)
             if r.status_code != 200:
+                log_nba(
+                    f"⚠️ CLV historique {sport} HTTP {r.status_code} @ {date_str}",
+                    level="warning",
+                )
                 continue
             payload = r.json() or {}
             data = payload.get("data", payload) if isinstance(payload, dict) else payload
@@ -3073,12 +3123,12 @@ def _fetch_cotes_historiques_tip_nba(home, away, tip_utc):
 
 
 def _appliquer_cloture_historique_nba(row, odds_hist=None, tip_utc=None):
-    """Si Cote_CLV == prise, tente de remplir depuis un snapshot historique tip−N."""
-    if not _clv_non_trackee(row.get("Cote_Prise"), row.get("Cote_CLV")):
+    """Remplit Cote_CLV depuis snapshot historique tip−N ; marque CLV_OK=OUI."""
+    if not _clv_non_trackee(row):
         return False
     dom, ext, typ = row.get("Domicile"), row.get("Exterieur"), row.get("Pari")
     if odds_hist is None:
-        tip = tip_utc or _tip_utc_match_nba(dom, ext)
+        tip = tip_utc or _tip_utc_pour_row_nba(row)
         if tip is None:
             return False
         odds_hist = _fetch_cotes_historiques_tip_nba(dom, ext, tip)
@@ -3086,10 +3136,62 @@ def _appliquer_cloture_historique_nba(row, odds_hist=None, tip_utc=None):
         return False
     cache = {(dom, ext): odds_hist}
     nv = _extraire_cote_clv_nba(dom, ext, typ, row.get("Cote_CLV"), cache)
-    if nv != row.get("Cote_CLV") and _cote_clv_plausible_nba(row.get("Cote_Prise"), nv):
-        row["Cote_CLV"] = nv
-        return True
-    return False
+    try:
+        nv_f = float(nv)
+    except (TypeError, ValueError):
+        return False
+    # Historique tip−5 = vraie close : tolérance plus large (présaison bouge fort)
+    if not _cote_clv_plausible_nba(row.get("Cote_Prise"), nv_f, max_dev_rel=0.85):
+        log_nba(
+            f"⚠️ CLV historique écart extrême {ext}@{dom} {typ} : "
+            f"prise {row.get('Cote_Prise')} → {nv}",
+            level="warning",
+        )
+        return False
+    row["Cote_CLV"] = str(nv)
+    row["CLV_OK"] = "OUI"
+    return True
+
+
+def _backfill_clv_historique_nba(max_matchs=40):
+    """Rattrape les paris déjà joués sans close (CLV_OK vide / prise=clv)."""
+    if not os.path.isfile(FICHIER_JOURNAL_NBA) or not NBA_CLV_HISTORIQUE_ACTIF:
+        return
+    rows = []
+    with open(FICHIER_JOURNAL_NBA, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    hist_cache: dict[tuple, dict | None] = {}
+    n_ok, n_try = 0, 0
+    for row in rows:
+        if not _clv_non_trackee(row):
+            continue
+        dom, ext = row.get("Domicile"), row.get("Exterieur")
+        cle = (dom, ext, str(row.get("ID_Match") or "").split("|")[0][:8])
+        n_try += 1
+        if cle not in hist_cache:
+            if len(hist_cache) >= max_matchs:
+                hist_cache[cle] = None
+            else:
+                tip = _tip_utc_pour_row_nba(row)
+                hist_cache[cle] = (
+                    _fetch_cotes_historiques_tip_nba(dom, ext, tip) if tip else None
+                )
+                if hist_cache[cle]:
+                    log_nba(f"📥 Close historique {ext}@{dom} tip={tip}")
+        if _appliquer_cloture_historique_nba(row, odds_hist=hist_cache.get(cle)):
+            n_ok += 1
+    if n_ok:
+        with open(FICHIER_JOURNAL_NBA, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=JOURNAL_COLONNES_NBA, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        publier_journal_dashboard_nba()
+        log_nba(f"📊 Backfill CLV historique — {n_ok}/{n_try} ligne(s) mises à jour")
+    elif n_try:
+        log_nba(
+            f"ℹ️ Backfill CLV — 0/{n_try} (tip schedule manquant ou Odds historique vide)",
+            level="warning",
+        )
 
 
 def _reparer_clv_aberrants_nba():
@@ -3102,6 +3204,7 @@ def _reparer_clv_aberrants_nba():
             prise, clv = row.get("Cote_Prise"), row.get("Cote_CLV")
             if prise and clv and not _cote_clv_plausible_nba(prise, clv):
                 row["Cote_CLV"] = prise
+                row["CLV_OK"] = "NON"
                 modifie = True
                 n += 1
             rows.append(row)
@@ -3140,6 +3243,16 @@ def traquer_et_actualiser_clv_nba():
                 nv_cote = _extraire_cote_clv_nba(dom, ext, type_pari, row.get("Cote_CLV"), odds_cache)
                 if nv_cote != row.get("Cote_CLV") and _cote_clv_plausible_nba(row.get("Cote_Prise"), nv_cote):
                     row["Cote_CLV"] = nv_cote
+                    row["CLV_OK"] = "OUI"
+                    maj = True
+                    n_upd += 1
+                elif (
+                    nv_cote == row.get("Cote_CLV")
+                    and str(row.get("CLV_OK") or "").upper() != "OUI"
+                    and get_odds_for_match_nba(dom, ext, odds_cache)
+                ):
+                    # Cote inchangée mais snapshot pré-tip vu → close connue (plat)
+                    row["CLV_OK"] = "OUI"
                     maj = True
                     n_upd += 1
                 elif nv_cote != row.get("Cote_CLV") and not _cote_clv_plausible_nba(row.get("Cote_Prise"), nv_cote):
@@ -3380,13 +3493,10 @@ def lancer_la_balayeuse_nba():
                 rows.append(row)
                 continue
             # Close historique si tracking live n'a rien capturé
-            if _clv_non_trackee(row.get("Cote_Prise"), row.get("Cote_CLV")):
-                cle_h = (dom, ext)
+            if _clv_non_trackee(row):
+                cle_h = (dom, ext, str(game_id)[:8])
                 if cle_h not in hist_cache:
-                    tip = _tip_utc_match_nba(dom, ext)
-                    # tip disparu des odds live → approx via date journal (UTC)
-                    if tip is None and date_hint:
-                        tip = _parse_utc_nba(date_hint)
+                    tip = _tip_utc_pour_row_nba(row)
                     hist_cache[cle_h] = (
                         _fetch_cotes_historiques_tip_nba(dom, ext, tip) if tip else None
                     )
@@ -3562,6 +3672,7 @@ def run_sniper_nba():
     assurer_journal_nba_existe()
     _dedupliquer_journal_nba()
     _reparer_clv_aberrants_nba()
+    _backfill_clv_historique_nba()
     if NBA_DRY_RUN:
         log_nba("🧪 NBA_DRY_RUN actif : Telegram paper + écriture journal (pas de mise réelle).")
     if NBA_ODDS_INCLUDE_PRESEASON:
